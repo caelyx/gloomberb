@@ -64,6 +64,7 @@ export const EXCHANGE_TIME_ZONES: Record<string, string> = {
   MSX: "Asia/Muscat",
   KUWAIT: "Asia/Kuwait",
   EGX: "Africa/Cairo",
+  BIST: "Europe/Istanbul",
   CCC: "UTC",
   HYPERLIQUID: "UTC",
   BINANCE: "UTC",
@@ -91,6 +92,12 @@ const KNOWN_EXCHANGE_CODES: ReadonlySet<string> = new Set([
 export function isKnownExchangeCode(value?: string): boolean {
   const normalized = normalizeExchange(value);
   return !!normalized && KNOWN_EXCHANGE_CODES.has(normalized);
+}
+
+/** "Warsaw Stock Exchange" for a venue with a name, the canonical code otherwise (NASDAQ, whose name is its code). */
+export function exchangeName(value?: string): string {
+  const code = canonicalExchange(value);
+  return EXCHANGE_NAMES[code] ?? code;
 }
 
 /** "Euronext Paris (EPA)" for a venue with a name, the canonical code otherwise. */
@@ -158,6 +165,43 @@ export function isUsListingExchange(value?: string): boolean {
   return US_LISTING_EXCHANGES.has(canonicalExchange(value));
 }
 
+/**
+ * A US share class's spellings, the dotted one first: BRK.B, BRK-B and BRK/B
+ * are one listing, and so one row. Null for any other symbol, and for one on
+ * a venue abroad (RCI-B on TSX is that venue's own code).
+ */
+export function usShareClassSpellings(symbol: string, exchange?: string | null): string[] | null {
+  const match = /^([A-Z]{1,5})[.\-/]([A-Z])$/.exec(symbol.trim().toUpperCase());
+  const venue = canonicalExchange(exchange ?? "");
+  if (!match || (venue && !isUsEquityExchange(venue))) return null;
+  return [`${match[1]}.${match[2]}`, `${match[1]}-${match[2]}`, `${match[1]}/${match[2]}`];
+}
+
+/** Canonical US over-the-counter venues: OTC, and the OTC Markets tiers' listing codes. */
+const US_OTC_EXCHANGES: ReadonlySet<string> = new Set(["OTC", "PINK", "PNK", "OQB", "OQX", "OEM", "OBB"]);
+
+/** Canonical US equity venues: the listing exchanges plus other lit and OTC venues. */
+const US_EQUITY_EXCHANGES: ReadonlySet<string> = new Set([
+  ...US_LISTING_EXCHANGES,
+  "BYX",
+  "IEX",
+  ...US_OTC_EXCHANGES,
+]);
+
+/**
+ * A US over-the-counter venue, by its code (OTC, PNK, OQX) or as a quote
+ * names it ("OTC MARKETS OTCPK" for TCEHY, "Other OTC").
+ */
+export function isUsOtcVenue(value?: string): boolean {
+  const venue = canonicalExchange(value);
+  return US_OTC_EXCHANGES.has(venue) || /^(?:OTC MARKETS\b|OTCPK$|OTCQX$|OTCQB$|PINX$|OTHER OTC$)/.test(venue);
+}
+
+/** A US venue a stock or fund trades on, listed or over the counter. */
+export function isUsEquityExchange(value?: string): boolean {
+  return US_EQUITY_EXCHANGES.has(canonicalExchange(value));
+}
+
 export function resolveExchangeTimeZone(value?: string): string | null {
   const canonical = canonicalExchange(value);
   return canonical ? EXCHANGE_TIME_ZONES[canonical] ?? null : null;
@@ -205,6 +249,28 @@ export function canonicalTickerKey(symbol: string, exchange?: string): string {
   // An explicit listing in the symbol wins over remembered/default metadata.
   const canonical = parsed.exchange ?? canonicalExchange(exchange);
   return canonical ? `${parsed.symbol}:${canonical}` : parsed.symbol;
+}
+
+/**
+ * A key as a person reads it: a listing by its venue's own code (`9992:XHKG` is `9992:HKEX`, `AAPL:XNAS` is
+ * `AAPL:NASDAQ`), as titles, legends and exports name it. Anything else (a bare symbol, `FRED:DFII10`,
+ * `CAP:bitcoin:hashrate`) stays as written. Display only: a stored key keeps its form.
+ */
+export function displayTickerKey(key: string): string {
+  return isKnownExchangeCode(parsePublicTickerKey(key).exchange) ? canonicalTickerKey(key) : key;
+}
+
+/**
+ * A stored key as the listing a request names: a row saved under its venue's
+ * code (`ES3:XSES`, as a key is when another listing holds the bare symbol)
+ * is ES3 on SGX, as `D05` on SGX is D05 there. A key whose suffix names no
+ * venue (`FRED:DFII10`) is requested as stored, on the row's exchange.
+ */
+export function storedKeyListing(key: string, exchange?: string): { symbol: string; exchange: string } {
+  const parsed = parsePublicTickerKey(key);
+  return parsed.exchange && isKnownExchangeCode(parsed.exchange)
+    ? { symbol: parsed.symbol, exchange: parsed.exchange }
+    : { symbol: key, exchange: exchange ?? "" };
 }
 
 export function publicTickerKey(symbol: string, exchange?: string): string {

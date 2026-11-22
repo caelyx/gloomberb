@@ -1,4 +1,5 @@
 import type { SecFilingItem } from "../types/data-provider";
+import { formatCompact } from "./format";
 import { secFilingItemCodes } from "./sec";
 
 /**
@@ -179,6 +180,8 @@ export interface HiddenFilings {
   pricingSupplements: number;
   /** The 13D/13G the company filed as a holder of other companies. */
   ownershipReportsAboutOthers: number;
+  /** A fund's trust filed these for its other funds (the sibling series' NPORT-P on the same day). */
+  otherFunds?: number;
 }
 
 /**
@@ -194,9 +197,12 @@ function keptFilings(
   const kept: SecFilingItem[] = [];
   const hidden: HiddenFilings = { pricingSupplements: 0, ownershipReportsAboutOthers: 0 };
   const isSupplement = pricingSupplementTest(filings);
+  // A fund's trust lists every fund it runs; where the service marks the fund's own series, the others' are left out.
+  const ownSeries = filings.some((filing) => filing.fundSeries === true);
   for (const filing of filings) {
     if (kept.length >= limit) break;
-    if (isSupplement(filing)) hidden.pricingSupplements += 1;
+    if (ownSeries && filing.fundSeries === false) hidden.otherFunds = (hidden.otherFunds ?? 0) + 1;
+    else if (isSupplement(filing)) hidden.pricingSupplements += 1;
     else if (schedulesAboutOthers && isScheduleAboutAnotherCompany(filing)) hidden.ownershipReportsAboutOthers += 1;
     else kept.push(filing);
   }
@@ -213,8 +219,26 @@ export function hiddenFilingsNote(hidden: HiddenFilings): string | null {
   const parts = [
     count(hidden.pricingSupplements, "pricing supplement", "pricing supplements"),
     count(hidden.ownershipReportsAboutOthers, "ownership report about another company", "ownership reports about other companies"),
+    count(hidden.otherFunds ?? 0, "filing for the trust's other funds", "filings for the trust's other funds"),
   ].filter((part): part is string => part != null);
   return parts.length > 0 ? `${parts.join(" and ")} hidden, --all to show` : null;
+}
+
+/**
+ * What a list's metadata says it left out: a count only for each kind it
+ * hid, nothing when it hid none.
+ */
+export function hiddenFilingsMetadata(hidden: HiddenFilings | null | undefined): {
+  pricingSupplementsHidden?: number;
+  ownershipReportsAboutOthersHidden?: number;
+  otherFundFilingsHidden?: number;
+} {
+  if (!hidden) return {};
+  return {
+    ...hidden.pricingSupplements > 0 ? { pricingSupplementsHidden: hidden.pricingSupplements } : {},
+    ...hidden.ownershipReportsAboutOthers > 0 ? { ownershipReportsAboutOthersHidden: hidden.ownershipReportsAboutOthers } : {},
+    ...(hidden.otherFunds ?? 0) > 0 ? { otherFundFilingsHidden: hidden.otherFunds } : {},
+  };
 }
 
 /** Filings asked for first, a few times the rows wanted: supplements come in runs of dozens. */
@@ -242,4 +266,35 @@ export async function loadLatestFilings(
     if (kept.filings.length >= limit || read.length < count || count >= SEC_FILING_FETCH_LIMIT) return kept;
     count = Math.min(SEC_FILING_FETCH_LIMIT, count * READ_GROWTH);
   }
+}
+
+const FORM4_VERBS: Record<string, string> = {
+  P: "Bought", S: "Sold", A: "Awarded", G: "Gift of", F: "Withheld for tax", M: "Exercised", X: "Exercised", C: "Converted",
+};
+
+/** Whether a Form 4 reports another company's shares: one the listing's company filed as their owner. */
+export function isOtherIssuerForm4(filing: Pick<SecFilingItem, "cik" | "form4">): boolean {
+  const issuer = filing.form4?.issuerCik?.replace(/^0+/, "");
+  return !!issuer && issuer !== filing.cik.replace(/^0+/, "");
+}
+
+/**
+ * A Form 4's row, from what Gloom Cloud read of it: "Sold 2.13M SIRI shares
+ * at $21.48 (SIRIUS XM HOLDINGS INC.)" for one the company filed as an owner
+ * of another company's shares, whose issuer only the form names, and "COOK
+ * TIMOTHY D: Sold 120k shares at $231.50" for an insider of its own. Null
+ * without the service's summary.
+ */
+export function form4TradeText(filing: Pick<SecFilingItem, "cik" | "form4">): string | null {
+  const trade = filing.form4;
+  if (!trade) return null;
+  const verb = FORM4_VERBS[trade.code] ?? (trade.side === "disposed" || trade.side === "sell" ? "Disposed of" : "Acquired");
+  const price = trade.price == null ? "" : ` at $${trade.price >= 1 ? trade.price.toFixed(2) : trade.price.toPrecision(3)}`;
+  // A form of options alone counts options, not shares.
+  const unit = trade.derivative ? "options" : "shares";
+  if (isOtherIssuerForm4(filing)) {
+    const subject = trade.issuerTicker ? `${trade.issuerTicker} ${unit}` : unit;
+    return `${verb} ${formatCompact(trade.shares)} ${subject}${price} (${trade.issuerName})`;
+  }
+  return `${trade.ownerName ? `${trade.ownerName}: ` : ""}${verb} ${formatCompact(trade.shares)} ${unit}${price}`;
 }

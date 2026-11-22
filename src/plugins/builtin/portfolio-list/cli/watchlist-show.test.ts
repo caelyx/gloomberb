@@ -7,7 +7,7 @@ import { createTestDataProvider, createTestQuote } from "../../../../test-suppor
 import { createTestTicker } from "../../../../test-support/ticker";
 import { createDefaultConfig } from "../../../../types/config";
 import type { Quote } from "../../../../types/financials";
-import type { TickerRecord } from "../../../../types/ticker";
+import type { TickerRecord, Watchlist } from "../../../../types/ticker";
 import { setCliColorEnabledOverride } from "../../../../utils/cli-output";
 import { perpBoard, venueRow } from "../../perps/test-fixture";
 import { showCollection } from "./render";
@@ -25,20 +25,23 @@ const option = watched("AAPL261218C00300000", "OPR", "OPTION");
 const brentPrice = watched("BZ-USD", "CCC", "CRYPTOCURRENCY", { name: "Brent Oil (Derivatives) USD" });
 const perpetual = watched("BZUSDT", "BINANCE", "PERP", { name: "BZ perpetual", currency: "USDT" });
 const halted = watched("SIVB", "NASDAQ", "STK");
+// Saved by its MIC, as a broker import names it.
+const abroad = watched("ASML:XAMS", "", "STK", { currency: "EUR" });
 
 const quotes: Record<string, Quote> = {
   XOM: createTestQuote({ symbol: "XOM", price: 120, change: 1.2, changePercent: 1, marketCap: 500e9 }),
   AAPL261218C00300000: createTestQuote({ symbol: "AAPL261218C00300000", price: 41.27, change: -4.9, changePercent: -10.6, name: "AAPL261218C00300000", instrumentType: "OPTION" }),
   "BZ-USD": createTestQuote({ symbol: "BZ-USD", price: 101.85, change: 0.37, changePercent: 0.36, marketCap: 0, instrumentType: "CRYPTOCURRENCY" }),
   BZUSDT: createTestQuote({ symbol: "BZUSDT", price: 101.48, currency: "USDT", change: -1, changePercent: -0.98, instrumentType: "PERP", listingExchangeName: "BINANCE" }),
+  "ASML:XAMS": createTestQuote({ symbol: "ASML", price: 1_283.6, currency: "EUR", change: 33.6, changePercent: 2.69, listingExchangeName: "AMS" }),
   // Its last trade was on the 9th; the source last refreshed the quote a day later.
   SIVB: createTestQuote({ symbol: "SIVB", price: 106.04, stale: true, listingExchangeName: "NASDAQ",
     lastTradeTime: Date.parse("2023-03-09T20:00:00Z"), lastUpdated: Date.parse("2023-03-10T14:00:00Z") }),
 };
 
 /** `watchlist show Mix` over these rows: its text, and its JSON rows. */
-async function show(tickers: TickerRecord[]) {
-  const market = { config, store: { loadAllTickers: async () => tickers },
+async function show(tickers: TickerRecord[], { groups }: { groups?: Watchlist["groups"] } = {}) {
+  const market = { config: groups ? { ...config, watchlists: [{ ...config.watchlists[0]!, groups }] } : config, store: { loadAllTickers: async () => tickers },
     dataProvider: createTestDataProvider({ getQuote: async (symbol) => quotes[symbol]! }) };
   setCliColorEnabledOverride(false);
   const output: string[] = [];
@@ -69,9 +72,21 @@ test("a market cap of zero prints a dash, as a missing one does, never 0 USD", a
   expect(rows.find((row) => row.symbol === "BZ-USD")).toMatchObject({ marketCap: null });
 });
 
+// `watchlist show --csv` wrote ASML beside the US lines' bare symbols: a join on it met the US ADR.
+test("a listing abroad is exported by the code RV and compare print, whatever it was saved as", async () => {
+  const { rows } = await show([stock, abroad]);
+  expect(rows.map((row) => row.symbol).sort()).toEqual(["ASML:AMS", "XOM"]);
+  const market = { config, store: { loadAllTickers: async () => [stock, abroad] },
+    dataProvider: createTestDataProvider({ getQuote: async (symbol) => quotes[symbol]! }) };
+  const cli = createTestCliContext(market, { format: "csv" });
+  await showCollection("Mix", cli.context);
+  const csv = serializeCliResult(cli.printed[0]!.result, { ...DEFAULT_CLI_OPTIONS, format: "csv" }, cli.printed[0]!.options).split("\n");
+  expect(csv.find((line) => line.startsWith("ASML"))).toStartWith("ASML:AMS,ASML:AMS,");
+});
+
 test("an option contract is named by its terms where its saved name is only its code", async () => {
   const { rows } = await show([option]);
-  expect(rows[0]).toMatchObject({ symbol: "AAPL261218C00300000", name: "AAPL Dec 18 '26 $300 Call" });
+  expect(rows[0]).toMatchObject({ symbol: "AAPL261218C00300000", name: "AAPL 18 Dec '26 $300 Call" });
 });
 
 test("a list holding a perpetual market gains a Fund 8H column; any other list keeps its columns", async () => {
@@ -103,4 +118,19 @@ test("a perpetual whose market cannot be read shows a dash under Fund 8H and sti
     expect(line("BZUSDT")).toMatch(/\$?101\.48 +-0\.98% +— +—$/);
     expect(rows[0]).toMatchObject({ fundingRate8h: null });
   } finally { markets.mockRestore(); }
+});
+
+test("a list with groups runs group by group under a Group column, and each JSON row names its group; a list without keeps its columns", async () => {
+  const { text, rows } = await show([stock, halted, abroad], { groups: [{ name: "Banks", symbols: ["SIVB"] }, { name: "Energy", symbols: ["XOM"] }] });
+  const lines = text.split("\n");
+  const header = lines.findIndex((line) => /^Group +Ticker/.test(line));
+  expect(header).toBeGreaterThanOrEqual(0);
+  expect(lines.slice(header + 2, header + 5).map((line) => line.split(/ {2,}/).slice(0, 2))).toEqual([
+    ["Banks", "SIVB:NASDAQ"], ["Energy", "XOM:NYSE"], ["Ungrouped", "ASML:AMS"],
+  ]);
+  expect(rows.map((row) => [row.symbol, row.group])).toEqual([["SIVB", "Banks"], ["XOM", "Energy"], ["ASML:AMS", null]]);
+
+  const plain = await show([stock, abroad]);
+  expect(plain.text).not.toContain("Group");
+  expect(plain.rows.every((row) => !("group" in row))).toBe(true);
 });

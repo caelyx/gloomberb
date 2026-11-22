@@ -1,0 +1,164 @@
+import { describe, expect, test } from "bun:test";
+import {
+  computeBeta,
+  computeDatedBeta,
+  resolveDatedReturns,
+  computeSharpeRatio,
+  computeWeightedPortfolioReturns,
+  syntheticPositionUnsupportedReason,
+  type DatedReturn,
+} from "./return-metrics";
+import { createTestTicker } from "../test-support/ticker";
+
+function datedReturns(values: number[], startDay = 1): DatedReturn[] {
+  return values.map((value, index) => ({
+    startDateKey: new Date(Date.UTC(2024, 0, startDay + index - 1)).toISOString().slice(0, 10),
+    dateKey: `2024-01-${String(startDay + index).padStart(2, "0")}`,
+    value,
+  }));
+}
+
+describe("computeSharpeRatio", () => {
+  test("computes positive Sharpe for good returns", () => {
+    const returns = Array.from({ length: 20 }, () => 0.005 + (Math.random() - 0.5) * 0.001);
+    const sharpe = computeSharpeRatio(returns);
+    expect(sharpe).not.toBeNull();
+    expect(sharpe!).toBeGreaterThan(0);
+  });
+
+  test("returns null for insufficient data", () => {
+    expect(computeSharpeRatio([0.01, 0.02])).toBeNull();
+  });
+
+  test("returns null for zero variance", () => {
+    expect(computeSharpeRatio(Array(20).fill(0.01))).toBeNull();
+  });
+});
+
+describe("computeBeta", () => {
+  test("beta of 1 when returns match market", () => {
+    const returns = Array.from({ length: 20 }, () => Math.random() * 0.02 - 0.01);
+    const beta = computeBeta(returns, returns);
+    expect(beta).toBeCloseTo(1.0, 1);
+  });
+
+  test("returns null for insufficient data", () => {
+    expect(computeBeta([0.01], [0.01])).toBeNull();
+  });
+
+  test("aligns dated returns before computing beta", () => {
+    const market = datedReturns([
+      -0.010, 0.015, 0.004, -0.006, 0.011,
+      0.008, -0.012, 0.009, 0.013, -0.007,
+      0.005, 0.010,
+    ], 2);
+    const asset = [
+      { startDateKey: "2023-12-31", dateKey: "2024-01-01", value: 0.25 },
+      ...market.map((point) => ({ startDateKey: point.startDateKey, dateKey: point.dateKey, value: point.value * 2 })),
+    ];
+
+    expect(computeDatedBeta(asset, market)).toBeCloseTo(2, 5);
+  });
+
+  test("weights portfolio returns by holding value", () => {
+    const market = datedReturns([
+      -0.010, 0.015, 0.004, -0.006, 0.011,
+      0.008, -0.012, 0.009, 0.013, -0.007,
+      0.005, 0.010,
+    ]);
+    const portfolio = computeWeightedPortfolioReturns([
+      {
+        weight: 80,
+        returns: market.map((point) => ({ startDateKey: point.startDateKey, dateKey: point.dateKey, value: point.value * 2 })),
+      },
+      {
+        weight: 20,
+        returns: market.map((point) => ({ startDateKey: point.startDateKey, dateKey: point.dateKey, value: 0 })),
+      },
+    ]);
+
+    expect(computeDatedBeta(portfolio, market)).toBeCloseTo(1.6, 5);
+  });
+
+  // The holdings are lined up once per list of series: new weights,
+  // another list or a series extended in place must still count.
+  test("weighs the holdings it is given now, not the ones it lined up before", () => {
+    const market = datedReturns([-0.010, 0.015, 0.004, -0.006, 0.011, 0.008, -0.012, 0.009, 0.013, -0.007]);
+    const double = market.map((point) => ({ ...point, value: point.value * 2 }));
+    const flat = market.map((point) => ({ ...point, value: 0 }));
+    const beta = (series: Array<{ weight: number; returns: DatedReturn[] }>) => computeDatedBeta(computeWeightedPortfolioReturns(series), market);
+
+    expect(beta([{ weight: 80, returns: double }, { weight: 20, returns: flat }])).toBeCloseTo(1.6, 5);
+    expect(beta([{ weight: 50, returns: double }, { weight: 50, returns: flat }])).toBeCloseTo(1, 5);
+    expect(beta([{ weight: 50, returns: double }])).toBeCloseTo(2, 5);
+    // A day the flat holding lacks drops out of the weighted series until it has it.
+    double.push({ startDateKey: "2024-01-10", dateKey: "2024-01-11", value: 0.5 });
+    expect(computeWeightedPortfolioReturns([{ weight: 50, returns: double }, { weight: 50, returns: flat }])).toHaveLength(10);
+    flat.push({ startDateKey: "2024-01-10", dateKey: "2024-01-11", value: 0 });
+    expect(computeWeightedPortfolioReturns([{ weight: 50, returns: double }, { weight: 50, returns: flat }]).at(-1)!.value).toBeCloseTo(0.25, 10);
+  });
+
+  test("computes dated returns from closing prices", () => {
+    const { returns } = resolveDatedReturns([
+      { date: new Date("2024-01-01T00:00:00Z"), close: 100 },
+      { date: new Date("2024-01-02T00:00:00Z"), close: 110 },
+      { date: new Date("2024-01-03T00:00:00Z"), close: 99 },
+    ]);
+
+    expect(returns).toEqual([
+      { startDateKey: "2024-01-01", dateKey: "2024-01-02", value: 0.1 },
+      { startDateKey: "2024-01-02", dateKey: "2024-01-03", value: -0.1 },
+    ]);
+  });
+
+  test("quarantines contradictory samples and permits a corrected duplicate to recover", () => {
+    const start = { date: new Date("2026-09-08"), close: 100 };
+    // A close above the high contradicts the bar; an open alone outside it is only withheld, and its close kept.
+    const bad = { date: new Date("2026-09-09"), open: 105, high: 102, low: 99, close: 104 };
+    const end = { date: new Date("2026-09-10"), close: 110 };
+    const input = [start, bad, end];
+    const rejected = resolveDatedReturns(input);
+    expect(rejected.returns).toEqual([]);
+    expect(resolveDatedReturns([start, { ...bad, close: 101 }, end]).integrity).toBeNull();
+    expect(rejected.integrity?.sourcePoints[0]).toMatchObject({ date: "2026-09-09T00:00:00.000Z", open: 105, high: 102 });
+    const recovered = resolveDatedReturns([...input, { ...bad, high: 106 }]);
+    expect(recovered.integrity).toBeNull();
+    expect(recovered.returns.map((entry) => entry.value)).toEqual([0.04, 6 / 104]);
+    expect(bad.high).toBe(102);
+    expect(rejected.integrity?.sourcePoints[0]?.high).toBe(102);
+  });
+});
+
+describe("syntheticPositionUnsupportedReason", () => {
+  const reason = (assetCategory: string) => syntheticPositionUnsupportedReason(
+    createTestTicker("SQM", "SQM", { assetCategory, positions: [{ portfolio: "p", shares: 10, broker: "manual" }] }),
+    "USD",
+    "p",
+  );
+
+  test("depositary receipts are equities whatever spelling the asset type arrives in", () => {
+    for (const category of [
+      "American Depositary Receipt", "American Depositary Receipts", "American Depositary Share", "American Depositary Shares",
+      "american-depositary_receipt", "ADR", "adr", "ADS", "Global Depositary Receipt", "GDR", "Depositary Receipt",
+      "American Depository Receipt", "American Depository Shares", "Global Depository Receipt", "Depository Receipt", "Depository Shares",
+    ]) expect([category, reason(category)]).toEqual([category, null]);
+  });
+
+  test("the equity categories it took before still count, in any case or spacing", () => {
+    for (const category of ["", "STK", "Stock", "Common Stock", "COMMON_STOCK", "common-stock", "Equity", "ETF", "ETN", "Fund", "REIT"])
+      expect([category, reason(category)]).toEqual([category, null]);
+  });
+
+  test("crypto and contracts stay outside the basket", () => {
+    expect(reason("Cryptocurrency")).toBe("Crypto is not covered by the equity basket");
+    for (const category of ["OPT", "Future", "Bond", "Depositary Bank", "Depository Bank"])
+      expect([category, reason(category)]).toEqual([category, "Asset type is not covered by the equity basket"]);
+  });
+});
+
+test("a pair's copied close is no day's close: the return runs across it from the close before", () => {
+  const day = (date: string, close: number, closeCopied?: boolean) =>
+    ({ date: new Date(`${date}T00:00:00Z`), close, ...(closeCopied ? { closeCopied } : {}) });
+  const { returns } = resolveDatedReturns([day("2022-06-09", 100), day("2022-06-10", 140, true), day("2022-06-13", 101)]);
+  expect(returns).toEqual([{ startDateKey: "2022-06-09", dateKey: "2022-06-13", value: expect.closeTo(0.01, 12) }]);
+});

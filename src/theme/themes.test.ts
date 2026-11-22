@@ -12,11 +12,15 @@ import {
   colors,
   floatingPaneTitleBg,
   getChartIndicatorColor,
+  inactiveSelectedBg,
+  inactiveSelectedText,
   paneTitleBg,
   paneTitleText,
 } from "./colors";
+import { readsAtBodyContrast, selectedCellColor } from "./tone-contrast";
 import { contrastRatio } from "./color-utils";
-import { DEFAULT_THEME, getThemeIds, isDarkTheme, resolveThemeId, themes } from "./themes";
+import { INACTIVE_SELECTION_MIN, INACTIVE_SELECTION_TEXT_MIN } from "./ui-tokens";
+import { DEFAULT_THEME, getThemeIds, isDarkTheme, listThemes, resolveThemeId, themes, TONE_TEXT_MIN } from "./themes";
 
 const BODY_TEXT_MIN = 4.5;
 const SUBTLE_TEXT_MIN = 3.6;
@@ -87,6 +91,55 @@ describe("theme contrast", () => {
 
       assertMinContrast(id, "headerText/header", theme.headerText, theme.header, BODY_TEXT_MIN);
       assertMinContrast(id, "selectedText/selected", theme.selectedText, theme.selected, BODY_TEXT_MIN);
+    }
+  });
+
+  // colorblind-light read a loss on a selected row at 3.16:1 and its warning amber at 3.85:1 on the panel; on the
+  // selection a loss read 2.99:1 in the default theme and 1.92:1 in nord, a gain 1.91:1 in rosepine.
+  test("keeps up, down, warning and neutral at body contrast in a selected row in every theme, and on the page in every light and colour-blind one", () => {
+    const tones = [["positive", "selectedPositive"], ["negative", "selectedNegative"], ["warning", "selectedWarning"], ["neutral", "selectedNeutral"]] as const;
+    for (const { id } of listThemes()) {
+      applyTheme(id);
+      for (const [role, inRow] of tones) {
+        // A data table draws the tone through the theme's token for the selection.
+        expect(selectedCellColor(colors[role], colors)).toBe(colors[inRow]!);
+        assertMinContrast(id, `${role}/selected`, colors[inRow]!, colors.selected, TONE_TEXT_MIN);
+      }
+      // Any other colour is the cell's own.
+      expect(selectedCellColor("#123456", colors)).toBe("#123456");
+    }
+    const readable = listThemes().filter((theme) => theme.appearance === "light" || theme.traits.includes("colorblind-safe"));
+    expect(readable.map((theme) => theme.id)).toContain("colorblind");
+    for (const { id } of readable) {
+      applyTheme(id);
+      expect(readsAtBodyContrast(colors)).toBe(true);
+      for (const [role] of tones) {
+        for (const [surface, background] of [["bg", colors.bg], ["panel", colors.panel]] as const) {
+          assertMinContrast(id, `${role}/${surface}`, colors[role], background, TONE_TEXT_MIN);
+        }
+      }
+    }
+    // A dark theme draws its tones and hints on the page as it always has.
+    applyTheme("amber");
+    expect(readsAtBodyContrast(colors)).toBe(false);
+  });
+
+  // The chosen row of a pane without the keyboard read 1.15:1 on the page in
+  // high contrast, blue and midnight, near enough to vanish, and a loss on it
+  // 2.89:1 in nord, a gain 2.99:1 in rosepine and muted text 2.92:1 in solarized.
+  test("keeps the inactive selection apart from the page, a panel and the selection, and every text on it readable", () => {
+    const roles = ["text", "textDim", "textMuted", "textBright", "positive", "negative", "warning", "neutral"] as const;
+    for (const [id, theme] of Object.entries(themes)) {
+      const fill = inactiveSelectedBg(theme);
+      assertMinContrast(id, "inactiveSelected/bg", fill, theme.bg, INACTIVE_SELECTION_MIN);
+      assertMinContrast(id, "inactiveSelected/panel", fill, theme.panel, INACTIVE_SELECTION_MIN);
+      // Still the quieter of the two: the focused pane's selection reads apart from it.
+      assertMinContrast(id, "selected/inactiveSelected", theme.selected, fill, 1.25);
+      for (const role of roles) {
+        assertMinContrast(id, `${role}/inactiveSelected`, inactiveSelectedText(theme[role], theme), fill, INACTIVE_SELECTION_TEXT_MIN);
+      }
+      // A colour that reads already is drawn as it is: a row's body text keeps its colour in every theme.
+      expect(inactiveSelectedText(theme.text, theme)).toBe(theme.text);
     }
   });
 

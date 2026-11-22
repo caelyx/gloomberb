@@ -5,16 +5,19 @@ import {
   compositeAxisTicks,
   formatChartLegendValue,
   formatCompositeAxisValue,
+  formatCompositeCursorAxisDate,
   formatCompositeCursorDate,
   formatCompositeCursorValue,
   formatCompositePointDetails,
   formatCompositeSeriesValue,
   formatCompositeTimeAxisDate,
+  sameCompositeAxisDomain,
   type CompositeAxisValueFormatter,
 } from "./format";
 import { formatCompact } from "../../../utils/format";
 import type { ResolvedSeries, TimeSeriesPoint } from "../../../time-series/types";
 import { renderCompositeAxisText } from "./text-renderer";
+import { compositeAxisLabelWidth } from "./panel-labels";
 import { buildCompositeTimeAxisLayout, buildCompositeViewportTimeAxisLayout } from "./time-axis";
 
 function scene(start: string, end: string): CompositeChartScene {
@@ -58,9 +61,9 @@ describe("composite chart timestamp formatting", () => {
       overnight.endTime,
     )).toBe("01-02 00:15 UTC");
     const axis = buildCompositeTimeAxisLayout(overnight, 80).text;
-    expect(axis).toContain("Jan 1 23:30 UTC");
-    expect(axis).toContain("Jan 2 00:00");
-    expect(axis).toContain("Jan 2 00:30 UTC");
+    expect(axis).toContain("1 Jan 23:30 UTC");
+    expect(axis).toContain("2 Jan 00:00");
+    expect(axis).toContain("2 Jan 00:30 UTC");
   });
 
   test("keeps longer chart spans as concise UTC calendar dates", () => {
@@ -69,8 +72,19 @@ describe("composite chart timestamp formatting", () => {
 
     expect(formatCompositeCursorDate(cursor, weekly.startTime, weekly.endTime)).toBe("2025-01-04");
     expect(formatCompositeTimeAxisDate(cursor, weekly.startTime, weekly.endTime)).toBe("2025-01-04");
-    expect(buildCompositeTimeAxisLayout(weekly, 60).text).toContain("Jan 1");
-    expect(buildCompositeTimeAxisLayout(weekly, 60).text).toContain("Jan 8");
+    expect(buildCompositeTimeAxisLayout(weekly, 60).text).toContain("1 Jan");
+    expect(buildCompositeTimeAxisLayout(weekly, 60).text).toContain("8 Jan");
+  });
+
+  test("the desktop's cursor tag on a daily axis reads as its end labels do, and keeps a time of day", () => {
+    const year = scene("2025-01-01T00:00:00Z", "2025-12-31T00:00:00Z");
+    const cursor = new Date("2025-11-03T00:00:00Z");
+    const tag = (words: boolean, intradayBars = false) => formatCompositeCursorAxisDate(cursor, year.startTime, year.endTime, undefined, intradayBars, words);
+
+    expect(tag(true)).toBe("3 Nov 2025");
+    // Cells keep the ISO date, which no tick is written in.
+    expect(tag(false)).toBe("2025-11-03");
+    expect(tag(true, true)).toBe("2025-11-03 00:00 UTC");
   });
 
   test("renders recovery-shell dates directly from a viewport", () => {
@@ -79,8 +93,8 @@ describe("composite chart timestamp formatting", () => {
       end: new Date("2025-01-08T00:00:00.000Z"),
     }, 60).text;
 
-    expect(axis).toContain("Jan 1");
-    expect(axis).toContain("Jan 8");
+    expect(axis).toContain("1 Jan");
+    expect(axis).toContain("8 Jan");
   });
 });
 
@@ -134,6 +148,21 @@ describe("composite chart point details", () => {
 });
 
 describe("composite chart unit formatting", () => {
+  test("Treasury axes and cursors keep the legend's 32nds, including fractional ticks and adjusted prices", () => {
+    for (const [value, expected] of [[104.484375, "104-15½"], [104.0078125, "104-00¼"], [104.49, "104-15.68"], [-0.375, "-0-12"]] as const) {
+      for (const span of [0.125, 20]) {
+        const domain = {
+          side: "right" as const, seriesIds: ["treasury"], min: value - span, max: value + span,
+          scale: "linear" as const, unit: "32nds", unitGroup: "price:32nds", priceAssetCategories: ["FUTURE"],
+          priceReferences: { FUTURE: value },
+        };
+        expect(formatChartLegendValue(value, domain.unit, domain.unitGroup, "FUTURE", value)).toBe(expected);
+        expect(formatCompositeAxisValue(value, domain)).toBe(expected);
+        expect(formatCompositeCursorValue(value, domain)).toBe(expected);
+      }
+    }
+  });
+
   test("keeps derived ratio dimensions visible instead of labeling them as multiples", () => {
     const derived: ResolvedSeries = {
       id: "ratio",
@@ -211,6 +240,8 @@ describe("composite chart unit formatting", () => {
     expect(formatChartLegendValue(90_007_000_000, "USD", "currency-total:USD")).toBe("$90.01B");
     expect(formatChartLegendValue(-12_345_600_000, "EUR", "currency-total")).toBe("-€12.35B");
     expect(formatChartLegendValue(123_456_000, "CAD", "currency-total:CAD")).toBe("123.46M CAD");
+    // A coin's volume is the value it traded, read at its scale like any total.
+    expect(formatChartLegendValue(223_397_618_905, "USD", "volume")).toBe("$223.4B");
     expect(formatCompositeCursorValue(90_007_000_000, { ...domain, unitGroup: "currency-total:USD" })).toBe("$90.01B");
     expect(formatCompositeCursorValue(-12_345_600_000, { ...domain, unit: "EUR", unitGroup: "currency-total" })).toBe("-€12.35B");
     expect(formatCompositeCursorValue(123_456_000, { ...domain, unit: "CAD", unitGroup: "currency-total:CAD" })).toBe("123.46M CAD");
@@ -259,13 +290,14 @@ test("zoomed price axes spend the digits their ticks need and stay compact when 
   const crypto = { priceAssetCategories: ["CRYPTOCURRENCY"] };
 
   expect(labels(109_500, 109_620, crypto)).toEqual(["$109,600", "$109,550", "$109,500"]);
-  expect(labels(109_500, 109_620, { ...crypto, scale: "log" })).toEqual(["$109,620", "$109,560", "$109,500"]);
+  // Inside one decade a log axis takes the same round steps.
+  expect(labels(109_500, 109_620, { ...crypto, scale: "log" })).toEqual(["$109,600", "$109,550", "$109,500"]);
   expect(labels(1.1598, 1.1607, { priceAssetCategories: ["CURRENCY"] })).toEqual(["$1.1606", "$1.1604", "$1.1602", "$1.1600", "$1.1598"]);
   expect(labels(0.000005, 0.000006, { ...crypto, maxTicks: 3 })).toEqual(["$0.0000060", "$0.0000055", "$0.0000050"]);
 
   // A wide view is already legible, so it keeps the narrower compact gutter.
   expect(labels(52_000, 133_000, crypto)).toEqual(["$120K", "$100K", "$80K", "$60K"]);
-  expect(labels(52_000, 133_000, { ...crypto, scale: "log" })).toEqual(["$133K", "$83K", "$52K"]);
+  expect(labels(52_000, 133_000, { ...crypto, scale: "log" })).toEqual(["$120K", "$100K", "$80K", "$60K"]);
   expect(labels(250, 262, { priceAssetCategories: ["EQUITY"] })).toEqual(["$260", "$255", "$250"]);
 
   for (const [min, max] of [[109_500, 109_620], [1.1598, 1.1607], [0.000005, 0.000006], [52_000, 133_000]] as const) {
@@ -329,7 +361,6 @@ describe("axis ticks never repeat a label", () => {
   });
 
   test("falls back to the top and bottom, then to one label", () => {
-    // A log axis has no round ladder to climb.
     expect(labels(thousands, 1880, 2030, 14, { scale: "log" })).toEqual(["2k", "1.9k"]);
     expect(labels(percent, 45.2, 45.4, 14)).toEqual(["45%"]);
     expect(labels(() => "n/a", 0, 100, 20)).toEqual(["n/a"]);
@@ -353,5 +384,105 @@ describe("axis ticks never repeat a label", () => {
         }
       }
     }
+  });
+});
+
+// A log axis labelled its top, middle and bottom: NVDA's whole history read $415, $2.85 and $0.0195.
+test("a log axis labels powers of ten, and their 2 and 5 steps where the panel has room", () => {
+  const axis = (min: number, max: number, rows: number, extra: Record<string, unknown> = {}) => ({
+    side: "right" as const, seriesIds: ["price"], min, max, scale: "log" as const, unit: "USD", unitGroup: "price:USD",
+    maxTicks: compositeAxisMaxTicks(rows), ...extra,
+  });
+  const labels = (...args: Parameters<typeof axis>) => compositeAxisTicks(axis(...args)).map((tick) => tick.label);
+  // Desktop labels sit at their exact heights; the terminal's on the row nearest each, a row clear of the next.
+  for (const rows of [undefined, 10]) {
+    const snapped = (min: number, max: number, height: number) => labels(min, max, height, rows ? { tickRows: height } : {});
+    expect(snapped(0.0195, 415, 10)).toEqual(["$100", "$10", "$1", "$0.1"]);
+    expect(snapped(3, 7_500, 20)).toEqual(["$1K", "$100", "$10"]);
+    expect(snapped(18, 110, 10)).toEqual(["$100", "$50", "$20"]);
+    expect(snapped(0.5, 15, 10)).toEqual(["$10", "$5", "$2", "$1", "$0.5"]);
+  }
+  // Twenty decades on six rows: powers far enough apart for three labels.
+  expect(labels(2e-9, 5e10, 6)).toEqual(["$1M", "$1", "$0.000001"]);
+  const terminal = axis(0.0195, 415, 10, { tickRows: 10 });
+  const rows = compositeAxisTicks(terminal).map((tick) => Math.round(tick.ratio * 9));
+  expect(rows.every((row, index) => index === 0 || row - rows[index - 1]! >= 2)).toBe(true);
+});
+
+// A log axis with no 1, 2, 5 ladder to label takes even steps, which it crowds
+// towards its top: 26 to 89 on a ten-row desktop panel read $80 to $30 a row
+// or less apart.
+test("a short desktop log axis keeps its even steps about a row apart, or labels its top, middle and bottom", () => {
+  const ticks = (min: number, max: number, rows: number) => compositeAxisTicks({
+    side: "right", seriesIds: ["price"], min, max, scale: "log", unit: "USD", unitGroup: "price:USD", maxTicks: compositeAxisMaxTicks(rows),
+  });
+  const labels = (min: number, max: number, rows: number) => ticks(min, max, rows).map((tick) => tick.label);
+  expect(labels(26, 89, 10)).toEqual(["$80", "$60", "$40"]);
+  expect(labels(26, 89, 7)).toEqual(["$80", "$60", "$40"]);
+  // No even step fits five rows.
+  expect(labels(26, 89, 5)).toEqual(["$89.0", "$48.1", "$26.0"]);
+  for (let rows = 5; rows <= 10; rows += 1) {
+    for (let min = 10; min < 100; min += 3) {
+      for (let span = 1.2; span <= 3.4; span += 0.2) {
+        const ratios = ticks(min, min * span, rows).map((tick) => tick.ratio).sort((left, right) => left - right);
+        const closest = Math.min(...ratios.slice(1).map((ratio, index) => ratio - ratios[index]!)) * (rows - 1);
+        if (closest < 1 - 1e-6) throw new Error(`${min} to ${min * span} on ${rows} rows: labels ${closest.toFixed(2)} rows apart`);
+      }
+    }
+  }
+});
+
+// A chart builds its axes again on every tick. What was worked out for an
+// equal axis is kept, and only for one: another range or formatter reads its own.
+describe("an axis built again", () => {
+  const axis = (max: number) => ({
+    side: "right" as const,
+    seriesIds: ["price"],
+    min: 100,
+    max,
+    scale: "linear" as const,
+    unit: "USD",
+    unitGroup: "currency",
+    maxTicks: 6,
+  });
+
+  test("reads the ticks worked out for an equal axis, and a moved one its own", () => {
+    const ticks = compositeAxisTicks(axis(200));
+    expect(compositeAxisTicks({ ...axis(200), seriesIds: ["price"] })).toBe(ticks);
+    expect(compositeAxisTicks(axis(260)).map((tick) => tick.value)).not.toEqual(ticks.map((tick) => tick.value));
+    expect(compositeAxisTicks(axis(200), String).map((tick) => tick.label)).toEqual(ticks.map((tick) => String(tick.value)));
+  });
+
+  test("is the same axis only when every field either has is equal", () => {
+    const base = axis(200);
+    expect(sameCompositeAxisDomain(base, { ...base, tickRows: undefined })).toBe(true);
+    expect(sameCompositeAxisDomain({ ...base, tickRows: undefined }, { ...base, scaleKey: "close" })).toBe(false);
+    expect(sameCompositeAxisDomain({ ...base, scaleKey: "close" }, { ...base, tickRows: undefined })).toBe(false);
+    expect(sameCompositeAxisDomain(
+      { ...base, priceReferences: { USD: undefined as unknown as number } },
+      { ...base, priceReferences: { EUR: 1.08 } },
+    )).toBe(false);
+    expect(sameCompositeAxisDomain({ ...base, seriesIds: ["price"] }, { ...base, seriesIds: ["price", "volume"] })).toBe(false);
+  });
+
+  // A formatter is meant to read only the value and the axis. One that reads
+  // something else and keeps its identity is caught when its top label moves.
+  test("labels an axis again when its formatter reads differently for the same axis", () => {
+    let unit = "a";
+    const format = (value: number) => `${value}${unit}`;
+    const first = compositeAxisTicks(axis(203), format);
+    expect(compositeAxisTicks(axis(203), format)).toBe(first);
+    expect(compositeAxisLabelWidth(axis(203), format, false)).toBe(Math.max(...first.map((tick) => tick.label.length)));
+    unit = "bcd";
+    expect(compositeAxisTicks(axis(203), format).map((tick) => tick.label)).toEqual(first.map((tick) => `${tick.value}bcd`));
+    expect(compositeAxisLabelWidth(axis(203), format, false)).toBe(Math.max(...first.map((tick) => tick.label.length)) + 2);
+  });
+
+  test("sizes its gutter for the cursor's precision with no formatter, whichever was asked first", () => {
+    // A fresh range for each order, so the first question finds nothing kept.
+    const bare = compositeAxisLabelWidth(axis(201), undefined, true);
+    expect(compositeAxisLabelWidth(axis(201), formatCompositeAxisValue, true)).toBeLessThan(bare);
+    const formatted = compositeAxisLabelWidth(axis(202), formatCompositeAxisValue, true);
+    expect(compositeAxisLabelWidth(axis(202), undefined, true)).toBeGreaterThan(formatted);
   });
 });

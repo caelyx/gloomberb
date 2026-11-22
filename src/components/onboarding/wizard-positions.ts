@@ -12,7 +12,7 @@ import {
 } from "../../portfolio/mutations";
 import { isFuturesTicker } from "../../portfolio/futures-positions";
 import { loadFuturesEntrySize } from "../../portfolio/futures-terms";
-import { wholeUnitQuantityProblem } from "../../portfolio/position-quantity";
+import { ambiguousQuantityProblem } from "../../portfolio/position-quantity";
 import { useAppDispatch, useAppSelector, useAppStateRef } from "../../state/app/context";
 import { saveConfigImmediately } from "../../state/config-save-scheduler";
 import { resolveTickerSearch, upsertTickerFromSearchResult, type ResolvedTickerSearch } from "../../tickers/search";
@@ -27,6 +27,7 @@ import {
   listOnboardingPositions,
   type OnboardingPositionRow,
 } from "./wizard-model";
+import { logFailure } from "../../utils/log-failure";
 
 const onboardingLog = debugLog.createLogger("onboarding");
 const PREVIEW_DEBOUNCE_MS = 300;
@@ -114,7 +115,7 @@ export function useOnboardingPositions({
   const stateRef = useAppStateRef();
   const tickers = useAppSelector((state) => state.tickers);
   const financials = useAppSelector((state) => state.financials);
-  const portfolioId = useAppSelector((state) => getOnboardingPortfolioId(state.config));
+  const portfolioId = useAppSelector((state) => getOnboardingPortfolioId(state.config, state.tickers.values()));
   const [draft, setDraft] = useState<PositionDraft>(EMPTY_DRAFT);
   const [fieldIdx, setFieldIdx] = useState(0);
   const [preview, setPreview] = useState<PositionPreview>({ status: "idle" });
@@ -156,7 +157,8 @@ export function useOnboardingPositions({
       try {
         const exchange = resolved.kind === "provider" ? resolved.result.exchange : resolved.ticker.metadata.exchange;
         quote = await pluginRegistry.marketData.getQuote(resolved.symbol, exchange);
-      } catch {
+      } catch (error) {
+        logFailure("onboarding.positions", "Load position quote failed")(error);
         quote = null;
       }
     }
@@ -292,8 +294,8 @@ export function useOnboardingPositions({
       if (shares === null) {
         nextTicker = addTickerToPortfolio(ticker, portfolioId).ticker;
       } else {
-        // 1.250 on a listing held in whole lots could be 1,250 as well, and asks as 1,250 does.
-        const lots = wholeUnitQuantityProblem(current.shares.trim(), ticker, { label: quantityLabel });
+        // 1.250 could be 1,250 as well, and asks as 1,250 does.
+        const lots = ambiguousQuantityProblem(current.shares.trim(), ticker, { label: quantityLabel });
         if (lots) {
           setFieldIdx(1);
           setError(lots);
@@ -302,7 +304,7 @@ export function useOnboardingPositions({
         const costBasis = avgCost ?? result.quote?.price;
         if (costBasis === undefined || costBasis === null || !Number.isFinite(costBasis)) {
           setFieldIdx(2);
-          setError(t("No live price yet. Enter the average cost."));
+          setError(t("No price yet. Enter the average cost."));
           return false;
         }
         // A future is entered in contracts, sized by its terms; a cost typed as corn is quoted counts cents.
@@ -415,6 +417,13 @@ export function useOnboardingPositions({
     /** What a blank Currency saves: the listing's currency, else the portfolio's. */
     blankCurrency: (preview.status === "ready" && preview.currency ? preview.currency : fallbackCurrency).toUpperCase(),
     fieldIdx,
+    /**
+     * The cursor is in the Ticker field and it is empty: with a holding
+     * listed, Enter there goes on to the next step instead of asking for one.
+     */
+    onEmptyTicker: fieldIdx === 0 && !normalizePositionQuery(draft.ticker),
+    /** A ticker is typed but not added yet: Add, Enter on the last field, or Continue adds it. */
+    hasDraft: !!normalizePositionQuery(draft.ticker),
     preview,
     /** What the size field counts: Contracts for a future, else Shares. */
     quantityLabel,

@@ -1,12 +1,67 @@
-import type { DividendPayment } from "./types";
+import type { DividendMetrics, DividendPayment, GrowthPayments } from "./types";
+import { MISSING_VALUE, formatCurrency, formatDistributionAmount } from "../../../utils/format";
+import { resolveCurrencyUnit } from "../../../utils/currency-units";
 import type { ProjectedChartPoint } from "../../../components/chart/core/data";
 import { calendarMonthsBefore } from "../../../utils/calendar-date";
-import { LATE_GRACE_DAYS, trailingCashAt } from "../../../utils/trailing-dividend";
+import { NOT_MEANINGFUL, formatPriceEarnings } from "../../../utils/price-earnings";
+import { UNEVEN_REGULAR_PAYMENTS } from "../../../utils/forward-dividend";
+import { CADENCE_GRACE_DAYS, LATE_GRACE_DAYS, trailingCashAt, type TrailingPayments } from "../../../utils/trailing-dividend";
 
 const DAY = 24 * 60 * 60 * 1000;
 
+export function formatConvertedAmount(value: number | null | undefined, currency: string, subUnit?: string): string {
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
+  const unit = subUnit ? resolveCurrencyUnit(subUnit) : null;
+  return unit && unit.divisor !== 1 && unit.currency === currency
+    ? formatCurrency(value * unit.divisor, subUnit!, 6)
+    : formatCurrency(value, currency, 8);
+}
+
+export function formatDividendRowAmount(row: Pick<DividendRow, "amount" | "currency" | "cashEstimate">, converted = false, subUnit?: string): string {
+  const cash = converted ? formatConvertedAmount(row.amount, row.currency, subUnit) : formatDistributionAmount(row.amount, row.currency);
+  return `${row.cashEstimate ? "estimated " : ""}${cash}`;
+}
+
+export function forwardEstimateText(metrics: DividendMetrics): string | null {
+  const estimate = metrics.forwardEstimate;
+  if (!estimate) return null;
+  return `${metrics.forwardBasis === "uneven" ? `${UNEVEN_REGULAR_PAYMENTS}; ` : ""}${cashEstimateText(estimate)}`;
+}
+
+export function cashEstimateText(estimate: NonNullable<DividendMetrics["forwardEstimate"]>): string {
+  const declared = estimate.declaredAmount == null ? estimate.declaredCurrency : `${estimate.declaredAmount} ${estimate.declaredCurrency}/share`;
+  return `estimated from ${declared}; FX ${estimate.fixingDate ? `fixing ${estimate.fixingDate}` : "fixing unavailable"}${estimate.basis ? `; ${estimate.basis}` : ""}`;
+}
+
+/** What a converted amount says beside it: `converted from USD`. */
+export const convertedFromText = (currency: string) => `converted from ${currency}`;
+
 export function formatDividendYield(value: number | null): string {
-  return value != null && Number.isFinite(value) ? `${(value * 100).toFixed(2)}%` : "—";
+  return value != null && Number.isFinite(value) ? `${(value * 100).toFixed(2)}%` : MISSING_VALUE;
+}
+
+/** A payout over zero or negative earnings, written as a P/E over a loss is. */
+export const PAYOUT_NOT_MEANINGFUL = formatPriceEarnings(NOT_MEANINGFUL);
+
+/** How many payments a trailing yield counts, for a regular payer whose year holds fewer than its cadence pays: "9 of 12 payments". */
+export function trailingPaymentsText(payments: TrailingPayments | null | undefined, { cadence = false }: { cadence?: boolean } = {}): string | null {
+  return payments ? `${payments.counted} of ${payments.expected} ${cadence ? `${payments.cadence} ` : ""}payments` : null;
+}
+
+/** How many payments a growth figure's short year holds: "1 of 2 payments", naming an earlier year by its end. */
+export function growthPaymentsDetail(payments: GrowthPayments): string {
+  return `${payments.counted} of ${payments.expected} payments${payments.yearTo ? ` in the year to ${payments.yearTo}` : ""}`;
+}
+
+/** What a growth figure reads when one of its years is short: "n/a: 1 of 2 payments". */
+export function growthPaymentsText(payments: GrowthPayments): string {
+  return `n/a: ${growthPaymentsDetail(payments)}`;
+}
+
+/** A history served stale, dated by its read when the source gave it. */
+export function staleHistoryText(fetchedAt: string | undefined): string {
+  const day = fetchedAt && /^\d{4}-\d{2}-\d{2}/.test(fetchedAt) ? fetchedAt.slice(0, 10) : null;
+  return `Stale cash history${day ? ` as of ${day}` : ""}; recent distributions may be missing.`;
 }
 
 /** Cash history does not contain historical share prices, so cannot establish historical yields. */
@@ -31,6 +86,10 @@ export function buildTrailingCashChartPoints(payments: DividendPayment[], now = 
           const lateExpiry = expiry.getTime() + days * DAY;
           if (lateExpiry <= now.getTime()) dates.add(lateExpiry);
         }
+      } else {
+        // The cadence's look past two years ends too (inferCadence).
+        const cadenceExpiry = expiry.getTime() + CADENCE_GRACE_DAYS * DAY;
+        if (cadenceExpiry <= now.getTime()) dates.add(cadenceExpiry);
       }
     }
   }
@@ -51,7 +110,12 @@ export interface DividendRow {
   key: string;
   exDate: string;
   amount: number;
+  cashEstimate?: DividendPayment["cashEstimate"];
   currency: string;
+  /** The amount as the company declared it, in another currency (DividendPayment.declared). */
+  declared?: { amount: number; currency: string };
+  /** Who published it when not the listing's history: the fund's sponsor (DividendPayment.source). */
+  source?: string;
 }
 
 export function toDividendRows(payments: DividendPayment[]): DividendRow[] {
@@ -59,6 +123,9 @@ export function toDividendRows(payments: DividendPayment[]): DividendRow[] {
     key: `${payment.exDate.toISOString()}:${index}`,
     exDate: payment.exDate.toISOString().slice(0, 10),
     amount: payment.amount,
+    ...(payment.cashEstimate ? { cashEstimate: payment.cashEstimate } : {}),
     currency: payment.currency,
+    ...(payment.declared ? { declared: payment.declared } : {}),
+    ...(payment.source ? { source: payment.source.publisher } : {}),
   }));
 }

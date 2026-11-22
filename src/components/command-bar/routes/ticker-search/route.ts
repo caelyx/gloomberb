@@ -7,6 +7,7 @@ import {
   mergeTickerSearchResultItems,
   QUICK_LOOK_TICKER_SEARCH_OPTIONS,
   tickerSearchFailureItems,
+  withMajorCoinCandidate,
 } from "./results";
 import type { ResultItem } from "../../list/model";
 
@@ -16,6 +17,8 @@ export function useTickerSearchRouteResults(options: {
   buildTickerSearchResultItems: (candidates: TickerSearchCandidate[], query: string) => ResultItem[];
   dataProvider: DataProvider;
   getTickers: () => AppState["tickers"];
+  /** The venue of the user's own market, whose lines of the company a word names lead. */
+  homeVenue?: string | null;
   localTickerSearchResultItems: (query?: string, options?: { category?: string; limit?: number }) => ResultItem[];
   readTickerSearchCache: (
     query: string,
@@ -40,6 +43,7 @@ export function useTickerSearchRouteResults(options: {
     buildTickerSearchResultItems,
     dataProvider,
     getTickers,
+    homeVenue,
     localTickerSearchResultItems,
     readTickerSearchCache,
     routeQuery,
@@ -81,7 +85,7 @@ export function useTickerSearchRouteResults(options: {
       brokerInstanceId,
     );
     setTickerSearchResults(cachedCandidates
-      ? mergeTickerSearchResultItems(searchQuery, buildTickerSearchResultItems(cachedCandidates, searchQuery), localItems)
+      ? mergeTickerSearchResultItems(searchQuery, buildTickerSearchResultItems(withMajorCoinCandidate(searchQuery, cachedCandidates, getTickers()), searchQuery), localItems)
       : localItems);
     const requestId = ++searchRequestIdRef.current;
     const searchDelay = skipTickerSearchDebounceRef.current ? 0 : 200;
@@ -103,6 +107,7 @@ export function useTickerSearchRouteResults(options: {
           },
           // The rows the CLI's search reads, so CAR Group on ASX (CAR's eleventh row) is offered too.
           totalLimit: LISTING_SEARCH_LIMIT,
+          homeVenue,
           ...QUICK_LOOK_TICKER_SEARCH_OPTIONS,
         });
         if (requestId !== searchRequestIdRef.current) return;
@@ -114,7 +119,7 @@ export function useTickerSearchRouteResults(options: {
         );
         setTickerSearchResults(mergeTickerSearchResultItems(
           searchQuery,
-          buildTickerSearchResultItems(combined, searchQuery),
+          buildTickerSearchResultItems(withMajorCoinCandidate(searchQuery, combined, getTickers()), searchQuery),
           localTickerSearchResultItems(searchQuery, { limit: 6 }),
         ));
       } catch (error) {
@@ -136,6 +141,7 @@ export function useTickerSearchRouteResults(options: {
     buildTickerSearchResultItems,
     dataProvider,
     getTickers,
+    homeVenue,
     localTickerSearchResultItems,
     readTickerSearchCache,
     resetTickerSearchRoute,

@@ -32,6 +32,7 @@ import {
 import { promptChoice } from "./prompts";
 import { thesisStore } from "./store";
 import { ClippedText } from "../../../../components/ui/display";
+import { useSelectionFill } from "../../../../components/ui/selection-fill";
 import { logFailure } from "../../../../utils/log-failure";
 
 type Row =
@@ -155,22 +156,28 @@ export function ThesisDetail({ thesis, width, height, focused, footerId, onDelet
   const [busy, setBusy] = useState(false);
   const generation = useRef(0);
   const { nativePaneChrome } = useUiCapabilities();
+  const selectionFill = useSelectionFill();
 
   const ctx = useMemo<flows.FlowContext>(() => ({ dialog, notify, hasProAccess: plan.hasProAccess, openUpgrade }), [dialog, notify, openUpgrade, plan.hasProAccess]);
 
-  const reloadSignals = useCallback(async () => {
+  // A failed load is logged and the signals on screen stay. A flow that
+  // changed the signals waits on the reload before it says it is done.
+  const reloadSignalsAndWait = useCallback(async () => {
     const current = ++generation.current;
     const detail = await thesisStore.loadDetail(thesis.id).catch(logFailure("cloud.thesis.detail", "Load thesis signals failed", null));
     if (generation.current !== current || !detail) return;
     setSignals(detail.signals);
   }, [thesis.id]);
+  const reloadSignals = useCallback(() => {
+    reloadSignalsAndWait().catch(logFailure("cloud.thesis.detail", "Reloading thesis signals failed"));
+  }, [reloadSignalsAndWait]);
 
   useEffect(() => {
-    void reloadSignals();
+    reloadSignals();
   }, [reloadSignals, thesis.revision, thesis.openSignals]);
 
   useEffect(() => thesisStore.onSignals((id) => {
-    if (id === thesis.id) void reloadSignals();
+    if (id === thesis.id) reloadSignals();
   }), [reloadSignals, thesis.id]);
 
   // Two cells of padding plus the list scrollbar column.
@@ -245,9 +252,9 @@ export function ThesisDetail({ thesis, width, height, focused, footerId, onDelet
     else if (row.kind === "catalyst") await flows.editCatalyst(ctx, current(), row.item);
     else if (row.kind === "signal") {
       await flows.resolveSignal(ctx, current(), row.item);
-      await reloadSignals();
+      await reloadSignalsAndWait();
     }
-  }), [ctx, reloadSignals, run, selectedRow]);
+  }), [ctx, reloadSignalsAndWait, run, selectedRow]);
 
   const cycleStatus = useCallback(() => run(async () => {
     const row = selectedRow;
@@ -271,8 +278,8 @@ export function ThesisDetail({ thesis, width, height, focused, footerId, onDelet
     const target = row && (row.kind === "pillar" || row.kind === "kill" || row.kind === "catalyst")
       ? ({ kind: row.kind, item: row.item } as flows.DocumentItem)
       : null;
-    if (await flows.challenge(ctx, current(), target)) await reloadSignals();
-  }), [ctx, reloadSignals, run, selectedRow]);
+    if (await flows.challenge(ctx, current(), target)) await reloadSignalsAndWait();
+  }), [ctx, reloadSignalsAndWait, run, selectedRow]);
 
   // The review lands over realtime; onSignals below refetches when it does.
   const review = useCallback(() => run(() => flows.runReview(ctx, current())), [ctx, run]);
@@ -314,7 +321,7 @@ export function ThesisDetail({ thesis, width, height, focused, footerId, onDelet
     else if (isPlainKey(event, "c")) void challengeSelected();
     // r refreshes, as everywhere; the paid AI review is its own key.
     else if (isPlainKey(event, "v")) void review();
-    else if (isPlainKey(event, "r")) void reloadSignals();
+    else if (isPlainKey(event, "r")) reloadSignals();
     else if (isPlainKey(event, "e")) void editMenu();
     else if (isPlainKey(event, "o")) openSource();
     else return;
@@ -355,8 +362,11 @@ export function ThesisDetail({ thesis, width, height, focused, footerId, onDelet
   const renderRow = useCallback((item: ListViewItem, state: { selected: boolean }) => {
     const row = rows.find((entry) => entry.id === item.id);
     if (!row) return null;
-    const fg = state.selected ? colors.selectedText : colors.text;
-    const dim = state.selected ? colors.selectedText : colors.textDim;
+    const lit = state.selected && selectionFill.lit;
+    // On the quieter fill a row's colours are lifted where they would not read.
+    const ink = (color: string) => (state.selected ? selectionFill.ink(color) : color);
+    const fg = lit ? colors.selectedText : ink(colors.text);
+    const dim = lit ? colors.selectedText : ink(colors.textDim);
     // Every row is a full-width row box, so the DOM host lays headings and
     // prose out flush left like the pillar rows instead of centering them.
     if (row.kind === "heading") {
@@ -427,7 +437,7 @@ export function ThesisDetail({ thesis, width, height, focused, footerId, onDelet
         <Text fg={dim}>{rightText}</Text>
       </Box>
     );
-  }, [contentWidth, rows, thesis.document]);
+  }, [contentWidth, rows, selectionFill.lit, thesis.document]);
 
   const owner = isTeam ? teamStore.getTeam(thesis.owner.id)?.name ?? "team" : null;
   const nextDue = thesis.document.catalysts
@@ -519,7 +529,7 @@ export function ThesisDetail({ thesis, width, height, focused, footerId, onDelet
           rowGap={0}
           height={nativePaneChrome ? undefined : Math.max(3, height - headerHeight - stripHeight)}
           flexGrow={nativePaneChrome ? 1 : undefined}
-          getRowBackgroundColor={(item, state) => (state.selected ? colors.selected : item.disabled ? colors.bg : undefined)}
+          getRowBackgroundColor={(item, state) => (state.selected ? selectionFill.bg : item.disabled ? colors.bg : undefined)}
           remoteRole="thesis"
           remoteLabel={thesis.title}
         />

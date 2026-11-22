@@ -88,7 +88,7 @@ test("a signal on the final session does not trade", () => {
   expect(result.strategy.exposurePct).toBe(0);
 });
 
-test("rolling windows are one year of bars: 365 for a 24/7 series, 252 for exchange sessions", () => {
+test("rolling windows are one year of bars: 365 for a 24/7 series, 260 for a currency pair, 252 for exchange sessions", () => {
   // Steady rise: always-in matches buy-and-hold minus nothing; never-in loses every window.
   const closes = Array.from({ length: 400 }, (_, index) => 100 + index);
   const options = { lookbackYears: null, costBps: 0 };
@@ -101,6 +101,14 @@ test("rolling windows are one year of bars: 365 for a 24/7 series, 252 for excha
   const sessions = runBacktest(bars(closes, undefined, sessionDay), parseRule("close < 0"), parseRule("close < 0"), options);
   expect(sessions.barsPerYear).toBe(252);
   expect(sessions.rollingWin.windows).toBe(400 - 252);
+  // The same weekdays of a currency pair are its 260-bar year, by what it is; a short run of it too.
+  const pair = runHistoryBacktest({ symbol: "USDJPY=X", bars: bars(closes, undefined, sessionDay), skippedDates: [], undatedSkipped: 0 },
+    parseRule("close < 0"), parseRule("close < 0"), options);
+  expect(pair.barsPerYear).toBe(260);
+  expect(pair.rollingWin.windows).toBe(400 - 260);
+  const month = runHistoryBacktest({ symbol: "USDJPY=X", bars: bars(closes.slice(0, 40), undefined, sessionDay), skippedDates: [], undatedSkipped: 0 },
+    parseRule("close < 0"), parseRule("close < 0"), options);
+  expect(month.barsPerYear).toBe(260);
 });
 
 test("volatility and Sharpe annualize at the series' bars per year", () => {
@@ -153,7 +161,7 @@ test("a run over a listing that no longer trades ends on its last session and sa
   const history = { symbol: "SIVB", bars: sessions, skippedDates: [], undatedSkipped: 0,
     delisting: { status: "delisted" as const, lastTradeDate: "2023-03-09", historyStart: "2021-01-04" } };
   const rules = [parseRule("close > sma(20)"), parseRule("close < sma(20)")] as const;
-  const ended = "SIVB: Delisted Mar 9, 2023. The run ends on its last session, 2023-03-09, and a position still held"
+  const ended = "SIVB: Delisted 9 Mar 2023. The run ends on its last session, 2023-03-09, and a position still held"
     + " is valued at that close, not at anything holders received after it.";
   // Through the newest session, or to an end after it: no later session will come, so the run is repeatable now.
   for (const end of [null, "2023-12-31"]) {
@@ -162,7 +170,7 @@ test("a run over a listing that no longer trades ends on its last session and sa
   }
   // 2021 to 2022 ends before the last session: an ordinary run, still naming the listing as delisted.
   const year = runHistoryBacktest(history, ...rules, { lookbackYears: null, costBps: 5, end: "2022-12-31" });
-  expect([year.end, year.repeatable, year.warnings]).toEqual(["2022-12-30", true, ["SIVB: Delisted Mar 9, 2023."]]);
+  expect([year.end, year.repeatable, year.warnings]).toEqual(["2022-12-30", true, ["SIVB: Delisted 9 Mar 2023."]]);
 });
 
 test("sessions served without a positive close are warned by date, a long list shortened", () => {

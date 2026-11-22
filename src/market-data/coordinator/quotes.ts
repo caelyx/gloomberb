@@ -1,15 +1,16 @@
 import type { DataProvider, QuoteSubscriptionTarget } from "../../types/data-provider";
 import type { Quote } from "../../types/financials";
 import type { InstrumentRef } from "../request-types";
-import { marketDataFrames, type DataFrameScheduler } from "../frame-scheduler";
+import { marketDataFrames, type DataFrameRequest, type DataFrameScheduler } from "../frame-scheduler";
 import { mergeQuoteSubscriptionTargets } from "../quote-subscription-target";
 import { QueryStore } from "../query-store";
 import type { QueryEntry } from "../result-types";
 import { buildQuoteKey, instrumentFromQuoteTarget, toMarketDataContext } from "../selectors";
 import { measurePerf } from "../../utils/perf-marks";
+import { quoteStampBucket } from "../quotes/freshness";
 import { withSavedCopyMarkOf } from "../../data/saved-copies";
 import {
-  EXPECTED_EMPTY,
+  failureStatus,
   SNAPSHOT_CACHE_TTL_MS,
   classifyError,
   createAttempt,
@@ -51,6 +52,8 @@ export const QUOTE_SUBSCRIPTION_REMOVE_GRACE_MS = 250;
 export const QUOTE_SUBSCRIPTION_PRIORITY_UPDATE_DELAY_MS = 100;
 /** Keys nobody is looking at still feed totals and alerts, just not every frame. */
 const BACKGROUND_QUOTE_APPLY_INTERVAL_MS = 1_000;
+/** How long past its interval an off-screen key waits for a frame that carries visible quotes. */
+const BACKGROUND_QUOTE_RIDE_MS = 250;
 
 /**
  * Visible and selected keys apply every data frame; every other key waits for
@@ -132,8 +135,7 @@ function storeQuoteFailure(
   error: unknown,
 ): QueryEntry<Quote> {
   const classified = classifyError(error);
-  const status = EXPECTED_EMPTY.test(classified.message) ? "empty" : "fatal_error";
-  const attempt = createAttempt(providerId, startedAt, status, classified.reasonCode, classified.message);
+  const attempt = createAttempt(providerId, startedAt, failureStatus(error, classified), classified.reasonCode, classified.message);
   return quoteStore.update(key, (current) => errorEntry(current, attempt));
 }
 
@@ -245,6 +247,16 @@ export class QuoteSubscriptionManager {
     dispose.update = update;
     update(targets);
     return dispose;
+  }
+
+  /** Whether a pane streams this quote key now. */
+  isStreaming(key: string): boolean {
+    return (this.quoteSubscriptions.get(key)?.targets.size ?? 0) > 0;
+  }
+
+  /** The quote keys panes stream now. */
+  streamingKeys(): string[] {
+    return [...this.quoteSubscriptions].filter(([, entry]) => entry.targets.size > 0).map(([key]) => key);
   }
 
   private createNoopSubscription(): QuoteSubscriptionHandle {
@@ -407,7 +419,24 @@ export class QuoteSubscriptionManager {
 
     // Latest tick per key wins; the frame applies whatever is newest.
     this.pendingStreamQuotes.set(key, { instrument, quote });
-    this.frames.request(this.streamQuoteFrame, { notBefore: this.streamQuoteDueAt(key, subscription.target) });
+    this.frames.request(this.streamQuoteFrame, this.streamQuoteRequest(
+      this.streamQuoteDueAt(key, subscription.target),
+      isForegroundQuoteTarget(subscription.target),
+    ));
+  }
+
+  /**
+   * A visible or selected key, and the first tick of any key, sets a frame
+   * off itself. An off-screen key held for its interval applies with the next
+   * frame that carries visible quotes, and sets a frame off only when none
+   * came within BACKGROUND_QUOTE_RIDE_MS of it falling due. A frame of its own
+   * spaces the next one: with a list longer than the screen the off-screen
+   * keys came due all second long, each held the next visible quote back for a
+   * frame interval, and every visible row updated twice as late.
+   */
+  private streamQuoteRequest(dueAt: number, foreground: boolean): DataFrameRequest {
+    if (foreground || dueAt === Number.NEGATIVE_INFINITY) return { notBefore: dueAt };
+    return { notBefore: dueAt, rideUntil: Math.max(dueAt, this.frames.now()) + BACKGROUND_QUOTE_RIDE_MS };
   }
 
   private streamQuoteDueAt(key: string, target: QuoteSubscriptionTarget): number {
@@ -437,7 +466,7 @@ export class QuoteSubscriptionManager {
       due.push(pending);
     }
     if (nextDueAt !== Number.POSITIVE_INFINITY) {
-      this.frames.request(this.streamQuoteFrame, { notBefore: nextDueAt });
+      this.frames.request(this.streamQuoteFrame, this.streamQuoteRequest(nextDueAt, false));
     }
     if (due.length === 0) return;
 
@@ -463,8 +492,13 @@ export class QuoteSubscriptionManager {
 }
 
 /**
- * Whether a tick would change nothing but its arrival time. Unavailable
- * numbers are NaN on the wire and count as equal to each other; key order and
+ * Whether a tick would change nothing but its arrival time, or its stamp
+ * within the minute it already has. Most of a busy symbol's ticks restamp a
+ * quote whose price, size and book did not move, and a stamp that stays in the
+ * same minute changes no chart bar, as-of clock or session edge, so the pane
+ * has nothing to redraw (the caller still refreshes the receipt now and then).
+ * A stamp that reaches another minute is a change. Unavailable numbers are NaN
+ * on the wire and count as equal to each other; key order and
  * absent-versus-undefined keys do not matter.
  */
 export function areStreamQuotesEquivalent(current: Quote | null | undefined, next: Quote): boolean {
@@ -472,12 +506,14 @@ export function areStreamQuotesEquivalent(current: Quote | null | undefined, nex
   if (current === next) return true;
   const left = current as unknown as Record<string, unknown>;
   const right = next as unknown as Record<string, unknown>;
+  const sameStampMinute = Object.is(quoteStampBucket(current), quoteStampBucket(next))
+    && Number.isFinite(current.lastUpdated);
   for (const key in left) {
-    if (key === "receivedAt" || key === "provenance") continue;
+    if (key === "receivedAt" || key === "provenance" || (key === "lastUpdated" && sameStampMinute)) continue;
     if (!Object.is(left[key], right[key])) return false;
   }
   for (const key in right) {
-    if (key === "receivedAt" || key === "provenance") continue;
+    if (key === "receivedAt" || key === "provenance" || (key === "lastUpdated" && sameStampMinute)) continue;
     if (!(key in left) && right[key] !== undefined) return false;
   }
   return current.provenance === next.provenance

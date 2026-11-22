@@ -1,4 +1,4 @@
-import { fixedUsdRate, heldCurrencyUnit, minorUnitSign } from "./currency-units";
+import { BIDI_MARKS, fixedUsdRate, heldCurrencyUnit, isDrawableCurrencySign, minorUnitSign } from "./currency-units";
 
 /** What a cell or figure reads when the source gave no value; an export writes it as an empty cell. */
 export const MISSING_VALUE = "—";
@@ -19,13 +19,17 @@ function getCurrencyFormatter(currency: string, maximumFractionDigits: number = 
   const key = `${currency}:${maximumFractionDigits}`;
   let formatter = currencyFormatters.get(key);
   if (!formatter) {
-    formatter = new Intl.NumberFormat("en-US", {
-      style: "currency",
+    const options = {
+      style: "currency" as const,
       currency,
       // Whole units (0) drop the cents rather than throw.
       minimumFractionDigits: Math.min(currencyPriceDigits(currency), maximumFractionDigits),
       maximumFractionDigits,
-    });
+    };
+    formatter = new Intl.NumberFormat("en-US", options);
+    // A sign a terminal cannot draw (the riyal's) is written as the code: SAR 25.88.
+    const sign = formatter.formatToParts(0).find((part) => part.type === "currency")?.value ?? "";
+    if (!isDrawableCurrencySign(sign)) formatter = new Intl.NumberFormat("en-US", { ...options, currencyDisplay: "code" });
     currencyFormatters.set(key, formatter);
   }
   return formatter;
@@ -60,7 +64,7 @@ function formatMoney(value: number, currency: string, maximumFractionDigits: num
     return `${value < 0 && /[1-9]/.test(body) ? "-" : ""}${body}${minor}`;
   }
   try {
-    return getCurrencyFormatter(currency, maximumFractionDigits).format(value);
+    return getCurrencyFormatter(currency, maximumFractionDigits).format(value).replace(BIDI_MARKS, "");
   } catch {
     const body = new Intl.NumberFormat("en-US", {
       minimumFractionDigits: Math.min(currencyPriceDigits(currency), maximumFractionDigits),
@@ -132,11 +136,31 @@ export function formatPercentRaw(value: number | undefined): string {
   return `${signedFixed(value, 2)}%`;
 }
 
+let figureColumnCells = 0;
+
 /**
- * Format large numbers compactly (e.g., 1.5T, 234B, 12.3M, 5k). Table columns
- * pass `fixedDecimals` so 1.70T lines up with 1.33T.
+ * Formats one cell of a right-aligned table column. Inside it `formatCompact`
+ * keeps its decimals unless the caller passes `fixedDecimals: false`, so a
+ * column of compact figures lines up: 12.00M over 10.73M, 10.0k over 12.5k.
+ * The table kit draws, reports and exports every right-aligned cell through
+ * this, so a pane's cell keeps the short 12M wherever else it says it (a
+ * figure, a sentence, a label).
  */
-export function formatCompact(value: number | undefined, { fixedDecimals = false }: { fixedDecimals?: boolean } = {}): string {
+export function inFigureColumn<T>(format: () => T): T {
+  figureColumnCells += 1;
+  try {
+    return format();
+  } finally {
+    figureColumnCells -= 1;
+  }
+}
+
+/**
+ * Format large numbers compactly (e.g., 1.5T, 234B, 12.3M, 5k). In a table
+ * column (`inFigureColumn`), or with `fixedDecimals`, the decimals stay so
+ * 1.70T lines up with 1.33T.
+ */
+export function formatCompact(value: number | undefined, { fixedDecimals = figureColumnCells > 0 }: { fixedDecimals?: boolean } = {}): string {
   if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
   const { fixed, suffix } = compactParts(Math.abs(value));
   // Strip unnecessary trailing zeros after decimal point
@@ -204,14 +228,19 @@ export function formatNumber(value: number | undefined, decimals = 2): string {
 export function formatSignificant(value: number | undefined, digits = 4): string {
   if (value == null || !Number.isFinite(value)) return formatNumber(undefined);
   if (value === 0) return getNumberFormatter(0).format(0);
+  return getNumberFormatter(significantDecimals(value, digits)).format(Number(value.toPrecision(digits)));
+}
+
+/** The decimals `formatSignificant` writes a value to: 0.8904 has 4, 1.123 has 3, 0 none. */
+export function significantDecimals(value: number, digits = 4): number {
+  if (value === 0 || !Number.isFinite(value)) return 0;
   const rounded = Number(value.toPrecision(digits));
-  const decimals = Math.min(12, Math.max(0, digits - 1 - Math.floor(Math.log10(Math.abs(rounded)))));
-  return getNumberFormatter(decimals).format(rounded);
+  return Math.min(12, Math.max(0, digits - 1 - Math.floor(Math.log10(Math.abs(rounded)))));
 }
 
 /** A percentile rank with its window: "73 pctl 1Y", "-- pctl 1Y" when unranked, "73 pctl" without a window. */
 export function formatPercentileRank(value: number | null | undefined, window?: string): string {
-  const rank = value == null || !Number.isFinite(value) ? "--" : value.toFixed(0);
+  const rank = value == null || !Number.isFinite(value) ? MISSING_VALUE : value.toFixed(0);
   return window ? `${rank} pctl ${window}` : `${rank} pctl`;
 }
 
@@ -342,17 +371,12 @@ function truncateToWidth(value: string, width: number): string {
   return output;
 }
 
+/** Cuts to a display width behind one `…`, as clipToDisplayWidth does: every cut text ends the same way. */
 export function truncateToDisplayWidth(value: string, width: number): string {
-  if (width <= 0) return "";
-  if (displayWidth(value) <= width) return value;
-  if (width <= 3) return ".".repeat(width);
-  return `${truncateToWidth(value, width - 3)}...`;
+  return clipToDisplayWidth(value, width);
 }
 
-/**
- * Clips to a display width behind a single `…`, which gives a narrow cell back
- * two characters that `...` would spend on the marker.
- */
+/** Clips to a display width behind a single `…`, the one cell every cut text ends with. */
 export function clipToDisplayWidth(value: string, width: number): string {
   if (width <= 0) return "";
   if (displayWidth(value) <= width) return value;

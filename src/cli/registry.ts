@@ -1,3 +1,4 @@
+import { basename } from "path";
 import type { AppConfig } from "../types/config";
 import type {
   CliCommandContext,
@@ -6,7 +7,7 @@ import type {
   GloomPlugin,
 } from "../types/plugin";
 import type { LoadedExternalPlugin } from "../plugins/loader";
-import { getPluginCatalog } from "../plugins/catalog";
+import { getBuiltinCliCommands } from "../plugins/catalog-cli";
 import { initCliServices, initConfigData, initMarketData } from "./context";
 import { closeAndFail, fail } from "./errors";
 import { DEFAULT_CLI_OPTIONS, type CliGlobalOptions } from "./options";
@@ -32,17 +33,37 @@ interface RegisteredCliCommand {
   builtin: boolean;
 }
 
+/**
+ * An installed plugin the command line does not run: switched off, built for
+ * other renderers (a desktop-only plugin), or failed to load (its `plugin` is
+ * then a stand-in named after its folder). Read to say why a code it owns
+ * opens nothing, never to run it.
+ */
+export interface IdleCliPlugin {
+  plugin: GloomPlugin;
+  reason: "off" | "target" | "failed";
+  /** Its folder under the plugins directory, for an external plugin. */
+  directory?: string;
+}
+
 export interface CliCommandRegistry {
   commands: RegisteredCliCommand[];
   lookup: ReadonlyMap<string, RegisteredCliCommand>;
   config: AppConfig | null;
+  /** The plugins that run here: loaded, switched on, and declaring the command line among their targets. */
   plugins: GloomPlugin[];
+  /** The ones of those that contribute data capabilities, which a command reading market data needs without the rest. */
+  readonly dataPlugins: GloomPlugin[];
+  readonly idlePlugins: IdleCliPlugin[];
   externalPlugins: LoadedExternalPlugin[];
+  /** Loads installed contributions when dispatch or application services need them. */
+  ensureExternalPlugins?: () => Promise<void>;
 }
 
 interface BuildCliCommandRegistryOptions {
   coreCommands: CliCommandDef[];
   externalPlugins?: LoadedExternalPlugin[];
+  loadExternalPlugins?: () => Promise<LoadedExternalPlugin[]>;
   config?: AppConfig | null;
 }
 
@@ -72,11 +93,11 @@ export function normalizeCliDispatchResult(result: void | CliDispatchResult): Cl
 export function buildCliCommandRegistry({
   coreCommands,
   externalPlugins = [],
+  loadExternalPlugins,
   config = null,
 }: BuildCliCommandRegistryOptions): CliCommandRegistry {
   const allCommands: RegisteredCliCommand[] = [];
   const allTokens = new Map<string, RegisteredCliCommand>();
-  const catalog = getPluginCatalog(externalPlugins);
   const disabledPlugins = new Set(config?.disabledPlugins ?? []);
 
   const registerCommand = (
@@ -110,8 +131,10 @@ export function buildCliCommandRegistry({
     registerCommand(command, "core", "core", true);
   }
 
-  const loadablePlugins: GloomPlugin[] = [];
-  for (const entry of catalog) {
+  for (const { pluginId, commands } of getBuiltinCliCommands()) {
+    for (const command of commands) registerCommand(command, pluginId, "plugin", true);
+  }
+  for (const entry of externalPlugins) {
     if (entry.error) {
       registryLog.warn(`Skipping external plugin "${entry.plugin.id}" for CLI registration.`, {
         path: entry.path,
@@ -119,9 +142,8 @@ export function buildCliCommandRegistry({
       });
       continue;
     }
-    loadablePlugins.push(entry.plugin);
     for (const command of entry.plugin.cliCommands ?? []) {
-      registerCommand(command, entry.plugin.id, "plugin", entry.source === "builtin");
+      registerCommand(command, entry.plugin.id, "plugin", false);
     }
   }
 
@@ -137,30 +159,88 @@ export function buildCliCommandRegistry({
     }
   }
 
-  return {
+  let plugins: GloomPlugin[] | undefined;
+  let loading: Promise<void> | undefined;
+  const registry: CliCommandRegistry = {
     commands,
     lookup,
     config,
-    plugins: loadablePlugins.filter((plugin) => !disabledPlugins.has(plugin.id)),
+    get plugins() {
+      const { getPluginCatalog } = require("../plugins/catalog") as typeof import("../plugins/catalog");
+      // A plugin built for other renderers (Gloom Social is the desktop app's) is not listed, run or captured here.
+      return plugins ??= getPluginCatalog(registry.externalPlugins)
+        .filter((entry) => !entry.error && !entry.unsupportedTarget && !disabledPlugins.has(entry.plugin.id))
+        .map((entry) => entry.plugin);
+    },
+    get dataPlugins() {
+      const { getLoadableDataPlugins } = require("../plugins/catalog-data") as typeof import("../plugins/catalog-data");
+      return getLoadableDataPlugins(registry.externalPlugins).filter((plugin) => !disabledPlugins.has(plugin.id));
+    },
+    get idlePlugins() {
+      const { getPluginCatalog } = require("../plugins/catalog") as typeof import("../plugins/catalog");
+      return getPluginCatalog(registry.externalPlugins).flatMap((entry): IdleCliPlugin[] => {
+        const at = entry.path ? { directory: basename(entry.path) } : {};
+        if (entry.error) return [{ plugin: entry.plugin, reason: "failed", ...at }];
+        if (disabledPlugins.has(entry.plugin.id)) return [{ plugin: entry.plugin, reason: "off", ...at }];
+        return entry.unsupportedTarget ? [{ plugin: entry.plugin, reason: "target", ...at }] : [];
+      });
+    },
     externalPlugins,
+    ...(loadExternalPlugins ? { ensureExternalPlugins: () => loading ??= (async () => {
+      const loaded = await loadExternalPlugins();
+      const expanded = buildCliCommandRegistry({ coreCommands, externalPlugins: loaded, config });
+      registry.commands = expanded.commands;
+      registry.lookup = expanded.lookup;
+      registry.externalPlugins = loaded;
+      // A command can retain ctx.plugins before opening market data (search does).
+      // Keep that reference current without materializing panes for command-only work.
+      if (plugins) plugins.splice(0, plugins.length, ...expanded.plugins);
+    })() } : {}),
   };
+  return registry;
 }
+
+/** The idle plugins of each command's context, kept off the plugin API's context type. */
+const idlePluginsByContext = new WeakMap<CliCommandContext, () => IdleCliPlugin[]>();
+/** How many installed plugins a command's context found, loading them first, kept off the plugin API's context type too. */
+const installedPluginCountByContext = new WeakMap<CliCommandContext, () => Promise<number>>();
+
+/**
+ * How many installed plugins (loaded, failed or switched to other targets) a command has beside the built-in ones.
+ * A command that answers from what the built-in plugins declare may do so only when this is none.
+ */
+export async function installedPluginCount(ctx: CliCommandContext): Promise<number> {
+  return (await installedPluginCountByContext.get(ctx)?.()) ?? 0;
+}
+
+/** The installed plugins a command's context does not run (`IdleCliPlugin`); none for a context built without a registry. */
+export function idleCliPlugins(ctx: CliCommandContext): IdleCliPlugin[] {
+  return idlePluginsByContext.get(ctx)?.() ?? [];
+}
+
+type ContextRegistry = Pick<CliCommandRegistry, "plugins" | "externalPlugins" | "ensureExternalPlugins"> & Partial<Pick<CliCommandRegistry, "idlePlugins" | "dataPlugins">>;
 
 export function createCliCommandContext(
   ownerId: string,
-  registryOrPlugins: Pick<CliCommandRegistry, "plugins" | "externalPlugins"> | GloomPlugin[],
+  registryOrPlugins: ContextRegistry | GloomPlugin[],
   cliOptions: CliGlobalOptions = DEFAULT_CLI_OPTIONS,
   args: readonly string[] = [],
 ): CliCommandContext {
-  const registry = Array.isArray(registryOrPlugins)
+  const registry: ContextRegistry = Array.isArray(registryOrPlugins)
     ? { plugins: registryOrPlugins, externalPlugins: [] }
     : registryOrPlugins;
-  return {
+  const ctx: CliCommandContext = {
     initConfigData,
-    initMarketData: () => initMarketData({ plugins: registry.plugins }),
-    initServices: () => initCliServices({ externalPlugins: registry.externalPlugins }),
+    initMarketData: async () => {
+      await registry.ensureExternalPlugins?.();
+      return initMarketData({ plugins: () => registry.plugins, ...registry.dataPlugins ? { dataPlugins: registry.dataPlugins } : {} });
+    },
+    initServices: async () => {
+      await registry.ensureExternalPlugins?.();
+      return initCliServices({ externalPlugins: registry.externalPlugins });
+    },
     cliOptions,
-    plugins: registry.plugins,
+    get plugins() { return registry.plugins; },
     fail,
     closeAndFail,
     output: {
@@ -175,4 +255,10 @@ export function createCliCommandContext(
       (id) => catalogFredSeriesIds(registry.plugins).has(id)),
     log: debugLog.createLogger(ownerId === "core" ? "cli" : ownerId),
   };
+  idlePluginsByContext.set(ctx, () => registry.idlePlugins ?? []);
+  installedPluginCountByContext.set(ctx, async () => {
+    await registry.ensureExternalPlugins?.();
+    return registry.externalPlugins.length;
+  });
+  return ctx;
 }

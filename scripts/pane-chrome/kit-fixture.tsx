@@ -37,7 +37,8 @@ import { DetailReader } from "../../src/components/reader/detail-reader";
 import type { DocsBlock } from "../../src/docs/content";
 import { DocsBlocks, DocsReadingColumn } from "../../src/plugins/builtin/docs/blocks";
 import { PaneHeader } from "../../src/components/layout/pane/header";
-import { DELAYED_SEGMENT, delayedFooterSegment, PaneFooterBar } from "../../src/components/layout/pane/footer";
+import { DELAYED_SEGMENT, delayedFooterSegment, PaneFooterBar, savedCopyFooterSegment } from "../../src/components/layout/pane/footer";
+import { combinePaneFooterRegistrations } from "../../src/components/layout/pane/footer/model";
 import { PageStackView } from "../../src/components/ui/page-stack-view";
 import { UpgradeLabel } from "../../src/plugins/builtin/shared/locked-rows";
 import { useThemeColors } from "../../src/theme/theme-context";
@@ -299,6 +300,29 @@ function FieldsFamily() {
             view={{ value: "1y", options: [{ value: "1m", label: "1M" }, { value: "1y", label: "1Y" }, { value: "5y", label: "5Y" }], onChange: noop }}
           />
         </Box>
+        {/* Short of room, the inline filter drops its label, then the view and the filter fold into menus; the as-of stays whole and the context gives way. */}
+        <Row>
+          {[{ label: "inline filter, as of and context", width: 720 }, { label: "short of room", width: 480 }].map((sample) => (
+            <Sample key={sample.label} label={sample.label} width={sample.width}>
+              <Box style={{ width: "100%" }}>
+                <QueryBar
+                  width={Math.floor(sample.width / 8)}
+                  filters={[{
+                    id: "statement",
+                    label: "Statement",
+                    inline: true,
+                    value: "income",
+                    options: ["Income", "Cash Flow", "Balance Sheet", "Ratios"].map((label) => ({ value: label.toLowerCase(), label })),
+                    onChange: noop,
+                  }]}
+                  view={{ value: "annual", options: [{ value: "annual", label: "Annual" }, { value: "quarterly", label: "Quarterly" }], onChange: noop }}
+                  asOf="as of 2026-06-30"
+                  meta="YoY"
+                />
+              </Box>
+            </Sample>
+          ))}
+        </Row>
       </Group>
     </>
   );
@@ -375,7 +399,7 @@ function StatesFamily() {
       <Sample label="error" width={300}><EmptyState status="error" title="Prices unavailable." message="The feed answered 503." /></Sample>
       <Sample label="loading" width={300}><PaneStatusBody loading subject="prices" /></Sample>
       <Sample label="empty in a pane body" width={300}><PaneStatusBody empty emptyTitle="Nothing to show yet." /></Sample>
-      <Sample label="sign-in wall" width={300}><PaneStatusBody empty emptyTitle="Sign in to manage alerts." actions={<><Button variant="primary" label="Log in" onPress={noop} /><Button variant="secondary" label="Sign up free" onPress={noop} /></>} /></Sample>
+      <Sample label="sign-in wall" width={300}><PaneStatusBody empty emptyTitle="Sign in to manage alerts." actions={<><Button variant="primary" label="Sign up free" onPress={noop} /><Button variant="secondary" label="Log in" onPress={noop} /></>} /></Sample>
       <Sample label="locked row" width={300}><UpgradeLabel text="Upgrade for the full history" onPress={noop} /></Sample>
       <Sample label="notice: warning" width={300}><Notice>Quotes are 15 minutes delayed.</Notice></Sample>
       <Sample label="notice: error" width={300}><Notice tone="negative">The last refresh failed; showing 10:02.</Notice></Sample>
@@ -429,6 +453,16 @@ function ChromeFamily() {
     menu: [],
     keys: [],
   };
+  // A pane answering from saved copies (a list, and the report it opens) registers each wherever it builds
+  // its footer; the footer draws one, the oldest, first.
+  const now = new Date(2026, 9, 28, 16, 0).getTime();
+  const savedCopy = combinePaneFooterRegistrations(new Map([
+    ["list", { info: [{ id: "loading", parts: [{ text: "loading", tone: "muted" as const }] },
+      savedCopyFooterSegment("list-saved", new Date(2026, 9, 28, 14, 37).getTime(), now)] }],
+    ["report", { order: 1, info: [{ id: "as-of", parts: [{ text: "as of 2026-10-27", tone: "muted" as const }] },
+      savedCopyFooterSegment("report-saved", new Date(2026, 9, 28, 9, 12).getTime(), now)],
+    hints: [{ id: "o", key: "o", label: "pen filing" }] }],
+  ]));
   return (
     <>
       <Group title="Title bar">
@@ -437,12 +471,21 @@ function ChromeFamily() {
           <PaneHeader title="AAPL" width={Math.min(100, pageColumns())} focused={false} tabs={{ ...tabs, focused: false }} />
           <PaneHeader title="Quick Notes" width={Math.min(100, pageColumns())} focused showActions tabs={closableTabs} />
           <PaneHeader title="World Indices" width={Math.min(100, pageColumns())} focused={false} />
+          {/* A single-ticker pane's ticker is a control in its title, on the title's line. */}
+          <PaneHeader title="RETURN AMD" titleTicker="AMD" onTitleTickerPress={noop} width={Math.min(100, pageColumns())} focused showActions />
+          <PaneHeader title="^HSI" titleTicker="^HSI" onTitleTickerPress={noop} width={Math.min(100, pageColumns())} focused={false} tabs={{ ...tabs, focused: false }} />
         </Box>
       </Group>
       <Group title="Footer">
         <Box flexDirection="column" style={{ width: "100%", gap: "var(--gloom-space-sm)" }}>
           <PaneFooterBar footer={footer} focused width={Math.min(100, pageColumns())} />
           <PaneFooterBar footer={footer} focused={false} width={Math.min(100, pageColumns())} />
+        </Box>
+      </Group>
+      <Group title="Footer, saved copy">
+        <Box flexDirection="column" style={{ width: "100%", gap: "var(--gloom-space-sm)" }}>
+          <PaneFooterBar footer={savedCopy} focused width={Math.min(100, pageColumns())} />
+          <PaneFooterBar footer={savedCopy} focused width={Math.min(48, pageColumns())} />
         </Box>
       </Group>
       <Group title="Detail back row">

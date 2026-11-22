@@ -3,7 +3,12 @@ import type { Quote } from "../../types/financials";
 import type { TickerRecord } from "../../types/ticker";
 
 export type TickerSearchInstrumentClass = "equity" | "fund" | "derivative" | "other";
-type TickerSearchCategory = "Saved" | "Primary Listing" | "Other Listings" | "Funds & Derivatives" | "Related";
+/**
+ * `Other Matches`: rows `gloom search` finds for the query that are not a listing
+ * of the primary listing's company (another company's DK, a line search names
+ * no company for), kept apart from its Other Listings.
+ */
+type TickerSearchCategory = "Saved" | "Primary Listing" | "Other Listings" | "Other Matches" | "Funds & Derivatives" | "Related";
 
 export interface TickerSearchRankableItem {
   id: string;
@@ -21,6 +26,10 @@ export interface TickerSearchRankableItem {
   primaryExchangeLabel?: string;
   providerRank?: number;
   popularity?: number;
+  /** The service marks the row as its company's home line (`InstrumentSearchResult.homeListing`). */
+  homeListing?: boolean;
+  /** The service says the line no longer trades (`InstrumentSearchResult.delisting`). */
+  delisted?: boolean;
   searchAliases?: string[];
   /**
    * The names the service sent the row for (`InstrumentSearchResult.searchAliases`: a trade name, or the name a

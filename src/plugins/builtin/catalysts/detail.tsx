@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { enrollmentBasis, enrollmentSeries, enrollmentValue } from "./history";
 import { useCallback, useMemo, useRef } from "react";
 import type { CatalystDetail, CatalystEvent } from "../../../api-client/catalysts";
@@ -6,7 +7,7 @@ import { usePluginPaneState } from "../../../public/react";
 import { useThemeColors } from "../../../theme/theme-context";
 import { Box, ScrollBox, Text, useRendererHost, useUiCapabilities, type ScrollBoxRenderable } from "../../../ui";
 import { UpgradeLabel } from "../shared/locked-rows";
-import { CATALYST_DATE_WITHHELD, catalystAgency, catalystChangeText, catalystDate, catalystDateBasis, catalystDateWithheld, catalystFacts, catalystLabel } from "./model";
+import { CATALYST_DATE_WITHHELD, catalystAgency, catalystChangeText, catalystDate, catalystDateBasis, catalystDateWithheld, catalystFacts, catalystLabel, catalystShownStatus } from "./model";
 import { humanLabel } from "../shared/research-cells";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { loadCatalystDetail } from "./client";
@@ -20,7 +21,7 @@ function Evidence({ event, width, height }: { event: CatalystEvent; width: numbe
   const documents = Array.isArray(event.metadata?.documents) ? event.metadata.documents.filter((value): value is { url: string; title?: string; label?: string } => !!value && typeof value === "object" && "url" in value && typeof value.url === "string" && /^https?:\/\//.test(value.url)) : [];
   return <ScrollBox scrollY width={width} height={desktop ? undefined : height} flexGrow={1} flexBasis={0} contentOptions={{ paddingX: 1 }}>
     <KeyValueRow label="Classification" value={`${catalystLabel(event.type)} · ${catalystAgency(event.agency)} · ${event.country ?? event.jurisdiction}`} labelWidth={18} />
-    <KeyValueRow label="Status" value={humanLabel(event.status)} detail={`Revision ${event.revision}`} labelWidth={18} />
+    <KeyValueRow label="Status" value={humanLabel(catalystShownStatus(event))} detail={`Revision ${event.revision}`} labelWidth={18} />
     <KeyValueRow label="Announced" value={catalystDate(event, "announced")} labelWidth={18} />
     {event.effectiveDate ? <KeyValueRow label={catalystDateBasis(event, "effective")} value={catalystDate(event, "effective")} labelWidth={18} /> : null}
     {event.deadlineDate ? <KeyValueRow label={catalystDateBasis(event, "deadline")} value={catalystDate(event, "deadline")} labelWidth={18} />
@@ -81,7 +82,7 @@ export function CatalystEventDetail({ event, accessKey, snapshot, width, height,
       rootWidth={width} rootHeight={Math.max(3, height - tabRows)} focused={focused} getItemKey={(row) => row.revisionId}
       selection={{ kind: "id", selectedId: revision.revisionId, getId: (row) => row.revisionId, onChange: setRevisionId }}
       onActivate={(row) => { setRevisionId(row.revisionId); setTab("evidence"); }}
-      renderCell={(row, column) => ({ text: column.id === "revision" ? String(row.revision) : column.id === "observed" ? catalystDate(row, "observed") : column.id === "status" ? humanLabel(row.status) : column.id === "enrollment" ? enrollmentValue(row) === null ? "--" : `${enrollmentValue(row)?.toLocaleString("en-US")} ${enrollmentBasis(row)}` : row.changes.map(catalystChangeText).join("; ") || "First observed" })}
+      renderCell={(row, column) => ({ text: column.id === "revision" ? String(row.revision) : column.id === "observed" ? catalystDate(row, "observed") : column.id === "status" ? humanLabel(row.status) : column.id === "enrollment" ? enrollmentValue(row) === null ? MISSING_VALUE : `${enrollmentValue(row)?.toLocaleString("en-US")} ${enrollmentBasis(row)}` : row.changes.map(catalystChangeText).join("; ") || "First observed" })}
       bodyAfter={data?.access && data.access.lockedRows > 0 ? <UpgradeLabel text="Upgrade for complete event history" onPress={openUpgrade} role="catalyst-history-upgrade" /> : undefined}
       emptyStateTitle="History is collecting." /></PaneStatusBody>
       : <Evidence event={revision} width={width} height={Math.max(3, height - tabRows)} />}

@@ -4,8 +4,9 @@ import type { DataProvider } from "../../types/data-provider";
 import type { CliListing } from "../listing-arg";
 import { cliStyles, cliTerminalWidth, wrapText } from "../../utils/cli-output";
 import { isFiniteNumber } from "../../utils/guards";
-import { calculateOptionGreeks, solveChainVolatilities } from "../../plugins/builtin/options/analytics";
+import { calculateOptionGreeks, ivSolvedNote, solveChainVolatilities } from "../../plugins/builtin/options/analytics";
 import { optionQuoteSide } from "../../plugins/builtin/options/market-reference";
+import { withQuotesUnderIntrinsicMarked } from "../../plugins/builtin/shared/volatility";
 import {
   formatModelSpotPrice, modelSpotLabel, optionModelSpot, type OptionModelSpot,
 } from "../../plugins/builtin/options/model-spot";
@@ -16,8 +17,29 @@ import { DEFAULT_OPTION_CALC_DRAFT } from "../../plugins/builtin/options-calcula
 import { expiryIsoDate, OPTION_EXPIRATION_PLACEHOLDER, parseOptionExpiration, settlementStampTime } from "../../utils/option-expiry";
 import { loadModelDividendYield } from "../../market-data/model-dividend-yield";
 import { formatUtcTime } from "../../utils/utc-time";
+import { takeOption } from "./command-utils";
 
 export const OPTIONS_USAGE = `options <symbol> [--expiration <${OPTION_EXPIRATION_PLACEHOLDER}>]`;
+
+/** `--expiration` as `options` names it, and `--expiry` as `fn GEX` and `fn OPX` do. */
+const OPTIONS_EXPIRATION_FLAGS = ["--expiration", "--expiry"] as const;
+type OptionsExpirationFlag = (typeof OPTIONS_EXPIRATION_FLAGS)[number];
+
+/**
+ * Takes the expiry option out of `args`, under either spelling: its value,
+ * the flag as typed (for messages), whether it was given at all (a flag with
+ * no value is given), and whether both spellings were.
+ */
+export function takeExpirationOption(args: string[]): {
+  value: string | undefined;
+  flag: OptionsExpirationFlag;
+  given: boolean;
+  both: boolean;
+} {
+  const typed = OPTIONS_EXPIRATION_FLAGS.filter((flag) => args.some((arg) => arg === flag || arg.startsWith(`${flag}=`)));
+  const [expiration, expiry] = OPTIONS_EXPIRATION_FLAGS.map((flag) => takeOption(args, flag));
+  return { value: expiration ?? expiry, flag: typed.length === 1 ? typed[0]! : "--expiration", given: typed.length > 0, both: typed.length > 1 };
+}
 
 export { parseOptionExpiration };
 
@@ -63,6 +85,8 @@ export interface OptionModelInputs {
 interface OptionModelFigures {
   /** Annualized volatility as a fraction, solved from the chain's quotes. */
   iv: number | null;
+  /** `iv` was read off the neighbouring strikes: this strike has no two-sided out-of-the-money quote to solve from. */
+  ivFilled?: boolean;
   delta: number | null;
 }
 
@@ -73,6 +97,7 @@ export const OPTION_MODEL_RATE = DEFAULT_OPTION_CALC_DRAFT.rate;
 export const MARKED_OPTION_FIELDS = {
   iv: "The venue's mark implied volatility (decimal), one per contract. Delta and the other greeks under mark are the venue's too: "
     + "Black-76 at the expiry's forward with no discounting, to its settlement.",
+  ivSource: "mark: iv is the venue's own, never solved or filled here.",
   bid: "Prices in USD are the coin prices (coin) at the expiry's forward (mark.forward), the venue's own model price.",
   mark: "price in USD; iv; delta and gamma per 1.00 move in the underlying; vega per volatility point and theta per calendar day, in USD.",
 } as const;
@@ -91,6 +116,8 @@ export function chainCoinCurrency(chain: OptionsChain): string | null {
 export const OPTION_VOLATILITY_FIELDS = {
   iv: "Annualized volatility (decimal) solved from the quote midpoint, one per strike from its out-of-the-money side, at the "
     + "spot, valuation time and rate in metadata.model. Delta here and dealer gamma (GEX) are valued with it.",
+  ivSource: "solved: iv comes from the strike's out-of-the-money quote midpoint. filled: that side has no two-sided quote, so iv is read off the "
+    + "nearest solved strikes (flat beyond the last one); it is no market's volatility, and delta is valued with it all the same.",
   impliedVolatility: "The data provider's own reported implied volatility, passed through unchanged. Delta does not use it; "
     + "GEX falls back to it only at a strike with no two-sided quote on either side.",
 } as const;
@@ -116,8 +143,9 @@ function optionModelFigures(chain: OptionsChain, inputs: OptionModelInputs): Map
       for (const contract of contracts) {
         const volatility = volatilities.byStrike.get(contract.strike);
         const delta = calculateOptionGreeks(contract, side, inputs.spot, inputs.dividendYield, volatilities)?.delta;
+        const iv = volatility != null && Number.isFinite(volatility) && volatility > 0 ? volatility : null;
         figures.set(contract, {
-          iv: volatility != null && Number.isFinite(volatility) && volatility > 0 ? volatility : null,
+          iv, ivFilled: iv != null && volatilities.filled.has(contract.strike),
           delta: delta != null && Number.isFinite(delta) ? delta : null,
         });
       }
@@ -167,7 +195,8 @@ export async function loadOptionModelInputs(
 /** The chain with each contract's modeled `iv` and `delta` added; every provider field is kept. */
 export function chainWithModelFigures(chain: OptionsChain, inputs: OptionModelInputs): OptionsChain {
   const figures = optionModelFigures(chain, inputs);
-  const add = (contract: OptionContract) => ({ ...contract, iv: figures.get(contract)?.iv ?? null, delta: figures.get(contract)?.delta ?? null });
+  const add = (contract: OptionContract) => ({ ...contract, iv: figures.get(contract)?.iv ?? null, ivFilled: figures.get(contract)?.ivFilled ?? false,
+    delta: figures.get(contract)?.delta ?? null });
   return { ...chain, calls: chain.calls.map(add), puts: chain.puts.map(add) };
 }
 
@@ -180,6 +209,13 @@ export interface OptionsChainBasis {
   spot: OptionModelSpot | null;
   dividendYield: number | null;
   openInterest: OpenInterestAsOf | null;
+  /** A strike's IV is filled from its neighbours (`chainHasFilledIv`), which the closing line says. */
+  ivFilled?: boolean;
+}
+
+/** Whether any contract's IV was read off the neighbouring strikes (see `ChainVolatilities.filled`). */
+export function chainHasFilledIv(chain: OptionsChain): boolean {
+  return [...chain.calls, ...chain.puts].some((contract) => (contract as OptionContract & OptionModelFigures).ivFilled === true);
 }
 
 /** The chain with `iv` and `delta` valued at the spot `optionModelSpot` picks for it, and that spot. */
@@ -187,8 +223,10 @@ export function valueChainAtModelSpot(
   chain: OptionsChain, inputs: OptionModelInputs, now: number, exchange?: string,
 ): { chain: OptionsChain; spot: OptionModelSpot | null } {
   const spot = optionModelSpot(inputs.quote, chain, now, exchange);
+  // A quote under intrinsic at that spot is shown marked stale, as the server marks one.
+  const marked = withQuotesUnderIntrinsicMarked(chain, spot?.price ?? inputs.spot);
   return {
-    chain: chainWithModelFigures(chain, spot ? { spot: spot.price, dividendYield: inputs.dividendYield, now: spot.valuationTime } : inputs),
+    chain: chainWithModelFigures(marked, spot ? { spot: spot.price, dividendYield: inputs.dividendYield, now: spot.valuationTime } : inputs),
     spot,
   };
 }
@@ -207,7 +245,8 @@ export async function loadOptionsChainOpenInterest(symbol: string, chain: Option
 }
 
 /**
- * The line under the chain: `Greeks at spot 89.79 (close Mon 12 Oct 20:00 UTC), dividend yield 2.34%, rate 4% · OI as of Fri 9 Oct`.
+ * The line under the chain: `Greeks at spot 89.79 (close Mon 12 Oct 20:00 UTC), dividend yield 2.34%, rate 4% · IV solved from quote mids ·
+ * OI as of Fri 9 Oct`, with `, ~ filled from neighbouring strikes` after the IV when a strike has no quote to solve from.
  * An open interest whose date cannot be established says why. A chain its
  * venue marks says whose marks they are: `Deribit marks: IV and greeks at
  * each expiry's forward, rate 0%; $ is the BTC price at the forward · OI live, Thu 22 Oct 22:42 UTC`.
@@ -225,11 +264,19 @@ export function optionsBasisFootnote(basis: OptionsChainBasis, chain?: OptionsCh
     parts.push(Number.isFinite(asOf) ? `OI live, ${formatUtcTime(new Date(asOf).toISOString())}` : openInterestAsOfLabel(basis.openInterest));
     return parts.join(" · ");
   }
-  if (basis.spot) {
+  // An adjusted contract delivers something other than 100 shares: the fund's price values none of it.
+  if (chain && [...chain.calls, ...chain.puts].some((contract) => contract.adjusted)) {
+    parts.push("adjusted: each delivers what its Deliverable says, so no IV or delta is read at the fund's price");
+  } else if (basis.spot) {
     parts.push(`Greeks at spot ${formatModelSpotPrice(basis.spot.price)} (${modelSpotLabel(basis.spot)}), `
       // An unknown yield is valued as none, and says so rather than read as a stated 0%.
       + `dividend yield ${basis.dividendYield == null ? "unknown (valued at 0%)" : `${Number((basis.dividendYield * 100).toFixed(2))}%`}, `
       + `rate ${Number((OPTION_MODEL_RATE * 100).toFixed(2))}%`);
+    parts.push(ivSolvedNote(basis.ivFilled === true));
+  }
+  // A quote that cannot be priced is shown, and its IV cell says why it values nothing.
+  if (chain && [...chain.calls, ...chain.puts].some((contract) => contract.quoteStale)) {
+    parts.push("stale: quoted before the session or under intrinsic, no IV or delta");
   }
   const oi = basis.openInterest;
   parts.push(oi?.date ? openInterestAsOfLabel(oi)
@@ -260,13 +307,19 @@ export function optionRows(chain: OptionsChain) {
       side,
       contract: contract.contractSymbol,
       strike: contract.strike,
-      last: contract.lastPrice,
+      // A contract that never traded has no last price, which the provider sends as 0: no 0 is shown or exported.
+      last: Number.isFinite(contract.lastPrice) && contract.lastPrice > 0 ? contract.lastPrice : null,
       bid: contract.bid,
       ask: contract.ask,
       volume: contract.volume,
       openInterest: contract.openInterest,
-      iv: modeled.iv ?? null,
-      delta: modeled.delta ?? null,
+      // A stale quote (from before the session, or under intrinsic) is shown but values nothing.
+      iv: contract.quoteStale ? null : modeled.iv ?? null,
+      // Solved from the strike's quote, or filled from its neighbours when it has none to solve from; a venue's own mark is neither.
+      ivSource: contract.quoteStale ? "stale quote" : modeled.iv == null ? null : contract.mark ? "mark" : modeled.ivFilled ? "filled" : "solved",
+      delta: contract.quoteStale ? null : modeled.delta ?? null,
+      quoteStale: contract.quoteStale === true,
+      ...(contract.adjusted ? { root: contract.adjusted.root, deliverable: contract.adjusted.deliverable } : {}),
       expiration: expiryIsoDate(contract.expiration),
       // A venue's marks and coin prices (Deribit), beside the dollar ones.
       ...(contract.mark ? {
@@ -296,14 +349,25 @@ export function formatOptionGammaCell(value: unknown): string {
   return isFiniteNumber(value) ? value.toFixed(6) : "—";
 }
 
+/** The last trade's price; a dash for a contract that never traded, as the OMON table shows it. */
+export function formatOptionLastCell(value: unknown): string {
+  return isFiniteNumber(value) && value > 0 ? String(value) : "—";
+}
+
 export function formatOptionQuoteCell(row: Record<string, unknown>, side: "bid" | "ask"): string {
   const quote = optionQuoteSide({ bid: Number(row.bid), ask: Number(row.ask) }, side);
   return quote == null ? "—" : String(quote);
 }
 
-/** Implied volatility as a percent; a dash when it could not be solved, never 0.0%. */
-export function formatOptionIvCell(value: unknown): string {
-  return isFiniteNumber(value) && value > 0 ? `${(value * 100).toFixed(1)}%` : "—";
+/**
+ * Implied volatility as a percent; a dash when it could not be solved, never 0.0%, and a leading "~" when it was filled
+ * from neighbouring strikes. A stale quote says so in its place: its bid and ask are shown, but value nothing.
+ */
+export function formatOptionIvCell(value: unknown, row?: Record<string, unknown>): string {
+  if (row?.quoteStale === true) return "stale";
+  if (!isFiniteNumber(value) || !(value > 0)) return "—";
+  const text = `${(value * 100).toFixed(1)}%`;
+  return row?.ivSource === "filled" ? `~${text}` : text;
 }
 
 /** Delta to two places, signed for puts; a dash when it could not be valued, and no "-0.00" for a far wing. */

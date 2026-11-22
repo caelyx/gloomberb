@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { deriveHeadlessFreshness, formatFreshnessLine } from "../../../cli/pane-functions/freshness";
 import { headlessReportTables, renderHeadlessPaneText } from "../../../cli/pane-functions/headless";
@@ -9,8 +10,11 @@ import { createTestHeadlessArgs, createTestHeadlessContext } from "../../../test
 import type { DataProvider } from "../../../types/data-provider";
 import type { HeadlessBundleResult, HeadlessPaneApiClient } from "../../../types/headless";
 import type { IvHistoryPayload, IvMethod, IvPoint, IvScreenPayload, IvScreenRow } from "./client";
-import { VCA_DEFINITIONS } from "./format";
+import { vcaDefinitions } from "./format";
 import { ivHistoryHeadless, ivScreenHeadless } from "./headless";
+import { MACRO_RELEASE_TABLE } from "../macro-day/release-table";
+import { macroReleaseCache } from "../macro-day/client";
+import type { CloudMacroReleaseDaysPayload } from "../../../api-client";
 
 const reading = (date: string, method: IvMethod, iv30: number) => ({
   date, method, capturedAt: `${date}T19:55:00Z`, spot: 100, iv7: null, iv30, iv60: null, iv90: iv30 + 0.01, iv180: null, iv365: null,
@@ -39,12 +43,12 @@ const load = async (rows: IvScreenRow[], marketData: DataProvider = createTestDa
 };
 
 describe("VCA dates", () => {
-  test("a quote reading and the close it is ranked on are each dated once, and the footer agrees", async () => {
+  test("IV30 and its rank are one dated close, said once, ahead of a newer quote, and the footer agrees", async () => {
     const { title, keys, footer } = await load([
       row("NVDA", reading("2026-10-09", "quote-mid", 0.293), "2026-10-09"),
       row("AAPL", reading("2026-10-09", "quote-mid", 0.265), "2026-10-09"),
     ]);
-    expect(title).toContain("IV30 2026-10-09 quote · IVR/IVP vs 52 weeks to 2026-10-09 close");
+    expect(title.endsWith("· 2026-10-09 close")).toBe(true);
     expect(title).not.toContain("live");
     expect(keys).not.toContain("date");
     expect(keys).not.toContain("rankDate");
@@ -56,7 +60,7 @@ describe("VCA dates", () => {
     expect(title.endsWith("· 2026-10-09 close")).toBe(true);
   });
 
-  test("rows on different readings or rank dates get a column each, and the footer is the newest reading", async () => {
+  test("rows ranked on different closes get a date column, and the footer is the newest", async () => {
     const { title, keys, cell, footer } = await load([
       row("NVDA", reading("2026-10-09", "quote-mid", 0.293), "2026-10-09"),
       row("XLF", reading("2026-10-09", "trade-close", 0.171), "2026-10-09"),
@@ -64,19 +68,20 @@ describe("VCA dates", () => {
     ]);
     expect(title).toBe("Rich/cheap · Custom symbols");
     expect(keys).toContain("date");
-    expect(keys).toContain("rankDate");
-    expect([0, 1, 2].map((index) => cell("date", index))).toEqual(["2026-10-09 quote", "2026-10-09 close", "2026-10-08 quote"]);
-    expect([0, 1, 2].map((index) => cell("rankDate", index))).toEqual(["2026-10-09 close", "2026-10-09 close", "2026-10-08 close"]);
+    expect([0, 1, 2].map((index) => cell("date", index))).toEqual(["2026-10-09 close", "2026-10-09 close", "2026-10-08 close"]);
+    // Each rank is its row's close, which the As of column already dates: no Rank as of column.
+    expect(keys).not.toContain("rankDate");
     expect(footer).toContain(" · Fri 9 Oct 2026 · ");
   });
 
-  test("a quote ahead of its rank says which close the rank is on", async () => {
-    const { title, keys } = await load([
+  test("a quote a session ahead of its rank is not the IV30 shown: the ranked close is", async () => {
+    const { title, keys, cell } = await load([
       row("NVDA", reading("2026-10-09", "quote-mid", 0.293), "2026-10-08"),
       row("AAPL", reading("2026-10-09", "quote-mid", 0.265), "2026-10-08"),
     ]);
-    expect(title).toContain("IV30 2026-10-09 quote · IVR/IVP vs 52 weeks to 2026-10-08 close");
+    expect(title.endsWith("· 2026-10-08 close")).toBe(true);
     expect(keys).not.toContain("rankDate");
+    expect(cell("iv30", 0)).toBe("30.0%");
   });
 
   test("IV1Y and its percentile join only when a row has them, ranked on the same close", async () => {
@@ -87,7 +92,8 @@ describe("VCA dates", () => {
     };
     const { keys, cell } = await load([oneYear("NVDA", "2026-10-09"), oneYear("AAPL", "2026-10-08")]);
     expect(keys.slice(keys.indexOf("verdict"), keys.indexOf("verdict") + 3)).toEqual(["verdict", "iv1y", "iv1yPercentile"]);
-    expect([0, 1].map((index) => [cell("iv1y", index), cell("iv1yPercentile", index)])).toEqual([["31.0%", "22"], ["31.0%", "--"]]);
+    // The IV30's own close: the 1Y read that session, ranked; none from another.
+    expect([0, 1].map((index) => [cell("iv1y", index), cell("iv1yPercentile", index)])).toEqual([["30.0%", "22"], [MISSING_VALUE, MISSING_VALUE]]);
   });
 
   test("skew from an older capture than the reading is dated", async () => {
@@ -95,13 +101,30 @@ describe("VCA dates", () => {
       skew: { date: "2026-10-08", put25: 0.3, call25: 0.28, skew: 0.02 } };
     const { keys, header, cell, result } = await load([stale]);
     expect(keys).toContain("skewDate");
-    // The header names the sign: OVDV's risk reversal subtracts the other way.
-    expect(header("skew")).toBe("25D skew put-call (pts)");
+    // The header names the sign, the one OVDV's risk reversal has: call minus put.
+    expect(header("riskReversal")).toBe("25D RR call-put (pts)");
+    expect(keys).not.toContain("skew");
     expect(cell("skewDate", 0)).toBe("2026-10-08");
-    // Puts at 30% against calls at 28% read +2.0, and the report says which side is subtracted and in what unit.
-    expect(cell("skew", 0)).toBe("+2.0");
-    expect(result.notes).toEqual([...VCA_DEFINITIONS]);
-    expect(result.notes?.[0]).toContain("25-delta put IV minus 25-delta call IV, in vol points; positive means puts are richer");
+    // Puts at 30% against calls at 28% read -2.0 (puts richer), and the report says which side is subtracted and in what unit.
+    expect(cell("riskReversal", 0)).toBe("-2.0");
+    expect(result.notes).toEqual(vcaDefinitions({ skew: true }));
+    expect(result.notes?.[0]).toContain("25-delta call IV minus 25-delta put IV, in vol points, as OVDV's risk reversal; positive means calls are richer");
+    expect(result.notes?.join(" ")).not.toContain("puts are richer");
+  });
+});
+
+describe("VCA definitions", () => {
+  test("the risk reversal line is there only with a risk reversal column, and IV/HV always says it uses the HV of the same date", async () => {
+    const without = vcaDefinitions({ skew: false });
+    const withSkew = vcaDefinitions({ skew: true });
+    expect(without.some((line) => line.includes("25D RR"))).toBe(false);
+    expect(withSkew[0]).toContain("25D RR");
+    expect(withSkew.slice(1)).toEqual(without);
+    expect(without[0]).toContain("IV/HV: IV30 over the HV20 of the same date");
+    // The report follows its columns: no row has a risk reversal, so the notes carry none.
+    const { keys, result } = await load([row("NVDA", reading("2026-10-09", "trade-close", 0.293), "2026-10-09")]);
+    expect(keys).not.toContain("riskReversal");
+    expect(result.notes).toEqual(without);
   });
 });
 
@@ -115,7 +138,7 @@ describe("VCA backfill states", () => {
   const report = async (rows: IvScreenRow[]) => {
     setSystemTime(new Date("2026-10-11T08:04:00Z"));
     const { result } = await load(rows);
-    return { notes: result.notes!.filter((note) => !(VCA_DEFINITIONS as readonly string[]).includes(note)),
+    return { notes: result.notes!.filter((note) => !vcaDefinitions({ skew: true }).includes(note)),
       complete: result.complete, unavailableSymbols: result.unavailableSymbols };
   };
 
@@ -167,7 +190,7 @@ describe("VCA backfill states", () => {
     expect(section.rows.map((row) => row.note ?? null)).toEqual([
       null,
       "TWTR stopped trading 2022-10-27; no history or options served",
-      "FB now lists ProShares S&P 500 Dynamic Daily Buffer ETF; Meta Platforms trades as META (changed 2022-06-09)",
+      "FB now lists ProShares S&P 500 Dynamic Daily Buffer ETF; FB was Meta Platforms before, now META (changed 2022-06-09)",
     ]);
     expect(result.notes?.[0]).toBe("No options history: FB.");
   });
@@ -231,7 +254,7 @@ describe("HIVG skew history", () => {
     expect(result.notes).toEqual(["no IV1Y history yet", "skew from 2026-10-07"]);
     const cells = (date: string) => text.split("\n").find((line) => line.startsWith(date))!.trim().split(/\s{2,}/);
     expect(cells("2026-10-08").slice(-2)).toEqual(["+2.5", "-2.5"]);
-    expect(cells("2026-10-05").slice(-2)).toEqual(["--", "--"]);
+    expect(cells("2026-10-05").slice(-2)).toEqual([MISSING_VALUE, MISSING_VALUE]);
   });
 
   test("an older server without the wing fields keeps the CSV columns blank and says skew is unavailable", async () => {
@@ -245,7 +268,18 @@ describe("HIVG skew history", () => {
 });
 
 describe("HIVG exports for scripts", () => {
-  afterEach(() => setSystemTime());
+  const bundled = { coveredThrough: MACRO_RELEASE_TABLE.coveredThrough, fomc: MACRO_RELEASE_TABLE.days.fomc[2026]! };
+  afterEach(() => {
+    setSystemTime();
+    macroReleaseCache.reset();
+    MACRO_RELEASE_TABLE.coveredThrough = bundled.coveredThrough;
+    MACRO_RELEASE_TABLE.days.fomc[2026] = bundled.fomc;
+  });
+  /** The release table an app of `day` carries: no release day after it, whatever the table the app ships with covers today. */
+  const bundledThrough = (day: string) => {
+    MACRO_RELEASE_TABLE.coveredThrough = day;
+    MACRO_RELEASE_TABLE.days.fomc[2026] = bundled.fomc.filter((date) => `2026-${date}` <= day);
+  };
   const session = (sessionDate: string, iv30: number): IvPoint => ({
     sessionDate, method: "trade-close", capturedAt: `${sessionDate}T23:30:00Z`, spot: 100,
     iv7: null, iv30, iv60: null, iv90: iv30 + 0.01, iv180: null, iv365: null,
@@ -273,24 +307,30 @@ describe("HIVG exports for scripts", () => {
     asOf: null, fetchedAt: "2026-10-21T00:00:00Z", stale: false, status: "available",
   });
   /** `meetings`: the FOMC days the rate path lists, or null when it cannot be read. */
-  const load = async (symbol: string, points: IvPoint[], options: Record<string, string | number> = {}, meetings: string[] | null = []) => {
+  const load = async (symbol: string, points: IvPoint[], options: Record<string, string | number> = {}, meetings: string[] | null = [],
+    patch: Partial<IvHistoryPayload> = {}, releaseDays: CloudMacroReleaseDaysPayload | null = null) => {
     const last = points.at(-1)?.sessionDate ?? null;
     const payload: IvHistoryPayload = { version: 1, symbol, asOf: "2026-10-21", status: points.length ? "ready" : "unavailable",
       coverage: { source: "seed", addedAt: "2026-08-01T00:00:00Z", backfilledThrough: last, since: points[0]?.sessionDate ?? null },
-      stats: { iv30: null, iv90: null }, latest: null, series: points, warnings: points.length ? [] : ["Coverage for new underlyings is full; try again later."] };
+      stats: { iv30: null, iv90: null }, latest: null, series: points, warnings: points.length ? [] : ["Coverage for new underlyings is full; try again later."], ...patch };
     const args = createTestHeadlessArgs({ rawArgument: symbol, argument: symbol, symbols: [symbol], options: { lookback: "ALL", hvWindow: "20", offset: 0, ...options } });
     const apiClient = { impliedVolatility: async () => payload, getCloudRatePath: async () => {
       if (!meetings) throw new Error("offline");
       return ratePath(meetings);
+    }, getCloudMacroReleaseDays: async () => {
+      if (!releaseDays) throw new Error("offline");
+      return releaseDays;
     } } as unknown as HeadlessPaneApiClient;
     const marketData = createTestDataProvider({ getPriceHistory: async () => bars });
     const result = await ivHistoryHeadless.load(args, createTestHeadlessContext({ apiClient, marketData })) as HeadlessBundleResult;
     const freshness = deriveHeadlessFreshness(ivHistoryHeadless, result);
     const csv = renderReportCsv(headlessReportTables(ivHistoryHeadless, result, args, "HIVG", freshness, { complete: true, unavailableSymbols: [] }), freshness);
-    return { result, lines: csv.split("\n") };
+    return { result, lines: csv.split("\n"), text: renderHeadlessPaneText(ivHistoryHeadless, result, args, "HIVG", freshness) };
   };
   const headers = (lines: string[]) => lines.filter((_, index) => lines[index - 1]?.startsWith("# section:"));
-  const releaseRows = (lines: string[]) => lines.filter((line) => line.startsWith("FOMC,")).map((line) => line.split(",").slice(0, 5).join(","));
+  /** Release, date, offset, session and IV30: an FOMC or ECB row's decision, actual and prior come between offset and session. */
+  const releaseRows = (lines: string[], kind = "FOMC") => lines.filter((line) => line.startsWith(`${kind},`))
+    .map((line) => line.split(",")).map((cells) => [...cells.slice(0, 3), ...cells.slice(6, 8)].join(","));
 
   test("a symbol with no IV history exports the same columns as one with it, with no unit moving into or out of a header", async () => {
     setSystemTime(new Date("2026-10-01T14:00:00Z"));
@@ -298,30 +338,69 @@ describe("HIVG exports for scripts", () => {
     const uncovered = await load("SCHD", []);
     expect(headers(uncovered.lines)).toEqual(headers(covered.lines));
     expect(headers(covered.lines)).toEqual([
-      "Measure,Current,As of,Method,52w low,52w high,Rank,Pctl,Sessions,status,symbol_or_series,currency_or_unit,interval,source,as_of",
-      "Session,IV30 (%),IV90 (%),IV1Y (%),HV (%),IV-HV,skew25d put-call (pts),rr25d call-put (pts),status,symbol_or_series,currency_or_unit,interval,source,as_of",
+      "Measure,Current,As of,Method,52w low,52w high,Rank,Pctl,Sessions,Basis,Stale,status,symbol_or_series,currency_or_unit,interval,source,as_of,retrieved_at",
+      "Session,IV30 (%),IV90 (%),IV1Y (%),HV (%),IV-HV,skew25d put-call (pts),rr25d call-put (pts),status,symbol_or_series,currency_or_unit,interval,source,as_of,retrieved_at",
     ]);
     // Each measure's unit stays in its label, figures or none.
     const measures = (lines: string[]) => lines.filter((line) => /^(IV|HV) /.test(line)).map((line) => line.split(",")[0]);
     expect(measures(uncovered.lines)).toEqual(measures(covered.lines));
   });
 
+  test("a stale measure is dated stale, a close solved from mids says close mid, and the note is VCA's wording", async () => {
+    setSystemTime(new Date("2026-10-21T14:00:00Z"));
+    const old = { method: "trade-close" as const, rank: 80, percentile: 80, low: 0.07, high: 0.09, samples: 0, windowStart: null };
+    // The prices run to the 21st: the 20th is a session behind, the 13th six, January 2025 far more.
+    const { result, lines, text } = await load("SPY", september, {}, [], { stats: {
+      iv30: { ...old, value: 0.14, date: "2026-10-20", basis: "mid" },
+      iv90: { ...old, value: 0.15, date: "2026-10-13" },
+      iv365: { ...old, value: 0.083, date: "2025-01-17" },
+    } });
+    expect(text).toMatch(/IV 30d ATM\s+14\.0%\s+2026-10-20\s+close mid/);
+    expect(text).toMatch(/IV 90d ATM\s+15\.0%\s+2026-10-13 stale\s+close\s/);
+    expect(text).toMatch(/IV 1Y ATM\s+8\.3%\s+2025-01-17 stale/);
+    expect(text).not.toContain("trade-close mid");
+    expect(result.notes?.find((note) => note.startsWith("Stale, left out of rank: IV 90d ATM 2026-10-13, IV 1Y ATM 2025-01-17"))
+      ?.endsWith("(over 5 sessions behind).")).toBe(true);
+    // Exports keep the raw method and carry the basis and the stale flag.
+    const measure = lines.find((line) => line.startsWith("IV 30d ATM"))!.split(",");
+    expect(measure.slice(2, 4)).toEqual(["2026-10-20", "trade-close"]);
+    expect(measure).toContain("mid");
+  });
+
   test("--event fomc --offset -6 is one row per release, read on the sixth session before the first session on or after it", async () => {
     setSystemTime(new Date("2026-10-01T14:00:00Z"));
     const { lines, result } = await load("SPY", september, { event: "fomc", offset: -6 });
-    expect(lines[0]).toBe("Release,Release date,Offset (sessions),Session,IV30 (%),IV90 (%),IV1Y (%),HV (%),IV-HV,"
-      + "skew25d put-call (pts),rr25d call-put (pts),status,symbol_or_series,currency_or_unit,interval,source,as_of");
+    expect(lines[0]).toBe("Release,Release date,Offset (sessions),Decision,Actual,Prior,Session,IV30 (%),IV90 (%),IV1Y (%),HV (%),IV-HV,"
+      + "skew25d put-call (pts),rr25d call-put (pts),status,symbol_or_series,currency_or_unit,interval,source,as_of,retrieved_at");
     // 16 Sep's FOMC, six sessions back over Labor Day.
     expect(releaseRows(lines)).toEqual(["FOMC,2026-09-16,-6,2026-09-08,12.4"]);
     // Every release before the history (July's, and those since 2021) is counted under the rows, with where the history starts.
     expect(result.notes).toContainEqual(expect.stringMatching(/^\d+ earlier FOMC releases predate the IV history, which starts 2026-09-01\.$/));
     await expect(Promise.resolve(ivHistoryHeadless.load(createTestHeadlessArgs({ symbols: ["SPY"], options: { lookback: "1Y", hvWindow: "20", offset: -6 } }),
-      createTestHeadlessContext()))).rejects.toThrow("--offset counts sessions from a release day: add --event fomc, cpi or jobs.");
+      createTestHeadlessContext()))).rejects.toThrow("--offset counts sessions from a release day: add --event fomc, cpi, jobs, ecb or boj.");
+  });
+
+  test("--event ecb reads the ECB's decision days Gloom Cloud lists, and its next decision once its session has a reading", async () => {
+    setSystemTime(new Date("2026-10-01T14:00:00Z"));
+    const releaseDays: CloudMacroReleaseDaysPayload = { checkedAt: "2026-09-30T22:00:00Z", coveredThrough: "2026-09-30", sources: [],
+      releases: { cpi: [], jobs: [], fomc: [], ecb: ["2026-07-23", "2026-09-10"] }, scheduled: { ecb: "2026-10-29" },
+      figures: { ecb: { "2026-09-10": { event: "Deposit facility rate", actual: "2.50%", forecast: "2.50%", prior: "2.25%",
+        surprise: "in-line", decision: "raised 25bp" } } } };
+    const { lines, result, text } = await load("FXE", september, { event: "ecb", offset: 0 }, [], {}, releaseDays);
+    // 10 Sep's decision read on its own session; 23 Jul's before the IV history starts.
+    expect(releaseRows(lines, "ECB")).toEqual(["ECB,2026-09-10,0,2026-09-10,12.6"]);
+    // The row says what the meeting did, as MDAY's does; the export keeps the rate before it, in % as its header says.
+    expect(lines.find((line) => line.startsWith("Release,"))!.split(",").slice(3, 6)).toEqual(["Decision", "Actual (%)", "Prior (%)"]);
+    expect(lines.find((line) => line.startsWith("ECB,"))!.split(",").slice(3, 6)).toEqual(["raised 25bp", "2.5", "2.25"]);
+    expect(text).toMatch(/2026-09-10\s+raised 25bp\s+2\.50%\s+2026-09-10\s+12\.6/);
+    expect(result.notes).toContain("1 earlier ECB release predates the IV history, which starts 2026-09-01.");
+    expect(result.notes).toContain("Left out ECB 2026-10-29: no closing reading yet for its session at --offset 0.");
   });
 
   test("the next FOMC has its row once its session at the offset has closed and been read; today's open session is none", async () => {
     // Wednesday 21 Oct 2026, 10:00 New York: IV is read through Tuesday's close, and today's bar is under way.
     setSystemTime(new Date("2026-10-21T14:00:00Z"));
+    bundledThrough("2026-10-20");
     const october = series("2026-10-20");
     // 28 Oct: six sessions back is 20 Oct, read last night.
     const week = await load("SPY", october, { event: "fomc", offset: -6 }, ["2026-10-28", "2026-12-09"]);

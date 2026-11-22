@@ -1,3 +1,4 @@
+import type { CompanyFrom } from "./company-from";
 import type { ExchangeRateSnapshot } from "./exchange-rate";
 import type {
   AnalystResearchData,
@@ -61,6 +62,41 @@ export interface SecFilingItem {
    * series list reaches).
    */
   fundSeries?: boolean;
+  /**
+   * The company's home line the filing was read from, when the listing asked
+   * is a receipt or a foreign line with no filer of its own (HY9H in
+   * Frankfurt reads SK hynix's). Absent on the listing's own filings.
+   */
+  companyFrom?: CompanyFrom;
+  /**
+   * A current report's press release (its EX-99.1), when its index names one:
+   * the page the results or the news are on, not the cover page.
+   */
+  pressReleaseUrl?: string;
+  /**
+   * What a Form 4 did, when Gloom Cloud read it for the list: whose shares,
+   * the main transaction and its shares and average price. A company's list
+   * holds the Form 4s it filed as an owner of other companies' shares, which
+   * only this names. Absent from other forms and from an older server.
+   */
+  form4?: SecForm4Trade;
+}
+
+/** A Form 4's main transaction, the one moving the most shares. */
+export interface SecForm4Trade {
+  /** The first reporting owner, as filed. */
+  ownerName: string;
+  issuerName: string;
+  issuerTicker: string | null;
+  issuerCik: string | null;
+  /** The SEC transaction code: P purchase, S sale, A award, G gift, F tax withholding, M exercise, ... */
+  code: string;
+  side: "buy" | "sell" | "acquired" | "disposed";
+  shares: number;
+  /** Share-weighted average price; null when no line gives one. */
+  price: number | null;
+  /** True when the transaction is in options or other derivatives (a form with no share lines): `shares` counts those. */
+  derivative?: boolean;
 }
 
 export interface SecFilingDocument {
@@ -128,9 +164,16 @@ export interface EarningsEvent {
   revenueActual: number | null;
   surprise: number | null;
   timing: "BMO" | "AMC" | "TNS" | "";
+  /** When the results come out, as the company announced it (Berkshire's Saturday 13:00Z); absent when it named no time. */
+  releaseAt?: string | null;
 }
 
+/** The reads a provider may send in batches (`DataProvider.batchesReads`). */
+export type BatchedReadMethod = "getPriceHistory" | "getOptionsChain";
+
 export interface MarketDataRequestContext {
+  /** An options chain of the contracts adjusted for a corporate action (ETHA1), in place of the standard ones. */
+  adjustedOptions?: boolean;
   brokerId?: string;
   brokerInstanceId?: string;
   instrument?: BrokerContractRef | null;
@@ -149,11 +192,24 @@ export interface MarketDataRequestContext {
   /** The listing's company, from its own quote: an SEC lookup for a non-US listing checks the registrant against it. */
   listingName?: string;
   /**
+   * The caller asks many reads like this one in the same moment (a board's
+   * rows), having checked `batchesReads`: a provider that batches them may
+   * hold this one a moment to send it with the others.
+   */
+  batch?: boolean;
+  /**
    * The caller prints what the quote's move is from: a short-lived process
    * (the CLI) waits briefly for the daily closes that date a previous close
    * no venue calendar dates. The long-lived app dates every quote anyway.
    */
   datesChangeBasis?: boolean;
+  /**
+   * The newest bars one read returns will do (a backtest of its last ten
+   * years): a history the service cut at its bar cap, or one beginning with
+   * the window asked, is answered as it came, without reads of its older bars.
+   * Without it `ALL` is every bar kept.
+   */
+  newestBars?: boolean;
 }
 
 export interface CachedFinancialsTarget {
@@ -170,10 +226,16 @@ export interface SearchRequestContext {
   brokerId?: string;
   brokerInstanceId?: string;
   /**
-   * A person is waiting on this result, so a slow source should be abandoned in
-   * well under a second rather than given the batch budget.
+   * A person is waiting on this result, so a slow broker should be abandoned in
+   * well under a second rather than given the batch budget. The data service is
+   * still waited for: its answer is the search's.
    */
   interactive?: boolean;
+  /**
+   * `always` asks for perpetual markets beside the listings for every query. Without it, a command that looks up
+   * one bare symbol the listings show to be a US stock does not ask for them.
+   */
+  perpetuals?: "always";
   /**
    * Rows to ask a catalogue for. Every listing of a symbol several companies
    * use (CAR: Avis, Carrefour, CAR Group) takes more than a keystroke's ten.
@@ -202,6 +264,19 @@ export interface QuoteBatchResult {
   target: QuoteSubscriptionTarget;
   quote: Quote | null;
   error?: unknown;
+  /**
+   * Set only with `deferFollowUps`: the batch left this target without a
+   * current quote, and `getQuote` with this cache mode is the read that
+   * settles it. `quote` meanwhile is the dated price the batch had, flagged
+   * stale, or none.
+   */
+  followUp?: "default" | "refresh";
+  /**
+   * The error is a source failing (a timeout, the request limit, an
+   * unreachable service), not an answer about the listing: asked again
+   * shortly it may be quoted. Kept where `error` crosses a bridge as text.
+   */
+  transient?: boolean;
 }
 
 export interface QuoteBatchOptions {
@@ -220,6 +295,13 @@ export interface QuoteBatchOptions {
    * each form's own copy from whenever it was last asked for.
    */
   revalidate?: boolean;
+  /**
+   * Answer from the cache and the batch read alone: a target they leave
+   * without a current quote comes back with `followUp` instead of being
+   * asked for on its own. A board paints the batch as soon as it answers and
+   * asks for those itself, so a slow one holds only its own row.
+   */
+  deferFollowUps?: boolean;
   /** The caller stopped waiting; a transport that can abandon the request does. */
   signal?: AbortSignal;
   /** The caller prints what each move is from (MarketDataRequestContext.datesChangeBasis). */
@@ -252,6 +334,15 @@ export interface AssetDataProvider {
   primaryMarketSourceName?(): string | null | Promise<string | null>;
   getCachedFinancialsForTargets?(targets: CachedFinancialsTarget[], options?: { allowExpired?: boolean; includeStaleQuotes?: boolean }): Map<string, TickerFinancials> | Promise<Map<string, TickerFinancials>>;
   getQuotesBatch?(targets: QuoteSubscriptionTarget[], options?: QuoteBatchOptions): Promise<QuoteBatchResult[]>;
+  /**
+   * Whether reads of `method` asked with others in one moment (context
+   * `batch`) go out as batch requests (trailing history, dated option
+   * expiries), so a caller that otherwise keeps a few in flight may ask them
+   * all at once. A router answers true only when every source it could ask
+   * for them does; a remote transport asks the process that owns the router.
+   * Absent or false: ask a few at a time, without `batch`.
+   */
+  batchesReads?(method: BatchedReadMethod): boolean | Promise<boolean>;
   getTickerFinancialsBatch?(targets: CachedFinancialsTarget[], options?: { forceRefresh?: boolean; datesChangeBasis?: boolean }): Promise<TickerFinancialsBatchResult[]>;
   getTickerFinancials(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<TickerFinancials>;
   getQuote(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<Quote>;
@@ -287,6 +378,12 @@ export interface AssetDataProvider {
    * all, or when another source (a connected broker) adds rows of its own.
    */
   searchBatch?(queries: string[], options?: { limit?: number; signal?: AbortSignal }): Promise<Map<string, InstrumentSearchResult[]> | null>;
+  /**
+   * True of a symbol known, before any request, to be a stock on a US exchange. A lookup of one is not searched for
+   * its share-class spellings (NVDA as NVD-A) and asks for no perpetual contracts. Set by a command line that
+   * ships the listings; absent elsewhere, where every lookup asks.
+   */
+  knownUsStock?(symbol: string): boolean;
   getEarningsCalendar?(symbols: string[], context?: MarketDataRequestContext): Promise<EarningsEvent[]>;
   getSecFilingDocuments?(filing: SecFilingItem): Promise<SecFilingDocument[]>;
   getSecFilingContent?(filing: SecFilingItem): Promise<string | null>;

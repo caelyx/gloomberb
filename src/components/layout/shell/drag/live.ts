@@ -1,8 +1,9 @@
-import { startTransition, useCallback, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
-import type { DockLeafLayout, FloatingRect, LayoutBounds } from "../../../../layout/pane-manager";
+import { startTransition, useCallback, useLayoutEffect, useRef, useState, useSyncExternalStore, type RefObject } from "react";
+import type { FloatingRect, LayoutBounds } from "../../../../layout/pane-manager";
 import type { BoxRenderable, LiveBoxFrame } from "../../../../ui";
 import type { DividerPreviewState } from "../native/window-state";
-import { hoverOverlayForLeaf, sameRect, type DragPreview, type HoverOverlay } from "./index";
+import { sameRect, type DragPreview, type PaneDragMode } from "./index";
+import type { DropZoneState } from "./drop-zones";
 
 /** Desktop divider drag: where the panes and dividers under the split are this frame. */
 export interface LiveDockGeometry {
@@ -19,18 +20,20 @@ export interface LiveDockGeometry {
  */
 export interface LiveDragGeometry {
   /** The pane being moved, from mouse down to release. */
-  paneDrag: { paneId: string; mode: "docked" | "floating" } | null;
+  paneDrag: { paneId: string; mode: PaneDragMode } | null;
   /** The floating pane being resized, from mouse down to release. */
   paneResize: { paneId: string } | null;
   /** The floating rect being moved or resized, already kept inside the shell. */
   floating: { paneId: string; rect: FloatingRect } | null;
+  /** The floating windows a resize moves with it, snapped edge to edge with it, by pane. */
+  partners: ReadonlyMap<string, FloatingRect> | null;
   divider: DividerPreviewState | null;
   /** Desktop divider drag: the panes and dividers it resizes, where the pointer has them. */
   dock: LiveDockGeometry | null;
-  /** The tiled pane whose drop grid is under the pointer during a pane move. */
-  hoverTargetId: string | null;
-  /** Where the release would dock or snap. */
+  /** Where the release would land the pane, if anywhere but where it is drawn. */
   dockPreview: DragPreview | null;
+  /** The drop targets the pane on the move is over: what a release there does. */
+  zones: DropZoneState | null;
 }
 
 /**
@@ -58,10 +61,11 @@ export const IDLE_DRAG: LiveDragGeometry = {
   paneDrag: null,
   paneResize: null,
   floating: null,
+  partners: null,
   divider: null,
   dock: null,
-  hoverTargetId: null,
   dockPreview: null,
+  zones: null,
 };
 
 export function createLiveDragStore(): LiveDragStore {
@@ -190,14 +194,3 @@ export function useLiveCatchUp(
   }, [select, store]);
   return select ? rect : null;
 }
-
-/** The drop grid under the pointer during a pane move. Re-renders only when the pointer enters another pane's grid. */
-export function useLiveHoverOverlay(store: LiveDragStore, leaves: DockLeafLayout[]): HoverOverlay | null {
-  const targetId = useLiveDrag(store, selectHoverTarget);
-  return useMemo(() => {
-    const leaf = targetId ? leaves.find((entry) => entry.instanceId === targetId) : undefined;
-    return leaf ? hoverOverlayForLeaf(leaf) : null;
-  }, [leaves, targetId]);
-}
-
-const selectHoverTarget = (geometry: LiveDragGeometry) => (geometry.paneDrag ? geometry.hoverTargetId : null);

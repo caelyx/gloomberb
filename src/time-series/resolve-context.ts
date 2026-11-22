@@ -3,11 +3,12 @@ import type { PriceHistoryResult } from "../types/price-history";
 import { LiveBarAccumulator } from "./live-bars";
 import type { ChartResolutionSupport, ManualChartResolution } from "./resolution";
 import type { DataProvider, MarketDataRequestContext } from "../types/data-provider";
-import type { EarningsAction, Quote, QuoteMetadata, TickerFinancials } from "../types/financials";
+import type { CorporateActionsData, EarningsAction, Quote, QuoteMetadata, TickerFinancials } from "../types/financials";
 import type { EarningsHistoryPayload } from "../api-client/earnings";
 import type { FredSeriesLoadResult, FredSeriesRequest } from "../sources/gloomberb-cloud/fred-series";
+import type { LoadFxCloses } from "./currency-conversion";
 import { chartQuoteOverrideKeyForSource } from "./live-quotes";
-import { publicTickerKey } from "../utils/exchanges";
+import { canonicalTickerKey } from "../utils/exchanges";
 import type {
   ChartSeriesSpec,
   ChartSpec,
@@ -40,6 +41,14 @@ export interface ChartResolveSources {
    * the terms do not say. Without it a future's price is in its currency alone.
    */
   loadFuturesPriceUnit?: (symbol: string) => Promise<string | null>;
+  /** A currency's daily USD closes, for a chart converted into one currency (`viewport.currency`). */
+  loadFxCloses?: LoadFxCloses;
+  loadStatementCurrency?: (target: string, currencies: readonly string[]) => Promise<{
+    rates: ReadonlyMap<string, number>;
+    note: string | null;
+    rateNotes?: readonly string[];
+    failures: readonly string[];
+  }>;
   /** Provider-neutral boundary for plugin-owned chart series. */
   resolveCapabilitySeries?: (
     source: Extract<ChartSeriesSpec["source"], { kind: "capability" }>,
@@ -78,6 +87,8 @@ export interface LiveTailRequest {
 export class ChartResolveCache {
   readonly financialsByInstrument = new Map<string, Promise<TickerFinancials | null>>();
   readonly earningsReleasesByInstrument = new Map<string, Promise<EarningsAction[]>>();
+  /** Each listing's cash distribution history, for the charts that draw total returns. */
+  readonly distributionsByInstrument = new Map<string, Promise<CorporateActionsData | null>>();
   readonly quoteMetadataByInstrument = new Map<string, Promise<QuoteMetadata | null>>();
   /** Each futures symbol's contract price unit, asked once per chart once known. */
   readonly futuresPriceUnits = new Map<string, Promise<string | null>>();
@@ -156,6 +167,11 @@ export function instrumentKey(spec: Extract<ChartSeriesSpec["source"], { kind: "
   return chartQuoteOverrideKeyForSource(spec);
 }
 
+/**
+ * A listing as a series' label and messages name it: the venue's own code
+ * (`9992:HKEX`, `AAPL:NASDAQ`), as the CLI takes it, never the key it is
+ * saved under (`9992:XHKG`).
+ */
 export function instrumentLabel(spec: Extract<ChartSeriesSpec["source"], { kind: "security" }>): string {
-  return publicTickerKey(spec.instrument.symbol, spec.instrument.exchange);
+  return canonicalTickerKey(spec.instrument.symbol, spec.instrument.exchange);
 }

@@ -35,6 +35,33 @@ describe("history freshness follows bar cadence", () => {
   });
 });
 
+describe("history freshness across a midday break", () => {
+  // 2026-09-09 is a Wednesday; SSE pauses 03:30-05:00 UTC (11:30-13:00 in
+  // Shanghai). The last 5-minute bar prints at 03:30Z and no bar follows
+  // until the afternoon opens.
+  const points = (dates: string[]) => dates.map((date) => ({ date: new Date(date), close: 12.5 }));
+  const fiveMinute = { exchange: "SSE", intervalMs: priceHistoryIntervalMs("5min") };
+
+  test("holds the morning's last bar current through the break and its reopening margin", () => {
+    const morningLast = points(["2026-09-09T02:00:00Z", "2026-09-09T03:30:00Z"]);
+    expect(isPriceHistoryStaleForCurrentWindow(morningLast, Date.parse("2026-09-09T04:15:00Z"), fiveMinute)).toBe(false);
+    expect(isPriceHistoryStaleForCurrentWindow(morningLast, Date.parse("2026-09-09T05:04:00Z"), fiveMinute)).toBe(false);
+  });
+
+  test("judges an hourly bar by when it ends, so the bar that closes at the break stays current", () => {
+    const hourly = { exchange: "SSE", intervalMs: priceHistoryIntervalMs("1h") };
+    // 10:30-11:30 Shanghai is the morning's last hourly bar; 12:50 is past its plain bar lag.
+    expect(isPriceHistoryStaleForCurrentWindow(points(["2026-09-09T01:30:00Z", "2026-09-09T02:30:00Z"]), Date.parse("2026-09-09T04:50:00Z"), hourly)).toBe(false);
+    // An hourly bar that ended at 10:30 means the feed stopped before the break.
+    expect(isPriceHistoryStaleForCurrentWindow(points(["2026-09-09T01:30:00Z"]), Date.parse("2026-09-09T04:50:00Z"), hourly)).toBe(true);
+  });
+
+  test("still rejects a bar the morning stopped before, and the morning's last once trading resumes", () => {
+    expect(isPriceHistoryStaleForCurrentWindow(points(["2026-09-09T02:00:00Z"]), Date.parse("2026-09-09T04:15:00Z"), fiveMinute)).toBe(true);
+    expect(isPriceHistoryStaleForCurrentWindow(points(["2026-09-09T03:30:00Z"]), Date.parse("2026-09-09T06:30:00Z"), fiveMinute)).toBe(true);
+  });
+});
+
 describe("normalizePriceHistory", () => {
   test("drops poisoned cached history when every timestamp collapses to the same value", () => {
     const history = normalizePriceHistory([
@@ -101,6 +128,25 @@ describe("normalizePriceHistory", () => {
       Date.parse("2026-10-02T05:30:00Z"), { exchange: "JPX", intervalMs: 60_000 })).toBe(true);
     const london = [{ date: new Date("2026-10-02T15:29:00Z"), close: 100 }];
     expect(isPriceHistoryStaleForCurrentWindow(london, Date.parse("2026-10-02T19:00:00Z"), { exchange: "LSE", intervalMs: 60_000 })).toBe(false);
+  });
+
+  test("reads a bare index symbol's bars against the venue its sessions follow, not New York's", () => {
+    // ^HSI's last hourly bar of Fri 6 Nov 2026 (15:30 to 16:30 Hong Kong), read that night, over the weekend and on Monday.
+    const hsi = [{ date: new Date("2026-11-06T07:30:00Z"), close: 24481.86 }];
+    const stale = (at: string) => isPriceHistoryStaleForCurrentWindow(hsi, Date.parse(at), { symbol: "^HSI", exchange: "", intervalMs: priceHistoryIntervalMs("1h") });
+    expect(stale("2026-11-06T21:50:00Z")).toBe(false);
+    expect(stale("2026-11-08T12:00:00Z")).toBe(false);
+    expect(stale("2026-11-09T04:00:00Z")).toBe(true);
+  });
+
+  test("reads a symbol written with a venue's suffix against that venue's sessions", () => {
+    // GUBRF.IS's last hourly bar of Tue 10 Nov 2026 (18:00 Istanbul), read that night with New York still open.
+    const gubrf = [{ date: new Date("2026-11-10T15:00:00Z"), close: 288 }];
+    const stale = (at: string) => isPriceHistoryStaleForCurrentWindow(gubrf, Date.parse(at), { symbol: "GUBRF.IS", exchange: "", intervalMs: priceHistoryIntervalMs("1h") });
+    expect(stale("2026-11-10T20:29:00Z")).toBe(false);
+    expect(stale("2026-11-11T06:30:00Z")).toBe(false);
+    // Wednesday's session opened at 07:00Z: its bars are due.
+    expect(stale("2026-11-11T10:00:00Z")).toBe(true);
   });
 
   test("keeps the last session current after the next open until its first delayed bar is due", () => {
@@ -397,10 +443,14 @@ describe("calendar history fetched copies", () => {
     expect(outdated(bars("2026-09-17T00:00:00Z", "2026-09-18T00:00:00Z"), "2026-09-22T21:00:00Z", "2026-09-23T12:00:00Z", { exchange: "" })).toBe(false);
     // The feed labels BSE bars at the 09:15 IST open, the previous New York date.
     expect(outdated(bars("2026-09-21T03:45:00Z", "2026-09-22T03:45:00Z"), "2026-09-22T21:00:00Z", "2026-09-23T02:00:00Z", { exchange: "" })).toBe(false);
-    // The JSE is closed for Heritage Day on 09-24 and publishes no calendar here:
+    // The JSE is closed for Heritage Day on Fri 24 Sep 2027, a year whose closures it has not published:
     // one refetch after each weekday open and close, the holiday's included.
+    expect(polls(bars("2027-09-21T00:00:00Z", "2027-09-22T00:00:00Z"), "2027-09-22T16:00:00Z", "2027-09-23T00:00:00Z", "2027-09-27T00:00:00Z", "JSE")).toBe(4);
     const toWednesday = bars("2026-09-22T00:00:00Z", "2026-09-23T00:00:00Z");
-    expect(polls(toWednesday, "2026-09-23T16:00:00Z", "2026-09-24T00:00:00Z", "2026-09-28T00:00:00Z", "JSE")).toBe(4);
+    // In 2026 the JSE's closures are published: Heritage Day (Thu 24 Sep) and election day (Wed 4 Nov) are no missing
+    // session, so a copy to the day before is not re-checked until the next session opens (07:00 UTC) and closes.
+    expect(polls(toWednesday, "2026-09-23T16:00:00Z", "2026-09-24T00:00:00Z", "2026-09-25T06:50:00Z", "JSE")).toBe(0);
+    expect(polls(bars("2026-11-02T00:00:00Z", "2026-11-03T00:00:00Z"), "2026-11-03T16:00:00Z", "2026-11-04T00:00:00Z", "2026-11-05T06:50:00Z", "JSE")).toBe(0);
     // KRX Chuseok, 09-24 to 09-26, is covered: no missing session before Monday opens (00:00 UTC).
     expect(polls(toWednesday, "2026-09-23T08:00:00Z", "2026-09-24T00:00:00Z", "2026-09-27T23:50:00Z", "KRX")).toBe(0);
     // SSE Golden Week, Oct 1-7, is covered: no missing session before Oct 8 opens.

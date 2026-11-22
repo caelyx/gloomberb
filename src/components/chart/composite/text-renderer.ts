@@ -1,4 +1,5 @@
 import { displayWidth, padTo } from "../../../utils/format";
+import { writeEventGuidesText } from "./event-guides";
 import { compositeAxisTicks, compositeGridRatios, type CompositeAxisValueFormatter } from "./format";
 import { resolveCompositeObservationWidth } from "./rasterizer";
 import { buildCompositeColumnLayout, type CompositeColumnLayout } from "./column-layout";
@@ -248,11 +249,16 @@ function renderOhlc(
     const lowRow = valueRow(low, domain, height);
     if (closeRow === null || highRow === null || lowRow === null) continue;
     drawRowsLine(rows, x, highRow, x, lowRow, "│");
-    if (series.source.style === "candles" && openRow !== null) {
+    const style = series.source.style;
+    if (style !== "ohlc" && style !== "hlc" && openRow !== null) {
       const [bodyTop, bodyBottom] = rowSpan(openRow, closeRow, height);
+      // A hollow rising body keeps its edges; one cell wide it is the wick alone.
+      const hollow = style === "hollow" && close >= open;
       for (let row = bodyTop; row <= bodyBottom; row += 1) {
         for (let offset = -halfCandleWidth; offset <= halfCandleWidth; offset += 1) {
-          setCell(rows, x + offset, row, "█");
+          const side = Math.abs(offset) === halfCandleWidth;
+          const rim = row === bodyTop || row === bodyBottom;
+          setCell(rows, x + offset, row, !hollow ? "█" : side ? "│" : rim ? "─" : " ");
         }
       }
       continue;
@@ -313,6 +319,8 @@ export function renderCompositePanelText(
         renderBand(rows, series, domain, plotWidth, height, cue);
         break;
       case "candles":
+      case "hollow":
+      case "heikin-ashi":
       case "ohlc":
       case "hlc":
         renderOhlc(rows, series, domain, plotWidth, height);
@@ -329,6 +337,7 @@ export function renderCompositePanelText(
 
   if (panel.volumeProfile) writeVolumeProfileText(rows, plotWidth, panel.volumeProfile);
   if (panel.extendedHours) writeSessionBreaksText(rows, plotWidth, panel.extendedHours);
+  if (panel.eventGuides) writeEventGuidesText(rows, plotWidth, panel.eventGuides);
 
   // Blank cells only, so the dashed level reads as if it ran under the marks.
   if (panel.lastPrice) {

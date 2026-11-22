@@ -8,6 +8,7 @@ import {
   remoteOperationToolName,
 } from "../../../../remote/schema";
 import type { RemoteControlRequest } from "../../../../remote/types";
+import { operationPolicy } from "../terminal-relay/policy";
 import type {
   HeadlessPaneDefinition,
   PaneDef,
@@ -29,7 +30,8 @@ const REMOTE_TOOL_TIMEOUT_MS = 10_000;
 /**
  * A tool that asks first waits for a person to read the prompt and click, so
  * the server holds the call this long: the minute the terminal relay gives a
- * confirmation. A server from before the window holds it 10 s.
+ * confirmation. A UI action that may ask declares it too. A server from
+ * before the window holds either 10 s.
  */
 const CONFIRM_TOOL_TIMEOUT_MS = 60_000;
 const REMOTE_RESOURCE_TOOL_NAME = "app.get_resource";
@@ -142,8 +144,11 @@ function headlessCandidates(registry: PaneFunctionCatalog): ManifestCandidate[] 
     const pane = registry.panes.get(template.paneId);
     if (!pane) continue;
     templatedPaneIds.add(pane.id);
+    // An unlisted function (`listed: false`) is no tool, and its pane none in its place.
+    if (template.listed === false) continue;
     const definition = definitionFor(template, pane);
-    if (!definition) continue;
+    // A report of what the user wrote for themselves (NOTE) is theirs to paste, not a tool.
+    if (!definition || definition.askGloom === false) continue;
     const token = template.shortcut?.prefix ?? template.id;
     candidates.push({
       token,
@@ -157,7 +162,7 @@ function headlessCandidates(registry: PaneFunctionCatalog): ManifestCandidate[] 
   const panes = [...registry.panes.values()]
     .sort((left, right) => compareText(left.id, right.id));
   for (const pane of panes) {
-    if (templatedPaneIds.has(pane.id) || !pane.headless) continue;
+    if (templatedPaneIds.has(pane.id) || !pane.headless || pane.headless.askGloom === false) continue;
     candidates.push({
       token: pane.id,
       identity: `pane:${pane.id}`,
@@ -191,7 +196,7 @@ function remoteCandidates(registry: PaneFunctionCatalog): ManifestCandidate[] {
       description: descriptor.description,
       writeTier: descriptor.writeTier,
       inputSchema: descriptor.inputSchema,
-      ...remoteConfirmation(descriptor.writeTier),
+      ...remoteConfirmation(operationsByName.get(descriptor.name)!.id, descriptor.writeTier),
     },
   }));
 
@@ -224,21 +229,34 @@ function remoteCandidates(registry: PaneFunctionCatalog): ManifestCandidate[] {
   return candidates;
 }
 
-/** Account and broker writes ask first, and get the minute that takes. */
-function remoteConfirmation(writeTier: ClientToolManifest["writeTier"]): Pick<ClientToolManifest, "confirm" | "timeoutMs"> {
-  return writeTier === "user-data" || writeTier === "broker"
-    ? { confirm: "always", timeoutMs: CONFIRM_TOOL_TIMEOUT_MS }
-    : { confirm: "never", timeoutMs: REMOTE_TOOL_TIMEOUT_MS };
+/**
+ * Account and broker writes ask first, and so does every operation the
+ * per-operation policy confirms each time (terminal-relay/policy.ts); they get
+ * the minute that takes. A UI action is asked about call by call instead
+ * (executor.ts), since scrolling or selecting asks nothing, so it says
+ * `never` and still declares the minute: the server holds it that long, and
+ * a scroll answers as soon as it ran.
+ */
+function remoteConfirmation(
+  operation: string,
+  writeTier: ClientToolManifest["writeTier"],
+): Pick<ClientToolManifest, "confirm" | "timeoutMs"> {
+  const { policy } = operationPolicy(operation);
+  if (writeTier === "user-data" || writeTier === "broker" || policy === "confirm") {
+    return { confirm: "always", timeoutMs: CONFIRM_TOOL_TIMEOUT_MS };
+  }
+  if (policy === "local-ui" || policy === "navigation") return { confirm: "never", timeoutMs: CONFIRM_TOOL_TIMEOUT_MS };
+  return { confirm: "never", timeoutMs: REMOTE_TOOL_TIMEOUT_MS };
 }
 
 /**
- * How long a call may run once it starts. A tool that asks first declares the
- * window for the person and the write together; the write itself keeps the
- * budget of every app action, counted from the approval rather than from the
- * call. The server's deadline for the call still bounds it.
+ * How long a call may run once it starts. A tool that may ask first declares
+ * the window for the person and the action together; an app action itself
+ * keeps the budget of every app action, counted from the approval rather
+ * than from the call. The server's deadline for the call still bounds it.
  */
-export function toolExecutionTimeoutMs(manifest: Pick<ClientToolManifest, "confirm" | "timeoutMs">): number {
-  return manifest.confirm === "always"
+export function toolExecutionTimeoutMs(manifest: Pick<ClientToolManifest, "confirm" | "source" | "timeoutMs">): number {
+  return manifest.confirm === "always" || manifest.source === "remote-op"
     ? Math.min(manifest.timeoutMs, REMOTE_TOOL_TIMEOUT_MS)
     : manifest.timeoutMs;
 }

@@ -1,5 +1,5 @@
 /** @jsxImportSource react */
-import { memo, type CSSProperties, type ReactNode } from "react";
+import { memo, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { TextAttributes } from "../../../ui/host";
 import { DisclosureMarker } from "../../../components/ui/disclosure-marker";
 import type {
@@ -12,6 +12,8 @@ import { tableColumnLeadGap } from "../../../components/ui/table-layout";
 import { WebIcon } from "../desktop/icons";
 import { useFrozenColumnInsets } from "./frozen-column";
 import { WEB_CELL_HEIGHT, WEB_CELL_WIDTH } from "../../../theme/font-scale";
+import { selectedRowCellColor } from "../../../theme/tone-contrast";
+import { useThemeColors } from "../../../theme/theme-context";
 import {
   CSS_BG,
   CSS_PANEL,
@@ -82,6 +84,9 @@ export function WebDataTableHeader<C extends DataTableColumn>({
   onTableMouseDown,
   gridTemplateColumns,
   onHeaderClick,
+  onMovableHeaderPress,
+  anchoredColumns = 1,
+  draggedColumn = null,
   sortColumnId,
   sortDirection,
 }: {
@@ -95,6 +100,11 @@ export function WebDataTableHeader<C extends DataTableColumn>({
   onTableMouseDown?: (event: any) => void;
   gridTemplateColumns: string;
   onHeaderClick?: (columnId: string) => void;
+  /** A left press on a header past the anchored ones, which sorts on release or drags the column (useWebColumnDrag). */
+  onMovableHeaderPress?: (columnId: string, index: number, event: ReactMouseEvent<HTMLElement>) => void;
+  anchoredColumns?: number;
+  /** The column being dragged, drawn lifted. */
+  draggedColumn?: number | null;
   sortColumnId: string | null;
   sortDirection: "asc" | "desc";
 }) {
@@ -123,11 +133,21 @@ export function WebDataTableHeader<C extends DataTableColumn>({
       {columns.map((column, columnIndex) => {
         const isSorted = sortColumnId === column.id;
         const color = isSorted ? CSS_TEXT : column.headerColor ?? CSS_TEXT_DIM;
+        const pressMovable = columnIndex >= anchoredColumns ? onMovableHeaderPress : undefined;
+        const movable = pressMovable !== undefined;
+        const sortOnPress = onHeaderClick ? (event: ReactMouseEvent<HTMLElement>) => {
+          focusPane();
+          onTableMouseDown?.(event);
+          event.preventDefault();
+          onHeaderClick(column.id);
+        } : undefined;
         return (
           <div
             key={column.id}
             data-gloom-role="data-table-header-cell"
-            data-gloom-interactive={onHeaderClick ? "true" : undefined}
+            data-gloom-interactive={onHeaderClick || movable ? "true" : undefined}
+            data-gloom-movable={movable ? "true" : undefined}
+            data-gloom-dragging={draggedColumn === columnIndex ? "true" : undefined}
             data-gloom-tinted={column.headerColor ? "true" : undefined}
             style={{
               minWidth: 0,
@@ -150,12 +170,16 @@ export function WebDataTableHeader<C extends DataTableColumn>({
               backgroundColor: column.headerBackgroundColor ?? CSS_PANEL,
               boxShadow: freezeFirstColumn && columnIndex === 0 ? `-${inlinePaddingPx(horizontalPadding)}px 0 0 ${column.headerBackgroundColor ?? CSS_PANEL}, ${columnGap * WEB_CELL_WIDTH}px 0 0 ${column.headerBackgroundColor ?? CSS_PANEL}` : undefined,
             }}
-            onMouseDown={onHeaderClick ? (event) => {
+            onMouseDown={pressMovable ? (event) => {
+              if (event.button !== 0) {
+                sortOnPress?.(event);
+                return;
+              }
               focusPane();
               onTableMouseDown?.(event);
               event.preventDefault();
-              onHeaderClick(column.id);
-            } : undefined}
+              pressMovable(column.id, columnIndex, event);
+            } : sortOnPress}
           >
             {column.headerLeading !== undefined ? <Leading>{column.headerLeading}</Leading> : null}
             <span
@@ -244,6 +268,7 @@ function WebDataTableRowInner<
   selectedTextOverridesCellColor: boolean;
 }) {
   const { ref, insets } = useFrozenColumnInsets(freezeFirstColumn === true, scrollLeft, viewportWidth, columns, columnGap * WEB_CELL_WIDTH);
+  const colors = useThemeColors();
   const sectionHeader: DataTableSectionHeader | null =
     renderSectionHeader?.(item, index) ?? null;
   const baseRowStyle: CSSProperties = {
@@ -294,6 +319,8 @@ function WebDataTableRowInner<
               sectionHeader.attributes ?? TextAttributes.BOLD,
             ),
             gridColumn: "1 / -1",
+            // Beside a pinned first column the heading stays in view too, not cut to its last letters.
+            ...(freezeFirstColumn ? { position: "sticky", left: inlinePaddingPx(horizontalPadding), justifySelf: "start" } : {}),
             overflow: "hidden",
             textOverflow: "ellipsis",
             display: "flex",
@@ -383,6 +410,8 @@ function WebDataTableRowInner<
             data-gloom-cell-instant={cell.value instanceof Date && Number.isFinite(cell.value.getTime()) ? cell.value.toISOString() : undefined}
             // The full-precision number behind a rounded cell (a trade of -9.4596 for -9.45963753), for the same reports.
             data-gloom-cell-value={typeof cell.value === "number" && Number.isFinite(cell.value) ? String(cell.value) : undefined}
+            // A value this row is still waiting on (DataTableCell.mayBeBlank): its blank is no lost data.
+            data-gloom-cell-may-be-blank={cell.mayBeBlank ? "true" : undefined}
             style={{
               minWidth: 0,
               position: freezeFirstColumn && columnIndex === 0 ? "sticky" : undefined,
@@ -443,8 +472,8 @@ function WebDataTableRowInner<
               <CellText
                 cell={cell}
                 column={column}
-                color={selected && (cell.color === undefined || (selectedTextOverridesCellColor && !cell.keepColorWhenSelected))
-                  ? CSS_SELECTED_TEXT
+                color={selected
+                  ? selectedRowCellColor(cell.color, selectedTextOverridesCellColor, cell.keepColorWhenSelected, colors) ?? CSS_SELECTED_TEXT
                   : cell.color ?? CSS_TEXT}
               />
             )}
@@ -457,7 +486,33 @@ function WebDataTableRowInner<
 
 function CellText({ cell, column, color }: { cell: DataTableCell; column: DataTableColumn; color: string }) {
   const style = clippedCellTextStyle(column, color, cell.attributes ?? TextAttributes.NONE);
-  if (cell.leading === undefined) return <span title={cell.text} style={style}>{cell.text}</span>;
+  if (cell.note) {
+    const text = (
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignContent: "flex-start",
+          justifyContent: contentJustifyForAlign(column.align),
+          columnGap: "var(--gloom-space-sm)",
+          width: "100%",
+          height: "100%",
+          minWidth: 0,
+          overflow: "hidden",
+        }}
+      >
+        <CellLabel cell={cell} column={column} style={{ ...style, width: "auto", flex: "0 1 auto", minWidth: 0 }} />
+        <span data-gloom-role="data-table-cell-note" style={{ ...cellTextStyle(CSS_TEXT_DIM, TextAttributes.NONE), flex: "none" }}>{cell.note}</span>
+      </div>
+    );
+    return cell.leading === undefined ? text : (
+      <div style={{ display: "flex", alignItems: "center", gap: LABEL_GAP_PX, width: "100%", height: "100%", minWidth: 0, overflow: "hidden" }}>
+        <Leading>{cell.leading}</Leading>
+        {text}
+      </div>
+    );
+  }
+  if (cell.leading === undefined) return <CellLabel cell={cell} column={column} style={style} fill />;
   return (
     <div
       style={{
@@ -472,9 +527,51 @@ function CellText({ cell, column, color }: { cell: DataTableCell; column: DataTa
       }}
     >
       <Leading>{cell.leading}</Leading>
-      <span title={cell.text} style={{ ...style, width: "auto", flex: "0 1 auto" }}>{cell.text}</span>
+      <CellLabel cell={cell} column={column} style={{ ...style, width: "auto", flex: "0 1 auto" }} />
     </div>
   );
 }
+
+/**
+ * The cell's text, ending in an ellipsis where the column cuts it. A cell with
+ * `keepEnd` is cut before that end, which always shows: "Brent Crude Oil Last
+ * Day… Jan 2027". The two parts read as the whole text, and a text that fits
+ * draws where it did as one. A label that fills its cell is a whole number of
+ * characters wide plus a quarter pixel, so the part that gives way ends in its
+ * ellipsis right before the end: a box rounded to layout units can otherwise
+ * fall short of its characters by a fraction of a pixel and lose one more.
+ */
+function CellLabel({ cell, column, style, fill = false }: {
+  cell: DataTableCell;
+  column: DataTableColumn;
+  style: CSSProperties;
+  fill?: boolean;
+}) {
+  const keepEnd = cell.keepEnd;
+  if (!keepEnd || !cell.text.endsWith(keepEnd) || cell.text.length === keepEnd.length) {
+    return <span title={cell.text} style={style}>{cell.text}</span>;
+  }
+  return (
+    <span
+      title={cell.text}
+      style={{
+        ...style,
+        display: "flex",
+        justifyContent: contentJustifyForAlign(column.align),
+        minWidth: 0,
+        ...(fill ? { width: KEPT_END_LABEL_WIDTH } : { maxWidth: WHOLE_CHARACTERS }),
+        textOverflow: "clip",
+      }}
+    >
+      <span style={{ flex: "0 1 auto", minWidth: 0, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>
+        {cell.text.slice(0, -keepEnd.length)}
+      </span>
+      <span style={{ flex: "none", whiteSpace: "pre" }}>{keepEnd}</span>
+    </span>
+  );
+}
+
+const WHOLE_CHARACTERS = "round(down, 100%, 1ch)";
+const KEPT_END_LABEL_WIDTH = `calc(${WHOLE_CHARACTERS} + 0.25px)`;
 
 export const WebDataTableRow = memo(WebDataTableRowInner) as typeof WebDataTableRowInner;

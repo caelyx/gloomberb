@@ -68,6 +68,18 @@ const STANDARD_ROLL_DAYS: Readonly<Record<string, number>> = {
   VX: 0,
 };
 
+/**
+ * Continuous symbols written as other roots' are (`CL=F`) for a root that has
+ * none, Cboe's VIX futures: `VX=F` is the front generic VX1, which follows
+ * the same front contract.
+ */
+const GENERIC_FOR_ALIAS: Readonly<Record<string, string>> = { "VX=F": "VX1" };
+
+/** The front generic a continuous symbol the root does not list stands for (VX=F: VX1), or null. */
+export function continuousAliasGeneric(symbol: string): string | null {
+  return GENERIC_FOR_ALIAS[symbol.trim().toUpperCase()] ?? null;
+}
+
 /** A root's standard roll: what a bare generic (NG1) and the continuous alias (NG=F) follow. */
 export function standardFuturesGenericRoll(root: string): FuturesGenericRoll {
   return { rule: "first-notice", days: STANDARD_ROLL_DAYS[root] ?? 1, standard: true };
@@ -170,9 +182,9 @@ export function futuresGenericPriceBasis(generic: Pick<FuturesGeneric, "root">):
 
 /**
  * How a futures listing's price reads, whichever form it takes: a generic by
- * its root (VX1 points, TY1 32nds), and a continuous (`ES=F`, `SXO=F`) or
- * listed contract (`SXOZ26.CME`) of an index, sector or industry root in index
- * points, on the root's own venue or with none. The quote keeps its currency
+ * its root (VX1 points, TY1 32nds), and a continuous (`ES=F`, `ZN=F`) or
+ * listed contract (`ZNZ26.CBT`) in the same units as its root's generic,
+ * on the root's own venue or with none. The quote keeps its currency
  * for what a tick is worth. Null for every other listing, a security that
  * shares a root's code on another venue (XAU on Toronto, the XAR ETF) included.
  */
@@ -180,7 +192,7 @@ export function futuresListingPriceBasis(symbol: string, exchange?: string | nul
   const generic = futuresGenericListing(symbol, exchange);
   if (generic) return futuresGenericPriceBasis(generic);
   const listing = futuresListingVenue(symbol, exchange);
-  return listing?.root && ROOT_VENUES[listing.root] === listing.venue && POINT_ROOTS.has(listing.root) ? "points" : null;
+  return listing?.root && ROOT_VENUES[listing.root] === listing.venue ? futuresGenericPriceBasis({ root: listing.root }) : null;
 }
 
 /** Whether a root's date rules count back from first notice or from last trade. */
@@ -204,6 +216,49 @@ function futuresGenericAdjustLabel(adjust: FuturesGenericAdjust): string {
 /** The legend caption: says it is a generic and how it rolls, so it is never read as one contract. */
 export function futuresGenericCaption(generic: FuturesGeneric): string {
   return `${generic.ticker} ${futuresGenericOrdinal(generic.position)} generic · ${futuresGenericRollLabel(generic)} · ${futuresGenericAdjustLabel(generic.adjust)}`;
+}
+
+const MONTH_CODES = "FGHJKMNQUVXZ";
+
+/**
+ * A listed contract's root and delivery month, counted in months from year 0
+ * (CLZ26 is CL, 2026 × 12 + 11), from its code with or without its venue
+ * (CLZ26.NYM). Null for anything else: a continuous symbol, a generic.
+ */
+export function futuresContractMonth(code: string): { root: string; month: number } | null {
+  const match = /^([A-Z0-9]{1,4}?)([FGHJKMNQUVXZ])(\d{2})(?:\.[A-Z]+)?$/.exec(code.trim().toUpperCase());
+  if (!match) return null;
+  return { root: match[1]!, month: (2000 + Number(match[3])) * 12 + MONTH_CODES.indexOf(match[2]!) };
+}
+
+/**
+ * A dated contract typed without its venue (ZQZ26), named as its quote is, with
+ * the venue that lists its root: ZQZ26.CBT, as WIRP prints it. A Bloomberg
+ * root reads as the exchange's (FFZ26 is ZQZ26.CBT). Null for a root Gloom
+ * Cloud does not archive and for any other code.
+ */
+export function venueOfDatedContract(code: string): string | null {
+  const match = /^([A-Z0-9]{1,4}?)([FGHJKMNQUVXZ])(\d{2})$/.exec(code.trim().toUpperCase());
+  if (!match) return null;
+  const year = 2000 + Number(match[3]);
+  const currentYear = new Date().getUTCFullYear();
+  if (year < currentYear - 1 || year > currentYear + 10) return null;
+  const root = ALIASES[match[1]!] ?? match[1]!;
+  const venue = ROOT_VENUES[root];
+  return venue ? `${root}${match[2]}${match[3]}.${venue}` : null;
+}
+
+/** A root's contract for a delivery month as `futuresContractMonth` counts it: CL and 2026 × 12 + 11 are CLZ26. */
+export function futuresContractCode(root: string, month: number): string {
+  return `${root}${MONTH_CODES[month % 12]}${String(Math.floor(month / 12) % 100).padStart(2, "0")}`;
+}
+
+/** The root of a continuous symbol (`RB=F`, `RB=F:NYM`), as its generics are written; null for any other symbol. */
+export function continuousFuturesRoot(symbol: string): string | null {
+  const match = /^([A-Z0-9]{1,4})=F$/.exec(parsePublicTickerKey(symbol).symbol.trim().toUpperCase());
+  if (!match) return null;
+  const root = ALIASES[match[1]!] ?? match[1]!;
+  return ROOT_VENUES[root] ? root : null;
 }
 
 /** Choice values for the chart's roll control: the standard roll and the three rules at their usual settings. */

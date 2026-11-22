@@ -4,14 +4,17 @@ import type { TickerRecord } from "../../../types/ticker";
 import type { AppConfig } from "../../../types/config";
 import type { PriceSparklinePeriod } from "../../../components/price-sparkline/view";
 import { getSharedRegistry } from "../../registry";
-import { formatTickerListInput, MAX_TICKER_LIST_SIZE, parseTickerListInput } from "../../../tickers/list";
+import { formatTickerListInput, parseTickerListInput, QUOTE_MONITOR_MAX_TICKERS } from "../../../tickers/list";
 import { resolveTickerInstrumentKind } from "../../../tickers/instrument-kind";
-
-type TickerResearchTabSummary = { id: string; name: string; order: number };
+import { groupTickerResearchTabs, type TickerResearchTabSummary } from "./research-groups";
+import {
+  AUTO_LOG_RANGE, OVERVIEW_CHART_SCALE_SETTING, parseOverviewChartScaleChoice, type OverviewChartScaleChoice,
+} from "./overview/chart-scale";
 
 export interface TickerResearchPaneSettings {
   hideTabs: boolean;
   lockedTabId: string;
+  overviewChartScale: OverviewChartScaleChoice;
 }
 
 export interface QuoteMonitorPaneSettings {
@@ -30,6 +33,7 @@ export function getTickerResearchPaneSettings(
     lockedTabId: settings?.lockedTabId === "fundamental-graphs"
       ? "chart"
       : typeof settings?.lockedTabId === "string" ? settings.lockedTabId : "overview",
+    overviewChartScale: parseOverviewChartScaleChoice(settings?.[OVERVIEW_CHART_SCALE_SETTING]),
   };
 }
 
@@ -49,9 +53,11 @@ function getAvailableSettingsTabs(): TickerResearchTabSummary[] {
     ? [...registry.tickerResearchTabs.values()].map((tab) => ({ id: tab.id, name: tab.name, order: tab.order }))
     : [];
 
-  return pluginTabs
+  const tabs = pluginTabs
     .sort((left, right) => left.order - right.order)
     .filter((tab, index, allTabs) => allTabs.findIndex((candidate) => candidate.id === tab.id) === index);
+  // In the order the strip shows them: group by group.
+  return groupTickerResearchTabs(tabs).flatMap((group) => group.views);
 }
 
 export function buildTickerResearchSettingsDef(settings: TickerResearchPaneSettings): PaneSettingsDef {
@@ -59,6 +65,7 @@ export function buildTickerResearchSettingsDef(settings: TickerResearchPaneSetti
 
   return {
     title: "Ticker Research Settings",
+    values: { [OVERVIEW_CHART_SCALE_SETTING]: settings.overviewChartScale },
     fields: [
       {
         key: "hideTabs",
@@ -86,6 +93,17 @@ export function buildTickerResearchSettingsDef(settings: TickerResearchPaneSetti
           { value: "30", label: "Every 30 minutes" },
         ],
       },
+      {
+        key: OVERVIEW_CHART_SCALE_SETTING,
+        label: "Overview chart scale",
+        description: `Auto draws a log scale once the history's highest close is ${AUTO_LOG_RANGE}x its lowest.`,
+        type: "select" as const,
+        options: [
+          { value: "auto", label: "Auto" },
+          { value: "linear", label: "Linear" },
+          { value: "log", label: "Log" },
+        ],
+      },
     ],
   };
 }
@@ -94,9 +112,9 @@ function coerceQuoteMonitorSymbols(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   const parsed = value.filter((entry): entry is string => typeof entry === "string");
   try {
-    return parseTickerListInput(parsed.join(", "), MAX_TICKER_LIST_SIZE);
+    return parseTickerListInput(parsed.join(", "), QUOTE_MONITOR_MAX_TICKERS);
   } catch {
-    return parsed.slice(0, MAX_TICKER_LIST_SIZE);
+    return parsed.slice(0, QUOTE_MONITOR_MAX_TICKERS);
   }
 }
 
@@ -117,14 +135,15 @@ export function getQuoteMonitorPaneSettings(
 
   if (symbols.length === 0 && storedText.trim().length > 0) {
     try {
-      symbols = parseTickerListInput(storedText, MAX_TICKER_LIST_SIZE);
+      symbols = parseTickerListInput(storedText, QUOTE_MONITOR_MAX_TICKERS);
     } catch {
+      // Intentional ignore: unparseable saved ticker text falls back to the legacy symbol or the pane's ticker.
       symbols = [];
     }
   }
   if (symbols.length === 0 && legacySymbol) {
     try {
-      symbols = parseTickerListInput(legacySymbol, MAX_TICKER_LIST_SIZE);
+      symbols = parseTickerListInput(legacySymbol, QUOTE_MONITOR_MAX_TICKERS);
     } catch {
       symbols = [legacySymbol.toUpperCase()];
     }
@@ -155,7 +174,7 @@ export function buildQuoteMonitorSettingsDef(settings: Record<string, unknown> |
       {
         key: "symbolsText",
         label: "Tickers",
-        description: `Enter up to ${MAX_TICKER_LIST_SIZE} tickers separated by commas.`,
+        description: `Enter up to ${QUOTE_MONITOR_MAX_TICKERS} tickers separated by commas.`,
         type: "text",
         placeholder: "AAPL, MSFT, NVDA",
       },

@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import { Box, Text, useUiCapabilities } from "../../../ui";
 import { colors } from "../../../theme/colors";
 import { clamp } from "../../../utils/math";
@@ -37,7 +37,7 @@ interface PriceAxisLabelsProps {
   axisColor?: string;
   /** Anchors that stay put while the cursor moves, such as a measure start. */
   extraMarkers?: readonly PriceAxisMarker[];
-  /** Desktop/web observations, separate from a drawing tool's endpoint. */
+  /** Series observations, separate from a drawing tool's endpoint. */
   seriesTags?: readonly SeriesAxisTag[];
   measuredPixelHeight?: number;
   /** A value axis the pointer stretches and squeezes: a drag or the wheel on it, a double click back. */
@@ -173,7 +173,10 @@ export function PriceAxisLabels({
   // Row-snapped labels drift up to a row off the gridlines they name.
   const usePixelTicks = fractionalViewport && axisTicks !== undefined;
   const pixelHeight = Math.max(measuredPixelHeight ?? height * cellHeightPx, 1);
-  const placedSeriesTags = seriesTags ? placeSeriesAxisTags(seriesTags, pixelHeight, cellHeightPx) : [];
+  const placedSeriesTags = useMemo(
+    () => seriesTags ? placeSeriesAxisTags(seriesTags, pixelHeight, cellHeightPx) : [],
+    [cellHeightPx, pixelHeight, seriesTags],
+  );
   const lanes = Math.max(1, ...placedSeriesTags.map((tag) => tag.lane + 1));
   // Fixed reference labels yield to observations, never the other way round.
   const visibleMarkers = extraMarkers?.filter((marker) => placedSeriesTags.every((tag) => Math.abs(tag.centerY - marker.pixelY) >= cellHeightPx));
@@ -198,22 +201,6 @@ export function PriceAxisLabels({
       : fractionalViewport
         ? "flex-start"
         : "flex-end";
-  const formatLabel = (label: string | null) => {
-    const formatted = formatAxisCell(label, axisWidth);
-    return side === "right" ? formatted.trimStart().padEnd(axisWidth) : formatted;
-  };
-  const renderAxisLabel = (label: string | null, fg: string) => (
-    fractionalViewport ? (
-      <Box flexDirection="row" width={axisSectionWidth} height={1}>
-        <Box flexDirection="row" width={axisWidth} justifyContent={axisLabelJustify} overflow="hidden">
-          {label ? <Text fg={fg} selectable={false}>{formatLabel(label).trim()}</Text> : null}
-        </Box>
-        {axisPaddingWidth > 0 ? <Box width={axisPaddingWidth} /> : null}
-      </Box>
-    ) : (
-      <Text fg={fg} selectable={false}>{formatLabel(label).padEnd(axisSectionWidth)}</Text>
-    )
-  );
 
   const placedStyle = usePixelOverlay || usePixelTicks ? { position: "relative", height: "auto", alignSelf: "stretch" } : undefined;
   return (
@@ -231,44 +218,39 @@ export function PriceAxisLabels({
       data-gloom-side={side}
     >
       {Array.from({ length: height }, (_, row) => {
+        const seriesTag = fractionalViewport ? undefined : placedSeriesTags.find((tag) =>
+          Math.min(height - 1, Math.floor(tag.centerY / pixelHeight * height)) === row);
         const isCursorRow = !usePixelOverlay && cursorLabel !== null && cursorRow === row;
         const marker = usePixelOverlay || usePixelTicks
           ? undefined
           : extraMarkers?.find((entry) => entry.row === row);
-        const label = isCursorRow
+        const label = seriesTag?.label ?? (isCursorRow
           ? cursorLabel
-          : marker?.label ?? (usePixelTicks || (footButton && row === height - 1) ? null : axisLabels.get(row) ?? null);
+          : marker?.label ?? (usePixelTicks || (footButton && row === height - 1) ? null : axisLabels.get(row) ?? null));
         return (
-          <Box key={row} height={1}>
-            {renderAxisLabel(
-              label,
-              isCursorRow ? cursorColor : marker ? marker.color : axisColor,
-            )}
-          </Box>
+          <AxisRow
+            key={row}
+            label={label}
+            fg={seriesTag?.color ?? (isCursorRow ? cursorColor : marker ? marker.color : axisColor)}
+            side={side}
+            axisWidth={axisWidth}
+            axisSectionWidth={axisSectionWidth}
+            fractional={fractionalViewport}
+            justify={axisLabelJustify}
+          />
         );
       })}
-      {placedTicks ? placedTicks.map((tick) => {
-        return (
-          <Box
-            key={`${tick.label}:${tick.ratio}`}
-            width={axisSectionWidth}
-            flexDirection="row"
-            style={{
-              position: "absolute",
-              left: 0,
-              top: `${tick.topPercent}%`,
-              transform: "translateY(-50%)",
-              whiteSpace: "pre",
-              pointerEvents: "none",
-            }}
-          >
-            <Box flexDirection="row" width={axisWidth} justifyContent={axisLabelJustify} overflow="hidden">
-              <Text fg={axisColor} selectable={false}>{tick.label}</Text>
-            </Box>
-            {axisPaddingWidth > 0 ? <Box width={axisPaddingWidth} /> : null}
-          </Box>
-        );
-      }) : null}
+      {placedTicks ? placedTicks.map((tick) => (
+        <AxisTick
+          key={`${tick.label}:${tick.ratio}`}
+          label={tick.label}
+          topPercent={tick.topPercent}
+          color={axisColor}
+          axisWidth={axisWidth}
+          axisSectionWidth={axisSectionWidth}
+          justify={axisLabelJustify}
+        />
+      )) : null}
       {usePixelOverlay || usePixelTicks ? visibleMarkers?.map((marker) => (
         <Box
           key={`${marker.label}:${marker.pixelY}`}
@@ -291,7 +273,7 @@ export function PriceAxisLabels({
           {axisPaddingWidth > 0 ? <Box width={axisPaddingWidth} /> : null}
         </Box>
       )) : null}
-      {seriesTags ? <SeriesAxisTags placed={placedSeriesTags} pixelHeight={pixelHeight} lanes={lanes} background={cursorBackgroundColor} /> : null}
+      {seriesTags && fractionalViewport ? <SeriesAxisTags placed={placedSeriesTags} pixelHeight={pixelHeight} lanes={lanes} background={cursorBackgroundColor} /> : null}
       {usePixelOverlay ? (
         <Box
           width={axisSectionWidth}
@@ -318,3 +300,69 @@ export function PriceAxisLabels({
     </Box>
   );
 }
+
+type AxisLabelJustify = "flex-start" | "flex-end";
+
+/**
+ * One row of the axis, with its label or none. A row only renders when its
+ * label does: the cursor's moving down the axis renders the rows it leaves
+ * and lands on, not the column.
+ */
+const AxisRow = memo(function AxisRow({ label, fg, side, axisWidth, axisSectionWidth, fractional, justify }: {
+  label: string | null;
+  fg: string;
+  side: "left" | "right" | undefined;
+  axisWidth: number;
+  axisSectionWidth: number;
+  fractional: boolean;
+  justify: AxisLabelJustify;
+}) {
+  const formatted = formatAxisCell(label, axisWidth);
+  const text = side === "right" ? formatted.trimStart().padEnd(axisWidth) : formatted;
+  const axisPaddingWidth = Math.max(0, axisSectionWidth - axisWidth);
+  return (
+    <Box height={1}>
+      {fractional ? (
+        <Box flexDirection="row" width={axisSectionWidth} height={1}>
+          <Box flexDirection="row" width={axisWidth} justifyContent={justify} overflow="hidden">
+            {label ? <Text fg={fg} selectable={false}>{text.trim()}</Text> : null}
+          </Box>
+          {axisPaddingWidth > 0 ? <Box width={axisPaddingWidth} /> : null}
+        </Box>
+      ) : (
+        <Text fg={fg} selectable={false}>{text.padEnd(axisSectionWidth)}</Text>
+      )}
+    </Box>
+  );
+});
+
+/** A tick label at its exact height, which holds still while the cursor moves past. */
+const AxisTick = memo(function AxisTick({ label, topPercent, color, axisWidth, axisSectionWidth, justify }: {
+  label: string;
+  topPercent: number;
+  color: string;
+  axisWidth: number;
+  axisSectionWidth: number;
+  justify: AxisLabelJustify;
+}) {
+  const axisPaddingWidth = Math.max(0, axisSectionWidth - axisWidth);
+  return (
+    <Box
+      width={axisSectionWidth}
+      flexDirection="row"
+      style={{
+        position: "absolute",
+        left: 0,
+        top: `${topPercent}%`,
+        transform: "translateY(-50%)",
+        whiteSpace: "pre",
+        pointerEvents: "none",
+      }}
+    >
+      <Box flexDirection="row" width={axisWidth} justifyContent={justify} overflow="hidden">
+        <Text fg={color} selectable={false}>{label}</Text>
+      </Box>
+      {axisPaddingWidth > 0 ? <Box width={axisPaddingWidth} /> : null}
+    </Box>
+  );
+});

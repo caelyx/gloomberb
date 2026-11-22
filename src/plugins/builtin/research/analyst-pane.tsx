@@ -8,7 +8,7 @@ import {
   spanAxisFormatter,
   staticSeries,
   useChartTableSelection,
-  usePaneFooter,
+  useExternalLinkFooter,
   type ChartTableSelection,
   type DataTableCell,
   type DataTableKeyEvent,
@@ -20,14 +20,14 @@ import type { TickerRecord } from "../../../types/ticker";
 import { useTickerFinancials } from "../../../market-data/hooks";
 import { useLiveTickerFinancials } from "../../../state/hooks/live-ticker-financials";
 import { blendHex, colors } from "../../../theme/colors";
-import { formatPercent } from "../../../utils/format";
+import { MISSING_VALUE, formatPercent } from "../../../utils/format";
 import { nextHeaderSort } from "../../../utils/sort-values";
 import { useAssetData } from "../../runtime";
 import { handleRefreshKey, useClampSelectedIndex } from "../../../components/data-table/table-pane";
 import { SignInWall } from "../cloud/auth-actions";
 import { isCloudSessionRequired, useResearchCloudSession } from "../shared/research-cloud-session";
 import { useBoundTicker as useSymbolBinding, useTickerRequest } from "../shared/ticker-request";
-import { loadAnalystResearch } from "./client";
+import { hasAnalystCoverage, loadAnalystResearch, noAnalystActionsText, noAnalystCoverageText } from "./client";
 import {
   DEFAULT_RATING_SORT,
   analystReferencePrice,
@@ -39,6 +39,9 @@ import {
   buildRatingColumns,
   firstRatingSortDirection,
   formatRatingTarget,
+  ratingReason,
+  ratingReasonFooterWidth,
+  ratingReasonSource,
   ratingSplit,
   ratingTargetDelta,
   sortRatingRows,
@@ -97,7 +100,7 @@ function AnalystHeader({ data, history, series, currency, width, height, tableRo
   const upside = targetUpside(target, analystReferencePrice(data, financials?.quote).price);
   const formatValue = useCallback(() => "", []);
   const formatAxisValue = useMemo(
-    () => spanAxisFormatter((value, digits) => formatPriceTarget(Number(value.toFixed(digits)), currency)),
+    () => spanAxisFormatter((value, digits) => formatPriceTarget(Number(value.toFixed(digits)), currency), 2),
     [currency],
   );
   // The terminal grid gives a label half its cell, so two columns under 44
@@ -106,12 +109,12 @@ function AnalystHeader({ data, history, series, currency, width, height, tableRo
   const consensusLabel = !nativePaneChrome && width < 44 ? "Cons." : "Consensus";
   const split = ratingSplit(data);
   // The table body already reports loading, error, and empty states.
-  const figures: StatItem[] = data ? [
+  const figures: StatItem[] = hasAnalystCoverage(data) ? [
     { id: "target", label: consensusLabel, value: formatAnalystPrice(target?.average, currency) },
     {
       id: "upside",
       label: "Upside",
-      value: upside != null ? formatPercent(upside) : "-",
+      value: upside != null ? formatPercent(upside) : MISSING_VALUE,
       tone: upside == null || upside === 0 ? "muted" : upside > 0 ? "positive" : "negative",
     },
     ...(split ? [{
@@ -142,13 +145,16 @@ function AnalystHeader({ data, history, series, currency, width, height, tableRo
 /**
  * Streams the bound symbol and keeps the status bar's reference price on it.
  * Rendered beside the table so a tick redraws the footer, not the ratings.
+ * The selected action's reason, when coverage gave one, is a link there.
  */
-function AnalystFooter({ data, loading, error, width, binding }: {
+function AnalystFooter({ data, loading, error, width, binding, focused, reason }: {
   data: AnalystResearchData | null;
   loading: boolean;
   error: string | null;
   width: number;
   binding: AnalystQuoteBinding;
+  focused: boolean;
+  reason: ReturnType<typeof ratingReason>;
 }) {
   // The upside is a percentage; about one update a second is enough for it.
   const financials = useLiveTickerFinancials(binding.ticker ? binding.symbol : null, binding.ticker, {
@@ -157,9 +163,17 @@ function AnalystFooter({ data, loading, error, width, binding }: {
     weight: 40,
   });
   const reference = analystReferencePrice(data, financials?.quote);
-  usePaneFooter("analyst-research", () => ({
-    info: buildAnalystFooterInfo(data, { width, loading, error, reference }),
-  }), [data, error, loading, reference.freshness, reference.live, reference.price, width]);
+  const info = useMemo(
+    () => buildAnalystFooterInfo(data, { width: width - ratingReasonFooterWidth(reason), loading, error, reference }),
+    [data, error, loading, reason, reference.freshness, reference.live, reference.price, width],
+  );
+  useExternalLinkFooter({
+    registrationId: "analyst-research",
+    focused,
+    url: reason?.url,
+    source: reason ? ratingReasonSource(reason) : null,
+    info,
+  });
   return null;
 }
 
@@ -180,6 +194,10 @@ export function AnalystResearchView({ focused, width, height }: { focused: boole
   }, [dataProvider, cloudSession.requestKey]);
   const { data, loading, error, reload } = useTickerRequest<AnalystResearchData>(loader, symbol, exchange);
   const authWall = !data && isCloudSessionRequired(error);
+  // A listing no analyst covers loads as research with nothing in it: the body says so, the footer has nothing to add.
+  const noCoverage = !!data && !hasAnalystCoverage(data);
+  // A failure with nothing loaded is the body's to say; one behind data on screen (a refresh), the footer's.
+  const failedEmpty = !!symbol && !data && !loading && !!error && !authWall;
   const rows = useMemo(() => sortRatingRows(data?.ratings ?? [], sortPreference), [data?.ratings, sortPreference]);
   const ratingCurrency = analystTargetCurrency(data);
   const columns = useMemo(
@@ -231,9 +249,9 @@ export function AnalystResearchView({ focused, width, height }: { focused: boole
       case "firm":
         return { text: row.firm, color: colors.textBright, attributes: TextAttributes.BOLD };
       case "action":
-        return { text: row.action ?? "-", color: ratingActionColor(row.action) };
+        return { text: row.action ?? MISSING_VALUE, color: ratingActionColor(row.action) };
       case "current":
-        return { text: row.current ?? "-", color: colors.text };
+        return { text: row.current ?? MISSING_VALUE, color: colors.text };
       case "target": {
         const delta = ratingTargetDelta(row);
         const hasTarget = row.currentPriceTarget != null || row.priorPriceTarget != null;
@@ -245,7 +263,10 @@ export function AnalystResearchView({ focused, width, height }: { focused: boole
         };
       }
       case "prior":
-        return { text: row.prior ?? "-", color: colors.textDim };
+        return { text: row.prior ?? MISSING_VALUE, color: colors.textDim };
+      case "reason":
+        // Blank, not a dash: no coverage gave a reason.
+        return { text: ratingReason(row)?.text ?? "", color: colors.textDim };
     }
   }, [ratingCurrency]);
 
@@ -258,13 +279,16 @@ export function AnalystResearchView({ focused, width, height }: { focused: boole
     }));
   }, []);
 
+  const selectedRow = rows.length > 0 ? rows[selectedIdx] : undefined;
   const footer = (
     <AnalystFooter
-      data={authWall ? null : data}
+      data={authWall || noCoverage ? null : data}
       loading={loading}
-      error={authWall ? null : error}
+      error={authWall || failedEmpty ? null : error}
       width={width}
       binding={binding}
+      focused={focused}
+      reason={authWall || !selectedRow ? null : ratingReason(selectedRow)}
     />
   );
 
@@ -312,7 +336,9 @@ export function AnalystResearchView({ focused, width, height }: { focused: boole
         getItemKey={(row, index) => `${row.date}:${row.firm}:${index}`}
         renderCell={renderCell}
         selectedTextOverridesCellColor
-        emptyStateTitle={loading ? "Loading analyst data..." : error ?? "No analyst data"}
+        status={noCoverage ? { empty: true, emptyTitle: noAnalystCoverageText(symbol ?? data?.symbol ?? "") }
+          : failedEmpty && error ? { error, subject: "Analyst research" } : undefined}
+        emptyStateTitle={loading ? "Loading analyst data..." : error ?? (data && symbol ? noAnalystActionsText(symbol, exchange) : "No analyst data")}
       />
     </>
   );

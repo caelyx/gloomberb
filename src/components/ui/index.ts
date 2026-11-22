@@ -3,7 +3,7 @@ export { ListView } from "./list-view";
 export type { ListViewItem, ListViewProps, ListRowState } from "./list-view";
 
 export { DataTable } from "./data-table";
-export type { DataTableCell, DataTableColumn, DataTableProps, DataTableVisibleRange } from "./data-table";
+export type { DataTableCell, DataTableColumn, DataTableColumnReorder, DataTableProps, DataTableVisibleRange } from "./data-table";
 
 export { Button, terminalButtonColumns } from "./button";
 export { Icon, IconButton, ICON_GLYPHS } from "./icon";
@@ -62,7 +62,7 @@ export { Tabs } from "./tabs";
 export type { TabsProps } from "./tabs";
 export { SegmentedControl } from "./toggle";
 export type { SegmentedControlProps } from "./toggle";
-export { EmptyState, PaneStatusBody, Notice, loadingText, unavailableText } from "./status";
+export { EmptyState, PaneStatusBody, Notice, RowNote, loadingText, unavailableText } from "./status";
 export type { EmptyStateProps, PaneStatusBodyProps, NoticeProps, StatusRetry } from "./status";
 export { Badge, BulletList, Divider, FigureList, KeyValueRow, Prose, READING_WIDTH, Section, SectionHeading } from "./display";
 export { Card } from "./card";
@@ -75,6 +75,8 @@ export { InlineQuickAddRow } from "./inline-quick-add";
 export type { InlineQuickAddRowProps } from "./inline-quick-add";
 
 export { ExternalLink, ExternalLinkText, openUrl, PaneLinkMenu, usePaneLinkMenuEntry } from "./external-link";
+export { DesktopPaneLinkChip, TerminalPaneLinkChip, TerminalPaneLinkItemCard, terminalItemCardRows } from "./pane-link-chip";
+export type { PaneLinkChipContent } from "./pane-link-chip";
 export { ButtonActionScope } from "./action-scope";
 export { RemoteImage } from "./remote-image";
 export { PageStackView } from "./page-stack-view";

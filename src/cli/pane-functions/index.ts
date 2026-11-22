@@ -1,10 +1,11 @@
 import { logFailure } from "../../utils/log-failure";
 import { extname, isAbsolute, relative, resolve } from "path";
-import type { CliCommandContext, HeadlessArgumentExpansion } from "../../types/plugin";
+import type { CliCommandContext, GloomPlugin, HeadlessArgumentExpansion } from "../../types/plugin";
 import type { MarketContext } from "../types";
-import { withMarketData } from "../context";
-import { cliStyles, renderStats, type CliStatEntry } from "../../utils/cli-output";
+import { withConfigData, withMarketData } from "../context";
+import { buildForFile, cliStyles, renderForFile, renderStats, type CliStatEntry } from "../../utils/cli-output";
 import {
+  correctCatalogQuery,
   filterPaneCatalogEntries,
   findFunctionCode,
   nearFunctionCodes,
@@ -15,36 +16,54 @@ import {
   type PaneFunctionCatalog,
 } from "./catalog";
 import { createPaneCatalog } from "./discovery";
-import { catalogFredSeriesIds, findCatalogSeries } from "../series-search";
+import { getHeadlessPaneDefinition } from "./capabilities";
+import { catalogFredSeriesIds, findCatalogSeries, findSeriesFacts, type SeriesMatch } from "../series-search";
 import {
+  normalizeLookupToken,
   parsePaneCatalogArgs,
   parsePaneFunctionArgs,
   type ParsedPaneFunctionArgs,
 } from "./options";
-import { applyListingArgument, findPaneFunction, parsePaneFunctionArgsFor, resolvePaneFunction, UnknownPaneFunctionError, type ResolvedPaneFunction } from "./resolver";
-import { buildFunctionReport } from "./report";
+import {
+  applyListingArgument, findPaneFunction, parsePaneFunctionArgsFor, resolvePaneFunction, UnknownPaneFunctionError,
+  type PluginCodeStopFinder, type ResolvedPaneFunction,
+} from "./resolver";
+import { idleCliPlugins, installedPluginCount } from "../registry";
+import { pluginSupportsTarget } from "../../plugins/plugin-export";
+import type { RegistryPlugin } from "../../plugins/marketplace/model";
+import type { AppResourceStorePort } from "../../core/app-service-ports";
+import { buildFunctionReport, resolvePaneFunctionReportSource } from "./report";
 import { expandResolvedArgument } from "./headless";
 import { defaultScreenshotPath, shotSizeWarnings } from "./screenshot-payload";
 import { renderDesktopShot } from "./screenshot-render";
-import { shotStatusIssues } from "./screenshot-assessment";
+import { shotCutColumnsWarning, shotStatusIssues } from "./screenshot-assessment";
+import { PANE_SWEEP_EVIDENCE_PATH } from "./screenshot-types";
 import {
   buildPaneCatalogEntries,
+  exampleListName,
+  type PaneCatalogEntry,
 } from "./catalog";
+import { readCatalogSnapshot, snapshotEntries } from "./catalog-snapshot";
+import { loadBuiltinPlugin } from "../../plugins/catalog-lazy";
 import { incompleteReportGateMessage } from "./access-gate";
 import { withPersistedCloudSession } from "./cloud-session";
 import {
-  ListingArgError, listingFateLoader, listingReadNotes, loadForListing, loadListingQuoteAnswer, quotedListingChoiceNotes, refuseMovedListing,
+  failUnchosenListing, ListingArgError, listingFateLoader, listingReadNotes, loadForListing, loadListingQuoteAnswer, quotedListingChoiceNotes, refuseMovedListing,
 } from "../listing-arg";
-import { isNotATickerMessage } from "../not-a-ticker";
-import { isCliFailure, SERVICE_UNREACHABLE_CODE } from "../errors";
-import { DATA_SERVICE_UNREACHABLE_MESSAGE } from "../../utils/network-failure";
+import { notATickerStop } from "../company-name-hint";
+import { CLI_ERROR_CODE, failUnreachable, failWithError, isCliFailure, isSourceUnavailableAnswer, unreachableError } from "../errors";
+import { dataServiceUnreachable, forgetDataServiceReach } from "../../api-client/request";
+import { DATA_SERVICE_UNREACHABLE_MESSAGE, isNetworkFailure } from "../../utils/network-failure";
 import { isTickerLinkPeer } from "../../layout/ticker-navigation";
-import { knownGapMessage, commandPointer, commandPointerLeads, topicPointer } from "../known-gaps";
-import { selectReportTables, type CliReportTables } from "../report-tables";
-import { cliOutputWritten, type CliErrorObject } from "../result";
+import { appCommandPointer, knownGapMessage, commandPointer, commandPointerLeads, topicPointer } from "../known-gaps";
+import { selectReportTables, splitCsvFooter, withRefusedRows, type CliReportTables } from "../report-tables";
+import { portableCsv } from "../csv-export";
+import { cliOutputWritten, printCliResult, serializeCliResult, type CliErrorObject } from "../result";
+import { checkOutputPath, resolveOutputPath, writeOutputFile } from "../output-file";
 import type { CatalogCommandHit } from "../unknown-command";
 import { CLI_EXIT_CODES } from "../exit-codes";
 import { shotOptionRefusal } from "./shot-options";
+import { listingChangeLine } from "../../tickers/listing-fate";
 import {
   GLOSSARY,
   glossaryRecord,
@@ -64,25 +83,105 @@ async function withPaneRuntime<T>(
     registry: PaneFunctionCatalog;
     resolved: ResolvedPaneFunction;
   }) => Promise<T>,
-  settings: { strictHeadlessOptions?: boolean; tableSection?: boolean; command?: "fn" | "shot" } = {},
+  settings: { strictHeadlessOptions?: boolean; tableSection?: boolean; rowWindow?: boolean; command?: "fn" | "shot" } = {},
 ): Promise<T> {
   return withMarketData(ctx, async (market) => {
     const context: MarketContext = ctx.cliOptions.refresh ? { ...market, refresh: true } : market;
-    const registry = await createPaneCatalog(context, ctx.plugins);
+    // `shot` draws a pane as the desktop app does, so it also opens the panes of plugins only the desktop app runs (Gloom Social).
+    const plugins = settings.command === "shot" ? [...ctx.plugins, ...desktopOnlyPlugins(ctx)] : await pluginsOfFunction(ctx, context, args);
+    const registry = await createPaneCatalog(context, plugins);
     try {
       let parsed = await applyListingArgument(registry, context, parsePaneFunctionArgsFor(registry, args, ctx.cliOptions), settings.command);
-      let resolved = await resolvePaneFunction(registry, context, parsed, settings);
+      const resolution = { ...settings, seriesSources: () => ctx.plugins, pluginStop: pluginStopFor(ctx, context) };
+      let resolved = await resolvePaneFunction(registry, context, parsed, resolution);
       // A function that widens its argument (RV's --peers) runs, reports and captures the widened one.
       const expansion = await withPersistedCloudSession(context, () => expandResolvedArgument(resolved, context, parsed.arg));
       if (expansion) {
         parsed = { ...parsed, arg: expansion.argument };
-        resolved = withExpansion(await resolvePaneFunction(registry, context, parsed, settings), expansion);
+        resolved = withExpansion(await resolvePaneFunction(registry, context, parsed, resolution), expansion);
       }
       return await run({ parsed, context, registry, resolved });
     } finally {
       registry.destroy();
     }
   });
+}
+
+/**
+ * The plugins `fn` resolves a function among. A coded function that reports data, of a built-in plugin, is
+ * opened by that plugin and the one that holds its pane (`catalog-snapshot.json`, where a build wrote it, says
+ * which), so the other plugins' code is not loaded to run it. Any other word, a source checkout without that
+ * file, and any command line with an installed or switched-off plugin, asks them all.
+ */
+async function pluginsOfFunction(ctx: CliCommandContext, context: MarketContext, args: string[]): Promise<GloomPlugin[]> {
+  if ((context.config.disabledPlugins ?? []).length > 0 || await installedPluginCount(ctx) > 0) return ctx.plugins;
+  let target: string;
+  try {
+    target = parsePaneFunctionArgs(args, ctx.cliOptions).target;
+  } catch {
+    // Intentional ignore: arguments that do not parse fail where they are parsed for the function.
+    return ctx.plugins;
+  }
+  const holders = target ? readCatalogSnapshot()?.functions[normalizeLookupToken(target)] : undefined;
+  const found = holders?.flatMap((id) => loadBuiltinPlugin(id) ?? []);
+  return found?.length ? found : ctx.plugins;
+}
+
+/** Installed plugins the command line does not run but the desktop app does, which `shot` draws as it does. */
+function desktopOnlyPlugins(ctx: CliCommandContext): GloomPlugin[] {
+  return idleCliPlugins(ctx)
+    .filter(({ plugin, reason }) => reason === "target" && pluginSupportsTarget(plugin, "desktop"))
+    .map(({ plugin }) => plugin);
+}
+
+/** The plugin of a function that does not run in the desktop app (IBKR Gateway is the terminal's), or null. */
+function terminalOnlyPlugin(resolved: ResolvedPaneFunction, ctx: CliCommandContext): GloomPlugin | null {
+  const owner = ctx.plugins.find((plugin) => (
+    plugin.panes?.some((pane) => pane.id === resolved.pane.id)
+    || (!!resolved.template && plugin.paneTemplates?.some((template) => template.id === resolved.template!.id))
+  ));
+  return owner && !pluginSupportsTarget(owner, "desktop") ? owner : null;
+}
+
+/**
+ * How long a code no function answers to (most often a mistyped ticker) waits
+ * for the plugin registry, to say which plugin it is: one request, cut off then.
+ */
+const PLUGIN_REGISTRY_WAIT_MS = 2_500;
+/** The registry the command line read, kept in the profile's cache: a day before it is asked again, a week to fall back on. */
+const PLUGIN_REGISTRY_CACHE = { namespace: "plugin-registry", kind: "feed", entityKey: "plugins.gloom.sh" };
+const PLUGIN_REGISTRY_CACHE_POLICY = { staleMs: 24 * 60 * 60_000, expireMs: 7 * 24 * 60 * 60_000 };
+
+/**
+ * The registry for a code no function answers to: the profile's copy from the
+ * last day, else one short request that nothing waits on once it is cut off,
+ * else the copy from the last week.
+ */
+async function readCodeRegistry(resources: AppResourceStorePort | undefined): Promise<readonly RegistryPlugin[]> {
+  const cached = resources?.get<RegistryPlugin[]>(PLUGIN_REGISTRY_CACHE);
+  const kept = Array.isArray(cached?.value) ? cached.value : null;
+  if (kept && !cached!.stale) return kept;
+  try {
+    const { readRegistryOnce } = await import("../../plugins/marketplace/feed");
+    const plugins = await readRegistryOnce(PLUGIN_REGISTRY_WAIT_MS);
+    resources?.set(PLUGIN_REGISTRY_CACHE, plugins, { cachePolicy: PLUGIN_REGISTRY_CACHE_POLICY });
+    return plugins;
+  } catch (error) {
+    if (kept) return kept;
+    throw error;
+  }
+}
+
+/** Why a code is a plugin's that does not run here (`pluginCodeStop`), read from the profile and the registry. */
+function pluginStopFor(ctx: CliCommandContext, context: MarketContext): PluginCodeStopFinder {
+  return async (name, commands) => {
+    const { pluginCodeStop } = await import("./plugin-code");
+    return pluginCodeStop(name, {
+      idle: idleCliPlugins(ctx),
+      running: ctx.plugins.map((plugin) => plugin.id),
+      loadRegistry: () => readCodeRegistry(context.persistence?.resources),
+    }, commands);
+  };
 }
 
 /** The resolved function with what its expansion adds to the pane: settings, and a title that says how. */
@@ -180,13 +279,21 @@ export async function catalogCommandHits(ctx: CliCommandContext, token: string):
     return await withMarketData(ctx, async (market) => {
       const registry = await createPaneCatalog(market, ctx.plugins);
       try {
-        return (await suggestPaneFunctions(registry, market, word)).slice(0, COMMAND_HIT_LIMIT).map((entry) => ({
-          code: entry.token,
-          label: entry.label,
-          argKind: entry.argKind ?? null,
-          argPlaceholder: entry.argPlaceholder ?? null,
-          peers: entry.capability.options.some((option) => option.key === "peers" && option.type === "boolean"),
-        }));
+        return (await suggestPaneFunctions(registry, market, word)).slice(0, COMMAND_HIT_LIMIT).map((entry) => {
+          const pane = registry.panes.get(entry.paneId);
+          const template = entry.templateId ? registry.paneTemplates.get(entry.templateId) : undefined;
+          const headless = pane ? getHeadlessPaneDefinition(template, pane) : undefined;
+          const refuse = headless?.refuseSymbol;
+          return {
+            code: entry.token,
+            label: entry.label,
+            argKind: entry.argKind ?? null,
+            argPlaceholder: entry.argPlaceholder ?? null,
+            peers: entry.capability.options.some((option) => option.key === "peers" && option.type === "boolean"),
+            ...(refuse ? { refusesSymbol: (key: string) => refuse(key) != null } : {}),
+            ...(headless?.currencyPairs ? { takesFx: true } : {}),
+          };
+        });
       } finally {
         registry.destroy();
       }
@@ -241,6 +348,41 @@ function tablesHoldValues(tables: CliReportTables): boolean {
   });
 }
 
+/** Whether a report's tables show a figure: a cell outside the label column with a digit in it (not a dash). */
+function tablesHoldFigures(tables: CliReportTables): boolean {
+  return tables.tables.some((table) => {
+    const skipped = new Set(table.columns.flatMap((header, index) => index === 0 || header === "status" || header === "value_status" ? [index] : []));
+    return table.rows.some((row) => row.some((cell, index) => !skipped.has(index) && /\d/.test(String(cell ?? ""))));
+  });
+}
+
+/**
+ * Whether a report holds nothing because its reads failed: empty with a
+ * failure said, every row failing to reach the data service (WEI's twenty
+ * indices each "couldn't reach"), or every row's listing without data and no
+ * figure anywhere (BI's sectors, all dashes). Never one behind a wall, whose
+ * note is its answer, one with nothing asked yet ("Select a ticker."), or one
+ * with a figure from a read that did answer (VIX's term structure beside
+ * quotes it has none of).
+ */
+export function reportHasNoData(data: {
+  empty: boolean; rowCount: number; unavailableSymbols: readonly string[]; errors?: readonly string[]; locked?: unknown;
+}, tables?: CliReportTables): boolean {
+  if (data.locked) return false;
+  const errors = data.errors ?? [];
+  if (data.unavailableSymbols.length === 0 && errors.length === 0) return false;
+  if (data.empty) return true;
+  if (data.rowCount === 0) return false;
+  const unreached = errors.filter((error) => error.includes(DATA_SERVICE_UNREACHABLE_MESSAGE)).length;
+  if (unreached >= data.rowCount) return true;
+  return data.unavailableSymbols.length >= data.rowCount && !!tables && !tablesHoldFigures(tables);
+}
+
+/** A report with nothing in it because the data service went unanswered: no answer, not "no data" dated now. */
+function reportFailedUnreached(data: Parameters<typeof reportHasNoData>[0], tables: CliReportTables): boolean {
+  return reportHasNoData(data, tables) && dataServiceUnreachable();
+}
+
 /**
  * Why `fn` fails a report it printed, or null when the report has data. It
  * fails when it is empty (a pane behind a wall reads nothing), when it has no
@@ -263,7 +405,7 @@ export function reportFailure(
   const reasons = [...data.errors ?? [], ...typeof data.reason === "string" ? [data.reason] : []];
   const unreached = reasons.filter((reason) => reason.includes(DATA_SERVICE_UNREACHABLE_MESSAGE));
   if (unreached.length > 0 && (data.empty || data.unavailableSymbols.length > 0)) {
-    return { code: SERVICE_UNREACHABLE_CODE, message: `${asked}: ${unreached.join("; ")}.`.replace(/\.\.$/, "."), retryable: true };
+    return unreachableError(`${asked}: ${unreached.join("; ")}.`.replace(/\.\.$/, "."));
   }
   if (!data.empty && !(noListing && noValues) && !(failsWithoutData && foundNothing(data))) return null;
   const unavailable = data.unavailableSymbols.length > 0 ? `no data for ${data.unavailableSymbols.join(", ")}` : "no data";
@@ -276,6 +418,16 @@ export async function runPaneFunction(args: string[], ctx: CliCommandContext) {
       if (parsed.strict) {
         throw new Error("--strict is an option of shot. fn takes --require-bot-safe to fail on a report that is not complete.");
       }
+      // What only a capture draws is refused, never ignored: the report would print as if it had not been given.
+      if (parsed.shotOnly?.length) {
+        const one = parsed.shotOnly.length === 1;
+        const shot = ["gloom shot", resolved.token, parsed.arg.trim() && commandWord(parsed.arg.trim())].filter(Boolean).join(" ");
+        throw new Error(`${parsed.shotOnly.join(" and ")} ${one ? "is an option" : "are options"} of shot, which saves the pane as a PNG; fn prints the report. `
+          + `Drop ${one ? "it" : "them"} from fn, or capture the pane with ${shot}.`);
+      }
+      // The file --output names, checked before the report loads so a path that cannot be written fails at once.
+      const outputPath = parsed.outputPath === null ? null : resolveOutputPath(parsed.outputPath);
+      const replacing = outputPath ? await checkOutputPath(outputPath) : false;
       if (parsed.requireBotSafe && (
         !resolved.capability.botSafe || resolved.capability.reportReadiness !== "ready"
       )) {
@@ -289,9 +441,20 @@ export async function runPaneFunction(args: string[], ctx: CliCommandContext) {
         throw new Error("--section picks one table of --csv or --ndjson output.");
       }
       if (resolved.tableSection === true) throw new Error("--section needs a section title or number.");
+      // A report read from the pane, and `shot` for a pane with none, draw it as the desktop app does: not one whose plugin does not run there.
+      const source = resolvePaneFunctionReportSource(resolved);
+      const terminalOnly = source === "headless" ? null : terminalOnlyPlugin(resolved, ctx);
+      if (terminalOnly) {
+        throw new Error((source
+          ? `${resolved.token}'s report is read from its pane as the desktop app draws it, and the ${terminalOnly.name} plugin does not run in the desktop app.`
+          : `${resolved.token} is an interactive pane with no data report, and the ${terminalOnly.name} plugin does not run in the desktop app, which shot draws panes with.`)
+          + ` Open ${resolved.token} in the terminal app.`);
+      }
       // A report's title names the function and the symbol, never the listing a bare one was read on,
       // so it gets `quote`'s line for that. Looked up beside the report, so it costs no wait.
-      const choice = parsed.listing ? quotedListingChoiceNotes(parsed.listing, context) : null;
+      // A price function (HP) names the index or future a code a security owns is typed for, as `quote` does (GOLD, MOVE).
+      const choice = parsed.listing ? quotedListingChoiceNotes(parsed.listing, context,
+        resolved.headless?.currencyPairs ? { pricesFor: `fn ${resolved.token}` } : {}) : null;
       // A symbol whose company moved (HFC became DINO) has no data of its own: a report of a pane that shows
       // one ticker, as the app gates those panes, serves none and names the new symbol with the same
       // function, as `history` does. Looked up beside the report. A loader that finds it itself (VCA of
@@ -301,26 +464,40 @@ export async function runPaneFunction(args: string[], ctx: CliCommandContext) {
       let quoted: ReturnType<typeof loadListingQuoteAnswer> | null = null;
       const quoteAnswer = listing ? () => quoted ??= loadListingQuoteAnswer(context.dataProvider, listing) : null;
       const fate = listing && quoteAnswer && isTickerLinkPeer(resolved.instance, registry.panes)
-        ? listingFateLoader(listing, context, quoteAnswer().then((answer) => answer.quote))
+        ? listingFateLoader(listing, context, quoteAnswer().then((answer) => answer.quote), { successor: true })
         : null;
       const moved = { command: "fn", retry: (key: string) => `gloom fn ${resolved.token} ${key}` };
       // A report that fails or comes back empty for an exchange the symbol is not listed on says so.
+      // A report written to a file is drawn for it as it is built: no colour and no terminal width, as a redirect gets it.
+      const buildReport = () => buildFunctionReport(resolved, context, parsed.arg, registry);
+      // A report still loading after a few seconds (a chain the server reads cold) says so, so it never looks stuck.
+      const progress = progressNotice(ctx, [resolved.token, parsed.arg].filter(Boolean).join(" "), FN_PROGRESS_AFTER_MS);
       const report = await refuseMovedListing(fate, moved, () => withPersistedCloudSession(
         context,
         () => loadForListing(
           parsed.listing ?? [],
           context,
           ctx,
-          () => buildFunctionReport(resolved, context, parsed.arg),
+          outputPath ? () => buildForFile(buildReport) : buildReport,
           (built) => built.data.empty || !built.data.complete,
         ),
-      ));
+      )).catch(async (error: unknown) => {
+        // A bare code several companies list (3988 in Hong Kong and Tokyo) asks which, as `quote` does, rather than "Not a ticker".
+        if (listing) await failUnchosenListing(listing, context, ctx, { ...moved, noun: "data" }, error);
+        throw error;
+      }).finally(progress.stop);
+      // A report with nothing in it while the data service went unanswered is no answer, not "No data" dated now:
+      // it fails as `search` and `quote` do (G, CMP, WEI and CHOKE printed empty tables and "retrieved" at the run).
+      if (reportFailedUnreached(report.data, report.tables)) failUnreachable();
       // A company's name typed where its ticker goes (`fn RDCF Palantir`) found nothing: the answer is `quote`'s,
-      // "Not a ticker: PALANTIR. Try `gloom search Palantir`.", not an empty report.
-      if (quoteAnswer && (report.data.empty || report.data.unavailableSymbols.length > 0)) {
+      // "Not a ticker: PALANTIR. Did you mean PLTR (Palantir Technologies Inc.)?", not an empty report. A source that
+      // could not answer for the word (a timeout) says nothing of it, but when search finds the company it is that.
+      if (quoteAnswer && listing && (report.data.empty || report.data.unavailableSymbols.length > 0)) {
         const { quote, error } = await quoteAnswer();
-        const message = error instanceof Error ? error.message : null;
-        if (!quote && isNotATickerMessage(message)) ctx.fail(message!);
+        // So does one whose report came back empty.
+        if (!quote) await failUnchosenListing(listing, context, ctx, { ...moved, noun: "data" }, error);
+        const stop = quote ? null : await notATickerStop(error, listing, context);
+        if (stop) ctx.fail(stop);
       }
       if (parsed.requireBotSafe && (report.data.empty || !report.data.complete)) {
         const unavailable = report.data.unavailableSymbols.length > 0
@@ -342,17 +519,38 @@ export async function runPaneFunction(args: string[], ctx: CliCommandContext) {
       const data = glossary
         ? { ...report.data, glossary: glossary.map(({ term, short, definition }) => ({ term, ...(short ? { short } : {}), definition })) }
         : report.data;
-      const warnings = [...parsed.listingNotes ?? [], ...await choice ?? [], ...report.data.warnings ?? []];
+      // What became of the company that had the symbol (GOGL), as `quote` says it, leads.
+      const successor = fate ? listingChangeLine(await fate()) : null;
+      // A note the listing and the report both make (a coin's code charted as a fund) is said once.
+      const warnings = [...new Set([...successor ? [successor] : [], ...parsed.listingNotes ?? [], ...await choice ?? [], ...report.data.warnings ?? []])];
       // A report with no data is printed as it is, and fails: exit 1, and `ok: false` in JSON with the reason.
       const failure = reportFailure(report.data, ["fn", resolved.token, parsed.arg.trim()].filter(Boolean).join(" "), {
         failsWithoutData: resolved.headless?.failsWithoutData, tables: report.tables });
       // The report states its own freshness in its data and text; JSON cites it as `source` too.
-      ctx.printResult({ data, exportFreshness: report.data.freshness, ...(warnings.length > 0 ? { warnings } : {}), ...(failure ? { failure } : {}) }, {
+      const result = { data, exportFreshness: report.data.freshness, ...(warnings.length > 0 ? { warnings } : {}), ...(failure ? { failure } : {}) };
+      const render = {
         text: () => glossary ? `${report.text}\n\n${renderReportGlossary(resolved.token, glossary)}` : report.text,
-        ...(tabular ? { tables: selectReportTables(report.tables, resolved.tableSection) } : {}),
-      });
+        // A symbol of the list left out still has its row, with why.
+        ...(tabular ? { tables: selectReportTables(withRefusedRows(report.tables, parsed.refusedListings), resolved.tableSection) } : {}),
+      };
+      if (outputPath) {
+        // A report with no data writes no file: a header alone would read as a screen that matched nothing. It fails
+        // as plain --json fails, with its code and whether to retry.
+        if (failure) failWithError({ ...failure, details: `Nothing was written to ${outputPath}.` });
+        const written = renderForFile(() => serializeCliResult(result, ctx.cliOptions, render));
+        const { csv, footer } = ctx.cliOptions.format === "csv" ? splitCsvFooter(written) : { csv: written, footer: [] };
+        await writeOutputFile(outputPath, `${ctx.cliOptions.format === "csv" ? portableCsv(written, warnings) : csv}\n`);
+        if (!ctx.cliOptions.quiet) for (const line of footer) console.error(line);
+        // What was written and where; warnings go to stderr as they would beside printed rows, and JSON keeps its envelope.
+        const saved = { output: outputPath, format: ctx.cliOptions.format, rows: report.data.rowCount, replaced: replacing };
+        printCliResult({ data: saved, ...(warnings.length > 0 ? { warnings } : {}) },
+          { ...ctx.cliOptions, format: ctx.cliOptions.format === "json" ? "json" : "text" },
+          { text: () => `${replacing ? "Replaced" : "Saved"} ${outputPath}` });
+        return;
+      }
+      ctx.printResult(result, render);
       if (failure) process.exitCode = CLI_EXIT_CODES.error;
-    }, { strictHeadlessOptions: true, tableSection: true });
+    }, { strictHeadlessOptions: true, tableSection: true, rowWindow: true });
   });
 }
 
@@ -394,6 +592,45 @@ export function emptySeriesExport(
 /** How long a capture's process may stay up after its output, for a report it stopped waiting for. */
 const STALLED_REPORT_EXIT_MS = 1_000;
 
+/** A capture still going after this long says what it is doing, so it never looks stuck. */
+const SHOT_PROGRESS_AFTER_MS = 3_000;
+/** A report, which most often prints within this, says so only past it. */
+const FN_PROGRESS_AFTER_MS = 5_000;
+
+/**
+ * One line on a terminal's standard error while a capture or report is slow:
+ * "Still loading the data for PORT izmir." while its data is read, "Still
+ * drawing PORT izmir." once a capture's page draws it. It is progress, not
+ * part of the answer: the line is cleared once the work ends, so a finished
+ * report never starts with it, and standard error that is not a terminal (a
+ * file, a pipe, a script reading it) never gets it. Nothing for a quick one,
+ * or with --quiet.
+ */
+export function progressNotice(
+  ctx: Pick<CliCommandContext, "cliOptions">,
+  label: string,
+  afterMs = SHOT_PROGRESS_AFTER_MS,
+  stream: Pick<NodeJS.WriteStream, "isTTY" | "write"> = process.stderr,
+): { drawing(): void; stop(): void } {
+  if (ctx.cliOptions.quiet || !stream.isTTY) return { drawing: () => {}, stop: () => {} };
+  let drawing = false;
+  let shown = false;
+  const timer = setTimeout(() => {
+    // No newline: the line stays the cursor's until it is cleared.
+    stream.write(cliStyles.muted(drawing ? `Still drawing ${label}.` : `Still loading the data for ${label}.`));
+    shown = true;
+  }, afterMs);
+  (timer as { unref?: () => void }).unref?.();
+  return {
+    drawing: () => { drawing = true; },
+    stop: () => {
+      clearTimeout(timer);
+      if (shown) stream.write("\r\x1b[2K");
+      shown = false;
+    },
+  };
+}
+
 export async function runPaneScreenshot(args: string[], ctx: CliCommandContext) {
   let stalledReport = false;
   try {
@@ -420,9 +657,19 @@ async function capturePaneScreenshot(args: string[], ctx: CliCommandContext, onS
       // An option the pane cannot draw fails here, before a capture of its default is saved as if it were the view asked for.
       const refusal = shotOptionRefusal(resolved, parsed.arg, parsed.options, { explain: parsed.explain === true });
       if (refusal) throw new Error(refusal);
+      // A capture draws the pane as the desktop app does: a plugin that does not run there has nothing to draw it with.
+      const terminalOnly = terminalOnlyPlugin(resolved, ctx);
+      if (terminalOnly) {
+        throw new Error(`${resolved.token} cannot be captured: the ${terminalOnly.name} plugin does not run in the desktop app, which shot draws panes with. `
+          + `Open ${resolved.token} in the terminal app.`);
+      }
       const outputPath = parsed.outputPath
         ? resolve(process.cwd(), ensurePngExtension(parsed.outputPath))
         : defaultScreenshotPath(resolved, parsed.arg);
+      const progress = progressNotice(ctx, [resolved.token, parsed.arg].filter(Boolean).join(" "));
+      const sweepEvidence = parsed.strict === true && ctx.cliOptions.format === "json" && !!parsed.outputPath
+        && process.env[PANE_SWEEP_EVIDENCE_PATH] === outputPath;
+      const onlyUsable = parsed.requireBotSafe === true || (parsed.strict === true && !sweepEvidence);
       const result = await renderDesktopShot({
         resolved,
         context,
@@ -436,7 +683,19 @@ async function capturePaneScreenshot(args: string[], ctx: CliCommandContext, onS
         statusLine: parsed.status !== false,
         fitRows: parsed.heightGiven !== true,
         options: parsed.options,
+        onlyUsable,
         onStalledReport,
+        onDrawing: progress.drawing,
+      }).finally(progress.stop).catch(async (error: unknown) => {
+        // A company's name typed where its ticker goes fails as `fn` words it, with the company search finds.
+        const { quote, error: quoteError } = parsed.listing ? await loadListingQuoteAnswer(context.dataProvider, parsed.listing) : { quote: null, error: undefined };
+        // A bare code several companies list asks which, as `fn` does.
+        if (parsed.listing && !quote) {
+          await failUnchosenListing(parsed.listing, context, ctx,
+            { command: "shot", noun: "data", retry: (key) => `gloom shot ${resolved.token} ${key}` }, quoteError);
+        }
+        const stop = parsed.listing && !quote ? await notATickerStop(quoteError, parsed.listing, context) : null;
+        throw stop ? new Error(stop) : error;
       });
       if (parsed.requireBotSafe && !result.usable) {
         throw new Error(
@@ -445,7 +704,9 @@ async function capturePaneScreenshot(args: string[], ctx: CliCommandContext, onS
       }
       // Text prints a warning on stderr, out of the way of piped output; JSON carries it in the envelope.
       const read = parsed.listing ? listingReadNotes(parsed.listing) : [];
-      const warnings = [...read, ...parsed.listingNotes ?? [], ...shotSizeWarnings(parsed.clamped, parsed)];
+      // A column cut at the table's edge is named, and does not make the picture unusable (or fail --strict).
+      const cut = shotCutColumnsWarning(result.cutColumns);
+      const warnings = [...read, ...parsed.listingNotes ?? [], ...shotSizeWarnings(parsed.clamped, parsed), ...cut ? [cut] : []];
       ctx.printResult({ data: result, ...(warnings.length > 0 ? { warnings } : {}) }, {
         text: (data) => {
           const issues = shotStatusIssues(data);
@@ -458,13 +719,18 @@ async function capturePaneScreenshot(args: string[], ctx: CliCommandContext, onS
           if (data.unusableReason) stats.push(["Reason", data.unusableReason]);
           if (data.notices?.length) stats.push(["Notes", data.notices.join(" ")]);
           if (data.unavailableSymbols.length > 0) stats.push(["No data for", data.unavailableSymbols.join(", ")]);
+          if (data.unreadRows?.length) {
+            stats.push(["Not loaded", cliStyles.warning(data.unreadRows.map((symbol) => data.unreadReasons?.[symbol] ? `${symbol} (${data.unreadReasons[symbol]})` : symbol).join(", "))]);
+          }
+          if (data.blankColumns?.length) stats.push(["Blank columns", cliStyles.warning(data.blankColumns.join(", "))]);
           if (data.render.emptyStateMarkers.length > 0) stats.push(["Empty states", data.render.emptyStateMarkers.join(", ")]);
           if (data.render.missingExpectedText.length > 0) stats.push(["Missing text", data.render.missingExpectedText.join(", ")]);
-          return [`Saved ${displayPath(data.outputPath)}`, renderStats(stats)].join("\n");
+          return [data.saved ? `Saved ${displayPath(data.outputPath)}` : "No image saved.", renderStats(stats)].join("\n");
         },
       });
-      // The image is saved and the reason printed; --strict tells a script it should not be used.
+      // A pane that drew nothing but its empty state ("No ticker selected.") fails either way, as `fn` does for an empty report.
       if (parsed.strict && !result.usable) process.exitCode = CLI_EXIT_CODES.unusableShot;
+      else if (!result.usable && result.render.emptyStateDetected && result.rowCount === 0) process.exitCode = CLI_EXIT_CODES.error;
     }, { command: "shot" });
   });
 }
@@ -508,7 +774,8 @@ export async function runPaneFunctionHelp(command: string, args: string[], ctx: 
         const found = findPaneFunction(registry, target);
         if (!found?.pane) return undefined;
         const { template, pane } = found;
-        const entries = await buildPaneCatalogEntries(registry, context);
+        // A function typed by its code is helped even while it is unlisted.
+        const entries = await buildPaneCatalogEntries(registry, context, { unlisted: true });
         // A pane named directly, where functions open it, is helped by the first of them.
         return (template ? entries.find((candidate) => candidate.templateId === template.id) : undefined)
           ?? entries.find((candidate) => candidate.paneId === pane.id);
@@ -525,6 +792,9 @@ export async function runPaneFunctionHelp(command: string, args: string[], ctx: 
   }
 }
 
+/** Set to 1 by the UI audits (scripts/pane-chrome/web-app.ts), so `catalog` lists the panes it leaves out for a user. */
+const CATALOG_APP_PANES_ENV = "GLOOMBERB_CATALOG_APP_PANES";
+
 export async function runPaneCatalog(args: string[], ctx: CliCommandContext) {
   await runPaneCliCommand(ctx, async () => {
     const parsed = parsePaneCatalogArgs(args);
@@ -537,36 +807,13 @@ export async function runPaneCatalog(args: string[], ctx: CliCommandContext) {
       ...parsed,
       limit: ctx.cliOptions.limit ?? parsed.limit,
     };
+    if (await listFromSnapshot(ctx, parsed, effectiveParsed)) return;
     await withMarketData(ctx, async (context) => {
       const registry = await createPaneCatalog(context, ctx.plugins);
       try {
-        const entries = await buildPaneCatalogEntries(registry, context);
-        const botSafeEntries = effectiveParsed.botSafeOnly
-          ? entries.filter((entry) => entry.capability.botSafe)
-          : entries;
-        // A topic no function covers is answered by its pointer, not by the loose matches its words find.
-        const pointer = topicPointer(parsed.query);
-        const filtered = pointer ? [] : filterPaneCatalogEntries(botSafeEntries, parsed.query);
-        // A search also finds the terms it names; text only, the JSON stays a list of functions.
-        const glossary = lookupGlossary(parsed.query);
-        // Data no source carries yet is said once: in the text, else as the envelope's warning.
-        const gap = knownGapMessage(parsed.query);
-        // A setting or a report can be a command, not a function: "light theme" names `config themes` beside THEM,
-        // "drip" names `portfolio show --drip` beside DVD.
-        const setting = commandPointer(parsed.query);
-        const settingLeads = commandPointerLeads(parsed.query);
-        // The data catalog series the query names, which `fn G` charts.
-        const series = findCatalogSeries(ctx.plugins, parsed.query);
-        const listed = pointer
-          ? pointer.codes.flatMap((code) => entries.filter((entry) => entry.token === code))
-          : selectPaneCatalogMatches(filtered, parsed.query, effectiveParsed.limit).shown;
-        ctx.printResult({
-          data: listed,
-          ...series.length ? { metadata: { series } } : {},
-          ...(gap || setting) && ctx.cliOptions.format !== "text" ? { warnings: [gap, setting].filter((note): note is string => !!note) } : {},
-        }, {
-          text: () => renderPaneCatalogReport(filtered, effectiveParsed, glossary, gap, series, setting, settingLeads),
-        });
+        // The UI audits picture every pane the app opens, those the command line has nothing to show for too.
+        const entries = await buildPaneCatalogEntries(registry, context, { appPanes: process.env[CATALOG_APP_PANES_ENV] === "1" });
+        printCatalog(ctx, parsed, effectiveParsed, entries, findCatalogSeries(ctx.plugins, parsed.query));
       } finally {
         registry.destroy();
       }
@@ -574,15 +821,90 @@ export async function runPaneCatalog(args: string[], ctx: CliCommandContext) {
   });
 }
 
+/**
+ * The catalog read from what the built-in plugins declare (`catalog-snapshot.json`, which a release build writes),
+ * where nothing else is installed, switched off or asked for: the plugins' code is not loaded to say what they
+ * are. False when it could not answer, with no snapshot among the reasons, and the plugins are asked instead.
+ */
+async function listFromSnapshot(
+  ctx: CliCommandContext,
+  parsed: ReturnType<typeof parsePaneCatalogArgs>,
+  effectiveParsed: ReturnType<typeof parsePaneCatalogArgs>,
+): Promise<boolean> {
+  const snapshot = readCatalogSnapshot();
+  if (!snapshot || process.env[CATALOG_APP_PANES_ENV] === "1" || await installedPluginCount(ctx) > 0) return false;
+  return withConfigData(ctx, async (context) => {
+    if ((context.config.disabledPlugins ?? []).length > 0) return false;
+    printCatalog(ctx, parsed, effectiveParsed, snapshotEntries(snapshot, await exampleListName(context)), findSeriesFacts(snapshot.series, parsed.query));
+    return true;
+  });
+}
+
+/** The report of the functions and series a `catalog` query finds. */
+function printCatalog(
+  ctx: CliCommandContext,
+  parsed: ReturnType<typeof parsePaneCatalogArgs>,
+  effectiveParsed: ReturnType<typeof parsePaneCatalogArgs>,
+  entries: PaneCatalogEntry[],
+  series: SeriesMatch[],
+): void {
+  const botSafeEntries = effectiveParsed.botSafeOnly
+    ? entries.filter((entry) => entry.capability.botSafe)
+    : entries;
+  // A topic no function covers is answered by its pointer, not by the loose matches its words find; so is a
+  // command of the app's own that no function is (FB, Send Feedback).
+  const pointer = topicPointer(parsed.query);
+  const appCommand = pointer || commandPointer(parsed.query) ? null : appCommandPointer(parsed.query);
+  const typed = pointer || appCommand ? [] : filterPaneCatalogEntries(botSafeEntries, parsed.query);
+  // Data no source carries yet is said once: in the text, else as the envelope's warning.
+  const gap = knownGapMessage(parsed.query);
+  // A word one letter off every function's ("fundng") is read as the one it is near, and the report says so; a
+  // word the catalog has its own answer for ("libor") is not a typo.
+  const corrected = pointer || gap || appCommand || typed.length ? null : correctCatalogQuery(botSafeEntries, parsed.query);
+  const correctedMatches = corrected ? filterPaneCatalogEntries(botSafeEntries, corrected) : [];
+  const readAs = corrected && correctedMatches.length ? corrected : null;
+  const filtered = readAs ? correctedMatches : typed;
+  const query = readAs ?? parsed.query;
+  // A search also finds the terms it names; text only, the JSON stays a list of functions.
+  const glossary = lookupGlossary(parsed.query);
+  // A setting or a report can be a command, not a function: "light theme" names `config themes` beside THEM,
+  // "drip" names `portfolio show --drip` beside DVD.
+  const setting = commandPointer(parsed.query) ?? appCommand;
+  const settingLeads = commandPointerLeads(parsed.query) || !!appCommand;
+  const listed = pointer
+    ? pointer.codes.flatMap((code) => entries.filter((entry) => entry.token === code))
+    : selectPaneCatalogMatches(filtered, query, effectiveParsed.limit).shown;
+  const readNote = readAs ? `No functions match "${parsed.query}"; showing "${readAs}".` : null;
+  ctx.printResult({
+    data: listed,
+    ...series.length || readAs ? { metadata: { ...series.length ? { series } : {}, ...readAs ? { query: readAs } : {} } } : {},
+    ...(gap || setting) && ctx.cliOptions.format !== "text" ? { warnings: [gap, setting].filter((note): note is string => !!note) } : {},
+  }, {
+    text: () => [readNote ? cliStyles.muted(readNote) : "", renderPaneCatalogReport(filtered, { ...effectiveParsed, query }, glossary, gap, series, setting, settingLeads)]
+      .filter(Boolean).join("\n\n"),
+  });
+}
+
 async function runPaneCliCommand(ctx: CliCommandContext, run: () => Promise<void>) {
+  // Whether the data service answered is this command's to say, never a request made before it.
+  forgetDataServiceReach();
   try {
     await run();
   } catch (error) {
-    // A failure with fields for --json (`ticker_moved`, its change and retry) keeps its code and them.
-    if (isCliFailure(error) && error.fields) throw error;
+    // A failure with fields for --json (`ticker_moved`, its change and retry), or a code of its own (`no_data`,
+    // `service_unreachable` and whether to retry), keeps them.
+    if (isCliFailure(error) && (error.fields || error.code !== CLI_ERROR_CODE)) throw error;
+    // A source the data service reads was unavailable: retryable `source_unavailable`, in its own words.
+    if (isSourceUnavailableAnswer(error)) throw error;
     // A listing it cannot use says what to type instead; a name that opens nothing, what is close to it.
     if (error instanceof ListingArgError || error instanceof UnknownPaneFunctionError) ctx.fail(error.message, error.details || undefined);
+    // Whatever a pane made of a request that never reached the data service ("News sources unavailable.", "No ticker
+    // match found", a bare ECONNREFUSED), nothing answered since: said as every command says it, with what to check.
+    if (dataServiceUnreachable()) failUnreachable();
     const message = error instanceof Error ? error.message : String(error);
+    // Nothing answered: said as every command says it, with what to check.
+    if (message.includes(DATA_SERVICE_UNREACHABLE_MESSAGE)) failUnreachable(message);
+    if (isNetworkFailure(error)) failUnreachable();
     // A failure the command already worded keeps its advice line.
     const stated = error instanceof Error ? (error as Error & { details?: unknown }).details : undefined;
     const details = typeof stated === "string" ? stated : undefined;

@@ -35,7 +35,7 @@ export function buildRootShortcutFeedback({
   if (rootShortcutIntent.source === "pane-template") {
     const argKind = getPaneTemplateArgKind(rootShortcutIntent.template);
     if (argKind === "ticker") {
-      if (rootShortcutIntent.template.shortcut?.argOptional && !rootShortcutIntent.argText) {
+      if (rootShortcutIntent.template.shortcut?.argOptional && !rootShortcutIntent.argText && !rootShortcutIntent.inferredArg) {
         return `Shortcut: ${rootShortcutIntent.label}`;
       }
       // Same ticker the intent inferred: the prompt's, so a linked desk counts.
@@ -58,7 +58,10 @@ export function buildRootShortcutFeedback({
       if (inferred) {
         return `Shortcut: ${rootShortcutIntent.label} for ${inferred} · Tab to accept`;
       }
-      return `Shortcut: ${rootShortcutIntent.label} · Enter tickers`;
+      // INS alone opens its own view (the market's insider buying), not a prompt for tickers.
+      return rootShortcutIntent.template.shortcut?.openWithoutArg
+        ? `Shortcut: ${rootShortcutIntent.label}`
+        : `Shortcut: ${rootShortcutIntent.label} · Enter tickers`;
     }
     return `Shortcut: ${rootShortcutIntent.label}`;
   }

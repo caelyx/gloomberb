@@ -1,11 +1,11 @@
 import type { ReactNode } from "react";
-import { ColumnGrid, ColumnGridPair, RangeTrack, usePaneLinkMenuEntry, type ColumnGridCell, type ColumnGridColumn } from "../../../../components";
+import { ActionRow, ColumnGrid, ColumnGridPair, RangeTrack, usePaneLinkMenuEntry, type ColumnGridCell, type ColumnGridColumn } from "../../../../components";
 import { t, tf } from "../../../../i18n";
-import { formatMarketPriceWithCurrency, liveQuoteFormatOptions, type MarketFormatOptions } from "../../../../market-data/market/format";
+import { formatMarketPrice, formatMarketPriceRange, formatMarketPriceWithCurrency, liveQuoteFormatOptions, type MarketFormatOptions } from "../../../../market-data/market/format";
 import { colors, hoverBg, priceColor } from "../../../../theme/colors";
 import type { Quote } from "../../../../types/financials";
 import { Box, Text, useUiCapabilities } from "../../../../ui";
-import { displayWidth, formatNumber, truncateToDisplayWidth } from "../../../../utils/format";
+import { MISSING_VALUE, displayWidth, formatNumber, truncateToDisplayWidth } from "../../../../utils/format";
 import type { OverviewFunctionLink, PositionTableRow, StatField } from "./types";
 import { portfolioPnlLabel } from "../../../../portfolio/position-metrics";
 
@@ -35,14 +35,60 @@ export function rangeRowChrome(labelWidth: number, endpointWidth: number): numbe
   return labelWidth + 1 + endpointWidth * 2 + 2;
 }
 
-/** The longest endpoint among ranges drawn together, so stacked tracks start and end in one column. */
-export function rangeEndpointWidth(
-  values: readonly number[],
+/**
+ * How a range row writes its ends: as the quote prints a price ($5,072.00),
+ * or, on a row too narrow for those beside a track even under its short
+ * label, the bare number: a 27-cell CC=F pane cut its highs, "Day $5,072.00
+ * ● $5,28". From 100 up a compact end drops the decimals the low and the
+ * high do not need to read apart (5,072 and 5,287, but 150.1 and 150.4, never
+ * 150 twice); below 100 it keeps them, or 18.13 and 18.60 would read 18 and 19.
+ */
+type RangeEndpointStyle = "price" | "compact";
+
+const fractionDigits = (text: string) => /\.(\d+)\D*$/.exec(text)?.[1]!.length ?? 0;
+
+/** The options a compact range writes its two ends with: the fewest decimals that still tell them apart. */
+function compactRangeOptions(low: number, high: number, priceOptions: MarketFormatOptions): MarketFormatOptions {
+  if (Math.max(Math.abs(low), Math.abs(high)) < 100) return priceOptions;
+  // The decimals the price has, read without the cell cap, which drops them to fit.
+  const unbounded = { ...priceOptions, maxWidth: undefined };
+  const full = Math.max(fractionDigits(formatMarketPrice(low, unbounded)), fractionDigits(formatMarketPrice(high, unbounded)));
+  for (let digits = 0; digits < full; digits += 1) {
+    const options = { ...priceOptions, fixedFractionDigits: digits, minimumFractionDigits: digits, referencePrice: undefined };
+    if (formatMarketPrice(low, options) !== formatMarketPrice(high, options)) return options;
+  }
+  return priceOptions;
+}
+
+/** A range's two ends, in `style`, both to one number of decimals. */
+function formatRangeEndpoints(
+  low: number,
+  high: number,
   currency: string,
   priceOptions: MarketFormatOptions,
+  style: RangeEndpointStyle = "price",
+): [string, string] {
+  if (style === "price") return formatMarketPriceRange(low, high, priceOptions, currency);
+  return formatMarketPriceRange(low, high, compactRangeOptions(low, high, priceOptions));
+}
+
+/** The longest endpoint among ranges drawn together, so stacked tracks start and end in one column. */
+export function rangeEndpointWidth(
+  ranges: ReadonlyArray<readonly [low: number, high: number]>,
+  currency: string,
+  priceOptions: MarketFormatOptions,
+  style: RangeEndpointStyle = "price",
 ): number {
-  const widths = values.map((value) => displayWidth(formatMarketPriceWithCurrency(value, currency, priceOptions)));
+  const widths = ranges.flatMap(([low, high]) => formatRangeEndpoints(low, high, currency, priceOptions, style).map(displayWidth));
   return Math.min(RANGE_ENDPOINT_WIDTH, Math.max(1, ...widths));
+}
+
+/**
+ * The ends rows of `width` write: the prices while they leave a track of
+ * RANGE_MIN_TRACK_WIDTH under the short label, else the compact numbers.
+ */
+export function rangeEndpointStyle(width: number, shortLabelWidth: number, priceEndpointWidth: number): RangeEndpointStyle {
+  return width - rangeRowChrome(shortLabelWidth, priceEndpointWidth) < RANGE_MIN_TRACK_WIDTH ? "compact" : "price";
 }
 
 /**
@@ -62,6 +108,8 @@ export function CompactRangeBar({
   grow = false,
   currency,
   priceOptions,
+  endpoints = "price",
+  note,
 }: {
   current: number;
   low: number;
@@ -80,6 +128,13 @@ export function CompactRangeBar({
   currency: string;
   /** The quote's live price options, so the endpoints keep the price's decimals. */
   priceOptions: MarketFormatOptions;
+  /** Shared by ranges drawn together, as `endpointWidth` is (rangeEndpointStyle). */
+  endpoints?: RangeEndpointStyle;
+  /**
+   * Muted context after the high, where the range is not the source's own
+   * (`daily bars`): shown only while the track keeps RANGE_MIN_TRACK_WIDTH.
+   */
+  note?: string;
 }) {
   const { nativePaneChrome } = useUiCapabilities();
   const range = high - low;
@@ -89,9 +144,10 @@ export function CompactRangeBar({
   const shownLabel = useShortLabel ? shortLabel : label;
   const shownLabelWidth = useShortLabel ? displayWidth(shortLabel) : labelWidth;
   const endpointOptions = { ...priceOptions, maxWidth: endpointWidth };
-  const lowText = formatMarketPriceWithCurrency(low, currency, endpointOptions);
-  const highText = formatMarketPriceWithCurrency(high, currency, endpointOptions);
-  const barWidth = Math.max(1, width - rangeRowChrome(shownLabelWidth, endpointWidth));
+  const [lowText, highText] = formatRangeEndpoints(low, high, currency, endpointOptions, endpoints);
+  const noteCells = note ? displayWidth(note) + 1 : 0;
+  const shownNote = note && width - rangeRowChrome(shownLabelWidth, endpointWidth) - noteCells >= RANGE_MIN_TRACK_WIDTH ? note : null;
+  const barWidth = Math.max(1, width - rangeRowChrome(shownLabelWidth, endpointWidth) - (shownNote ? noteCells : 0));
 
   // The desktop and the web size the row and its track by CSS, so the high end keeps to the pane's edge on every frame of a
   // resize; the label, the endpoints and which of them show are still worked out from `width`, at each catch-up.
@@ -127,6 +183,11 @@ export function CompactRangeBar({
       <Box width={endpointWidth} flexShrink={0} overflow="hidden">
         <Text fg={colors.text}>{highText}</Text>
       </Box>
+      {shownNote && (
+        <Box width={noteCells} flexShrink={0} overflow="hidden" data-gloom-role="range-note">
+          <Text fg={colors.textDim}>{` ${shownNote}`}</Text>
+        </Box>
+      )}
     </Box>
   );
 }
@@ -151,12 +212,13 @@ export function QuoteBook({ quote, assetCategory, width, desktopWidth }: {
   const { nativePaneChrome } = useUiCapabilities();
   // Bid, ask and spread keep the instrument's decimals on every tick ($224.58 / $224.60 / $0.02).
   const priceOptions = liveQuoteFormatOptions(quote, quote.currency, assetCategory);
-  const bidPrice = quote.bid != null ? formatMarketPriceWithCurrency(quote.bid, quote.currency, priceOptions) : "—";
-  const askPrice = quote.ask != null ? formatMarketPriceWithCurrency(quote.ask, quote.currency, priceOptions) : "—";
+  const bidPrice = quote.bid != null ? formatMarketPriceWithCurrency(quote.bid, quote.currency, priceOptions) : MISSING_VALUE;
+  const askPrice = quote.ask != null ? formatMarketPriceWithCurrency(quote.ask, quote.currency, priceOptions) : MISSING_VALUE;
   const bidText = quote.bidSize != null && quote.bidSize > 0 ? `${formatNumber(quote.bidSize, 0)} x ${bidPrice}` : bidPrice;
   const askText = quote.askSize != null && quote.askSize > 0 ? `${formatNumber(quote.askSize, 0)} x ${askPrice}` : askPrice;
-  let spreadText = "—";
-  if (quote.bid != null && quote.ask != null) {
+  let spreadText = MISSING_VALUE;
+  // A crossed book (a closing auction's last bid above its ask, Tencent's HK$430.80 / HK$430.40) has no spread to show.
+  if (quote.bid != null && quote.ask != null && quote.ask >= quote.bid) {
     const spread = quote.ask - quote.bid;
     const mid = (quote.ask + quote.bid) / 2;
     const spreadPercent = mid > 0 ? ` (${((spread / mid) * 100).toFixed(2)}%)` : "";
@@ -242,6 +304,18 @@ function LinkedStatCell({
       {children}
     </Box>
   );
+}
+
+/**
+ * The way from a section into the function that has all of it ("Open
+ * Financials" under Fundamentals), as Trending's row opens Research Attention.
+ * Inside a `PaneLinkMenu` the pane menu lists it once with the section's
+ * figures that open the same function.
+ */
+export function FunctionLinkRow({ link, onOpen }: { link: OverviewFunctionLink; onOpen: (link: OverviewFunctionLink) => void }) {
+  const label = tf("Open {label}", { label: t(link.name) });
+  usePaneLinkMenuEntry(`function:${link.templateId}`, label, () => onOpen(link));
+  return <ActionRow label={label} onPress={() => onOpen(link)} />;
 }
 
 export function FundamentalsGrid({

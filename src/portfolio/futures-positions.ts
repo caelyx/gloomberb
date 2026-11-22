@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../utils/format";
 import type { FuturesContractSpec, FuturesContractTermsPayload } from "../api-client/futures-curve";
 import type { ActiveQuoteDisplay } from "../market-data/market/status";
 import type { PricePoint } from "../types/financials";
@@ -36,10 +37,15 @@ export interface FuturesSettlement {
   previous: number | null;
 }
 
-/** What a portfolio reads from a future's terms: its contract size and its settlement. */
+/** A future's contract size, settlement and front reference for collection rows. */
 export interface PortfolioFuturesTerms {
   size: FuturesContractSize | null;
   settlement: FuturesSettlement | null;
+  /** A different contract that is currently front, when the terms name one. */
+  front?: Pick<NonNullable<FuturesContractTermsPayload["front"]>, "contract" | "contractSymbol">;
+  /** The tick and the month the settlement is of, which a move is checked against (futuresQuoteFromSettle), as FUT and `quote` check it. */
+  spec?: { tick: number } | null;
+  deliveryMonth?: string | null;
 }
 
 /** A grain or a soft quotes in US cents, so a dollar point value is a hundred of its price units. */
@@ -69,7 +75,7 @@ export function futuresContractSize(spec: Pick<FuturesContractSpec, "unit" | "si
 
 /** A count of contracts and what each one is: "1,000 × 100 oz", or the count alone when the size is unknown. */
 export function futuresQuantityText(quantity: string, size: Pick<FuturesContractSize, "size"> | null | undefined): string {
-  return size?.size && quantity !== "—" ? `${quantity} × ${size.size}` : quantity;
+  return size?.size && quantity !== MISSING_VALUE ? `${quantity} × ${size.size}` : quantity;
 }
 
 function hasMultiplier(position: Pick<TickerPosition, "multiplier">): boolean {
@@ -167,7 +173,7 @@ export function previousFuturesSettlement(
 
 /** What a portfolio reads from a future's terms, with the settlement before the latest when the history has it. */
 export function portfolioFuturesTerms(
-  terms: Pick<FuturesContractTermsPayload, "spec" | "settlement"> | null | undefined,
+  terms: (Pick<FuturesContractTermsPayload, "spec" | "settlement"> & Partial<Pick<FuturesContractTermsPayload, "front" | "contract" | "deliveryMonth">>) | null | undefined,
   history?: readonly PricePoint[] | null,
 ): PortfolioFuturesTerms {
   const settlement = terms?.settlement && Number.isFinite(terms.settlement.price) && terms.settlement.price > 0
@@ -177,7 +183,13 @@ export function portfolioFuturesTerms(
       previous: previousFuturesSettlement(history, terms.settlement.date, terms.settlement.price),
     }
     : null;
-  return { size: futuresContractSize(terms?.spec), settlement };
+  const front = terms?.front && terms.front.contract !== terms.contract ? terms.front : undefined;
+  const tick = terms?.spec?.tick;
+  return {
+    size: futuresContractSize(terms?.spec), settlement, ...(front ? { front } : {}),
+    ...(tick != null && Number.isFinite(tick) && tick > 0 ? { spec: { tick } } : {}),
+    ...(terms?.deliveryMonth ? { deliveryMonth: terms.deliveryMonth } : {}),
+  };
 }
 
 /**

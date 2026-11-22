@@ -1,5 +1,5 @@
 import { basename, join, resolve } from "path";
-import { existsSync, lstatSync, readFileSync, rmSync } from "fs";
+import { existsSync, lstatSync, readFileSync } from "fs";
 import {
   DEPRECATED_HOST_EXPORTS,
   REMOVED_HOST_EXPORTS,
@@ -21,15 +21,17 @@ import {
 import { linkHostPackages } from "../../plugins/host-link";
 import {
   installedPluginDirectories,
+  installedPluginDirectoriesById,
+  installedPluginId,
   loadRegistryListings,
   readPluginRemote,
   readPluginRemoteHeads,
   updatePlugin,
-  validatePluginDirectoryName,
   type RegistryListing,
 } from "../../plugins/installer";
 import { isReservedBuiltinPluginId } from "../../plugins/ownership";
 import { pluginFromModule, pluginSupportsTarget } from "../../plugins/plugin-export";
+import { removeFolder } from "../../utils/remove-folder";
 import { formatVersion, requiredGloomberb } from "../../utils/semver";
 import { ALL_PLUGIN_TARGETS, type GloomPlugin, type PluginTarget } from "../../types/plugin";
 import {
@@ -58,8 +60,20 @@ function absorbedNotice(absorbed: AbsorbedPlugin, directory: string | null): str
   return directory ? `${built}; remove this copy with "gloom remove ${directory}".` : `${built}.`;
 }
 
+/**
+ * The folder of the installed plugin a command names, by its id or by its
+ * folder, a linked plugin's included; fails when none, or more than one,
+ * answers to it.
+ */
+export async function installedPluginArg(name: string): Promise<string> {
+  const matches = await installedPluginDirectoriesById(name);
+  if (matches.length > 1) fail(`"${name}" is the id of ${matches.length} installed plugins: ${matches.join(", ")}.`, "Name one by its folder.");
+  if (matches.length === 0) fail(`Plugin "${name}" was not found.`, PLUGINS_DIR);
+  return matches[0]!;
+}
+
 export async function updatePlugins(name?: string) {
-  const dirs = name ? [validatePluginDirectoryName(name)] : installedPluginDirectories();
+  const dirs = name ? [await installedPluginArg(name)] : installedPluginDirectories();
 
   if (dirs.length === 0) {
     console.log(cliStyles.muted("No plugins installed."));
@@ -126,6 +140,52 @@ function hostCovered(host: string, declared: readonly string[]): boolean {
   return declared.some((entry) => host === entry || host.endsWith(`.${entry}`));
 }
 
+/**
+ * The `hosts` rows of `plugin doctor`. A plugin declares its hosts twice: in
+ * its export, which is what the web reads (the worker proxies exactly the
+ * exported `hosts` of the plugins in its build, see
+ * scripts/generate-web-proxy-hosts.ts), and in gloom.json, which is what the
+ * plugin directory shows. Terminal and desktop reach any host, so a host
+ * missing from the export works there and fails only on the web.
+ *
+ * Hosts are found by a regex over the source, so a page the plugin only opens
+ * as a link is found too; gloom.json `linkHosts` names those.
+ */
+export function pluginHostChecks(
+  sources: readonly string[],
+  exported: readonly string[],
+  manifest: { hosts: readonly string[] | null; linkHosts: readonly string[] },
+): Array<{ status: PluginCheckStatus; message: string }> {
+  const declared = exported.map((host) => host.toLowerCase());
+  const listed = manifest.hosts ?? [];
+  const seen = new Set<string>();
+  for (const text of sources) {
+    for (const match of text.matchAll(HOST_LITERAL_PATTERN)) {
+      const host = match[1]!.toLowerCase();
+      if (!IGNORED_HOST_PATTERN.test(host)) seen.add(host);
+    }
+  }
+  const known = [...declared, ...listed, ...manifest.linkHosts];
+  const undeclared = [...seen].filter((host) => !hostCovered(host, known)).sort();
+  const notExported = listed.filter((host) => !hostCovered(host, declared));
+  const notListed = manifest.hosts ? declared.filter((host) => !hostCovered(host, listed)) : [];
+
+  const checks: Array<{ status: PluginCheckStatus; message: string }> = [];
+  if (undeclared.length > 0) {
+    checks.push({ status: "warn", message: `In source but not declared: ${undeclared.join(", ")}. A host it fetches goes in hosts, in the plugin and in gloom.json; a page it only opens goes in linkHosts in gloom.json.` });
+  }
+  if (notExported.length > 0) {
+    checks.push({ status: "warn", message: `In gloom.json but not in the plugin's hosts: ${notExported.join(", ")}. The web proxies only the hosts the plugin exports.` });
+  }
+  if (notListed.length > 0) {
+    checks.push({ status: "warn", message: `In the plugin's hosts but not in gloom.json: ${notListed.join(", ")}. The plugin directory shows gloom.json's.` });
+  }
+  if (checks.length === 0) {
+    checks.push({ status: "ok", message: declared.length ? declared.join(", ") : "no third-party hosts found" });
+  }
+  return checks;
+}
+
 /** Host imports the compat tables list, as `name from gloomberb/x (...)` lines. */
 function listedHostImports<T>(
   sources: readonly string[],
@@ -151,7 +211,7 @@ function listedHostImports<T>(
  * build the desktop and web app need actually compiles.
  */
 async function doctorPlugin(nameOrPath: string): Promise<PluginDoctorReport> {
-  const candidate = nameOrPath.includes("/") || nameOrPath.startsWith(".") ? resolve(nameOrPath) : join(PLUGINS_DIR, nameOrPath);
+  const candidate = nameOrPath.includes("/") || nameOrPath.startsWith(".") ? resolve(nameOrPath) : join(PLUGINS_DIR, await installedPluginArg(nameOrPath));
   if (!existsSync(candidate)) fail(`Plugin "${nameOrPath}" was not found.`, PLUGINS_DIR);
   const directory = basename(candidate);
   const linked = lstatSync(candidate).isSymbolicLink();
@@ -193,7 +253,8 @@ async function doctorPlugin(nameOrPath: string): Promise<PluginDoctorReport> {
   else add("host-link", "ok", `linked ${link.linked.join(", ")}`);
 
   const incompatible = checkPluginCompatibility(candidate);
-  const declaredMin = readPluginManifest(candidate).minGloomberb;
+  const manifest = readPluginManifest(candidate);
+  const declaredMin = manifest.minGloomberb;
   // The loader skips this check for a linked checkout, so it only warns there.
   if (incompatible) add("gloom", linked ? "warn" : "fail", incompatible.error);
   else if (declaredMin) add("gloom", "ok", `${formatVersion(declaredMin)} or newer`);
@@ -225,6 +286,8 @@ async function doctorPlugin(nameOrPath: string): Promise<PluginDoctorReport> {
 
   if (!plugin.version) add("version", "warn", "No version; the marketplace cannot tell when an update is available.");
   if (isReservedBuiltinPluginId(plugin.id)) add("id", "fail", `"${plugin.id}" is reserved by a built-in module.`);
+  // gloom plugins and the plugin directory read gloom.json's; plugin enable takes the export's.
+  else if (manifest.id && manifest.id !== plugin.id) add("id", "warn", `gloom.json says "${manifest.id}" and the plugin exports "${plugin.id}": make them the same.`);
   else add("id", "ok", plugin.id);
 
   const badTargets = (plugin.targets ?? []).filter((target) => !ALL_PLUGIN_TARGETS.includes(target as PluginTarget));
@@ -237,23 +300,7 @@ async function doctorPlugin(nameOrPath: string): Promise<PluginDoctorReport> {
     else add("config-schema", "ok", `${plugin.configSchema.length} setting${plugin.configSchema.length === 1 ? "" : "s"}`);
   }
 
-  const declaredHosts = plugin.hosts ?? [];
-  const seenHosts = new Set<string>();
-  for (const text of sources) {
-    for (const match of text.matchAll(HOST_LITERAL_PATTERN)) {
-      const host = match[1]!.toLowerCase();
-      if (IGNORED_HOST_PATTERN.test(host)) continue;
-      seenHosts.add(host);
-    }
-  }
-  const undeclared = [...seenHosts].filter((host) => !hostCovered(host, declaredHosts)).sort();
-  if (undeclared.length > 0) {
-    // A regex over source: a link the plugin only opens in the browser shows
-    // up too, so this is a prompt to check, not a verdict.
-    add("hosts", "warn", `In source but not in hosts: ${undeclared.join(", ")}. Anything fetched from there works on desktop and fails on the web.`);
-  } else {
-    add("hosts", "ok", declaredHosts.length ? declaredHosts.join(", ") : "no third-party hosts found");
-  }
+  for (const check of pluginHostChecks(sources, plugin.hosts ?? [], manifest)) add("hosts", check.status, check.message);
 
   const rendersInBrowser = pluginSupportsTarget(plugin, "desktop") || pluginSupportsTarget(plugin, "web");
   if (rendersInBrowser) {
@@ -265,7 +312,7 @@ async function doctorPlugin(nameOrPath: string): Promise<PluginDoctorReport> {
       const result = await bundleExternalPlugin(candidate, outDir, { define: { "process.env.NODE_ENV": "\"production\"" } });
       const size = Math.round(Bun.file(result.outputPath).size / 1024);
       add("browser-build", "ok", `${basename(browserEntry ?? entryFile)} compiles for the desktop view (${size}KB)`);
-      rmSync(outDir, { recursive: true, force: true });
+      await removeFolder(outDir);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       add("browser-build", "fail", `Desktop build failed: ${message.split("\n")[0]}. Ship an index.browser.ts without node:* imports, or set targets to ["cli", "tui"].`);
@@ -285,6 +332,9 @@ export async function doctorPlugins(nameOrPath?: string): Promise<PluginDoctorRe
 }
 
 export interface InstalledPluginRow {
+  /** What `plugin info|enable|disable` take; every other plugin command takes it too. */
+  id: string;
+  /** The folder under the plugins directory, which every plugin command also takes. */
   name: string;
   version: string;
   commit: string;
@@ -330,6 +380,7 @@ async function readInstalledPlugins(options: { check?: boolean }): Promise<Insta
     const commit = readPluginCommit(dir);
     const blocked = builtIn ? absorbedNotice(builtIn, name) : linked ? null : checkPluginCompatibility(dir)?.error;
     const row: InstalledPluginRow = {
+      id: installedPluginId(name),
       name,
       version,
       commit: linked ? "linked" : commit ? commit.slice(0, 7) : "",
@@ -352,8 +403,11 @@ async function readInstalledPlugins(options: { check?: boolean }): Promise<Insta
 
 export async function listPlugins(ctx: CliCommandContext, options: { check?: boolean } = {}) {
   const plugins = await readInstalledPlugins(options);
+  // The folder `gloom install` names for the repository, where it is not the id.
+  const folders = plugins.some((plugin) => plugin.name !== plugin.id);
   const columns = [
-    { key: "name", header: "Plugin", shrink: false },
+    { key: "id", header: "Plugin", shrink: false },
+    ...(folders ? [{ key: "folder", header: "Folder", value: (row: Record<string, unknown>) => row.name }] : []),
     { key: "version", header: "Version" },
     { key: "commit", header: "Commit" },
     ...(options.check ? [{ key: "update", header: "Update" }] : []),
@@ -369,11 +423,12 @@ export async function listPlugins(ctx: CliCommandContext, options: { check?: boo
         renderTable(
           columns.map(({ header, shrink }) => ({ header, shrink })),
           rows.map((row) => columns.map(({ key }) => {
+            if (key === "folder") return row.name === row.id ? "" : cliStyles.muted(row.name);
             const value = String(row[key as keyof InstalledPluginRow] ?? "");
             return key === "update" && value && value !== "up to date" ? cliStyles.warning(value) : value;
           })),
         ),
-        ...rows.filter((row) => row.blocked).map((row) => cliStyles.warning(`${row.name} is not loaded: ${row.blocked}`)),
+        ...rows.filter((row) => row.blocked).map((row) => cliStyles.warning(`${row.id} is not loaded: ${row.blocked}`)),
         "",
         renderStats([["Directory", cliStyles.muted(PLUGINS_DIR)]]),
       ].join("\n");

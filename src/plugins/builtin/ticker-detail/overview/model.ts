@@ -1,14 +1,18 @@
-import { formatPriceEarnings, NOT_MEANINGFUL } from "../../../../utils/price-earnings";
+import { forwardFiscalYear, forwardPEAsked, formatPriceEarnings, NOT_MEANINGFUL } from "../../../../utils/price-earnings";
 import { convertMarketCapitalization } from "../../../../utils/market-capitalization";
 import { priceColor } from "../../../../theme/colors";
-import type { CompanyProfile, DepositaryPair, NextEarnings, Quote, TickerFinancials } from "../../../../types/financials";
+import { notMeaningfulColor } from "../../../../components/ui/not-meaningful";
+import { NOT_MEANINGFUL_TEXT } from "../../../../utils/growth";
+import type { ServedRate } from "../../../../utils/served-rates";
+import type { CedearRatio, CompanyProfile, DepositaryPair, NextEarnings, Quote, TickerFinancials } from "../../../../types/financials";
 import { adrRatioText } from "../../../../utils/depositary-receipt";
-import { ratioCount } from "../../../../market-data/depositary-pair";
+import { cedearRatioText, premiumText, ratioCount } from "../../../../market-data/depositary-pair";
 import { ADR_PAIR_TAB_ID, ADR_PAIR_TEMPLATE_ID } from "../adr-pair/model";
 import type { Portfolio, TickerPosition, TickerRecord } from "../../../../types/ticker";
 import type { BrokerInstanceConfig } from "../../../../types/config";
 import type { BrokerAccount } from "../../../../types/trading";
 import {
+  MISSING_VALUE,
   formatCompact,
   formatCompactCurrency,
   formatCurrency,
@@ -23,19 +27,21 @@ import {
   formatMarketQuantity,
   withCurrencyMinorDigits,
 } from "../../../../market-data/market/format";
-import { reportedQuoteVolume } from "../../../../market-data/market/index-level";
+import { quoteVolumeCurrency, reportedQuoteVolume } from "../../../../market-data/market/index-level";
+import { formatChartLegendValue } from "../../../../components/chart/composite/format";
 import type { OverviewFunctionLink, PositionTableRow, StatField } from "./types";
 import type { OverviewDividendState } from "./dividend";
-import { NO_CURRENT_DIVIDEND } from "../../../../utils/forward-dividend";
+import { lapseValue } from "../../../../utils/forward-dividend";
 import { getPortfolioPositionMetrics, getPortfolioQuoteDisplay, resolvePortfolioMarketValue, resolvePortfolioPositionPnl, portfolioPnlPercent, signedPositionDirection } from "../../../../portfolio/position-metrics";
 import { listingDividendYield, liveForwardPE, liveMarketCapitalization, liveTrailingPE } from "../../../../market-data/quotes/live-valuation";
 import { atRegularSessionPrice } from "../../../../market-data/quotes/regular-session-valuation";
-import { formatReportedMoney } from "../../../../utils/reported-money";
-import { enterpriseValueCheck, enterpriseValueNotMeaningful, fundamentalsCurrency, fundamentalsEpsCurrency, reportedEnterpriseValue } from "../../../../utils/fundamentals";
+import { formatReportedMoney, REPORTING_CURRENCY_NOT_SOURCED } from "../../../../utils/reported-money";
+import { enterpriseValueCheck, enterpriseValueComputed, enterpriseValueNotMeaningful, fundamentalsCurrency, financialEnterpriseValue, fundamentalsEpsCurrency, reportedEnterpriseValue } from "../../../../utils/fundamentals";
 import { formatShortDate } from "../../../../utils/datetime-format";
 import { safeExternalUrl } from "../../../../utils/external-url";
 import type { FundBondFacts } from "../../../../api-client/fund-facts";
 import { bondFigures } from "../../../../market-data/bond-funds";
+import { quoteStatsBasisText } from "../../../../market-data/quotes/export-identity";
 import { formatRunwayMonths, type CashRunway, type RunwayEstimate } from "../../../../utils/cash-runway";
 
 type CurrencyConverter = (value: number, fromCurrency: string) => number;
@@ -46,7 +52,8 @@ const SHORT_INTEREST: OverviewFunctionLink = { name: "Short Interest", tabId: "s
 const EARNINGS: OverviewFunctionLink = { name: "Earnings", templateId: "earnings-calendar-pane" };
 const DIVIDENDS: OverviewFunctionLink = { name: "Dividends", tabId: "dividend-yield", templateId: "dividend-yield-pane" };
 const FUND_FACTS: OverviewFunctionLink = { name: "Fund Facts", templateId: "sec-etf-pane" };
-const FINANCIALS: OverviewFunctionLink = { name: "Financials", tabId: "financials", templateId: "financial-analysis-pane" };
+/** The company's statements: Financials' first view in this pane, otherwise FA. */
+export const FINANCIALS: OverviewFunctionLink = { name: "Financials", tabId: "financials", templateId: "financial-analysis-pane" };
 const ADR_PAIR: OverviewFunctionLink = { name: "ADR vs Home", tabId: ADR_PAIR_TAB_ID, templateId: ADR_PAIR_TEMPLATE_ID };
 
 /** A bond fund's sponsor figures in a narrow grid: `SEC Yield 4.04% 2026-10-15`. */
@@ -62,7 +69,7 @@ function daysUntil(date: string, today: string): number {
   return Math.round((Date.parse(`${date}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
 }
 
-/** "Sep 10", or "Dec 12, 25" in another year. */
+/** "10 Sep", or "12 Dec '25" in another year. */
 function calendarDate(date: string, today: string): string {
   return formatShortDate(`${date}T00:00:00Z`, { year: date.slice(0, 4) === today.slice(0, 4) ? false : "2-digit", utc: true });
 }
@@ -151,10 +158,15 @@ export function buildOverviewStats({
   nextEarnings,
   depositaryReceipt = false,
   depositaryPair = null,
+  ahPair = null,
+  cedearRatio = null,
+  boardLot = null,
   today,
   dividend,
   bond = null,
   runway = null,
+  trailingEpsYear,
+  notMeaningful = {},
 }: {
   quote: Quote | undefined;
   fundamentals: TickerFinancials["fundamentals"] | undefined;
@@ -169,6 +181,15 @@ export function buildOverviewStats({
   depositaryReceipt?: boolean;
   /** The receipt pair the listing is a side of, as Gloom Cloud serves it; `receiptSide` when the listing is the receipt. */
   depositaryPair?: { pair: DepositaryPair; receiptSide: boolean } | null;
+  /**
+   * An A+H company's other line (`useAhPair`): the A share on the H line's DES, the H share on the A line's, with
+   * the H price over the A price at spot. `linked` when this DES has the ADR vs Home tab that shows them.
+   */
+  ahPair?: { other: string; side: "h" | "a"; premiumPercent: number | null; linked: boolean } | null;
+  /** A Buenos Aires CEDEAR's ratio in its company's shares, as Gloom Cloud serves it. */
+  cedearRatio?: CedearRatio | null;
+  /** The shares one lot of the listing trades in, as its exchange states it (an HKEX or SGX line). */
+  boardLot?: number | null;
   /** The listing's calendar day, YYYY-MM-DD; dates before it are left out. */
   today?: string;
   /** The history the dividend yield reads (useOverviewDividend): a trailing one is measured from its cash, a forward one stops with it; without it the yield stands. */
@@ -180,27 +201,47 @@ export function buildOverviewStats({
   bond?: FundBondFacts | null;
   /** Months of cash at the latest balance sheet (utils/cash-runway); shown when the company burns cash. */
   runway?: CashRunway | null;
+  /** The fiscal year the trailing EPS is ("FY Mar-26"), when it is a year's a quarter or more old (trailingEpsFiscalYear). */
+  trailingEpsYear?: string;
+  /** Why a served margin or revenue growth is N/M (servedRatesNotMeaningful): read N/M, as RV and `ticker` read it. */
+  notMeaningful?: Partial<Record<ServedRate, string>>;
 }): StatField[] {
   const stats: StatField[] = [];
-  const money = (value: number, perShare = false) => formatReportedMoney(value, fundamentalsCurrency({ fundamentals, financialCurrency, quote }), perShare);
+  // Amounts no source names the currency of are bare; the first says so after it, once for all of them.
+  let unsourcedSaid = false;
+  const reported = (value: number, currency: string | undefined, perShare = false): Pick<StatField, "value" | "detail"> => {
+    const text = formatReportedMoney(value, currency, perShare);
+    if (currency?.trim() || unsourcedSaid || !Number.isFinite(value)) return { value: text };
+    unsourcedSaid = true;
+    return { value: text, detail: [REPORTING_CURRENCY_NOT_SOURCED, "currency not sourced"] };
+  };
+  const money = (value: number) => reported(value, fundamentalsCurrency({ fundamentals, financialCurrency, quote }));
 
   // An index's 0 is volume nobody counts, not a quiet session: no Volume row.
   const volume = reportedQuoteVolume(quote);
   if (volume != null) {
     // Live figures keep their decimals (12.30M, not 12.3M) so the digits hold still.
-    stats.push({ label: "Volume", value: formatCompact(volume, { fixedDecimals: true }) });
+    // A coin's volume is the value it traded in its quote currency, written as the chart's volume reads ($47.94B),
+    // and the composite's or one exchange's own day, said beside it as its range's is.
+    const basis = quoteStatsBasisText(quote, false);
+    const currency = quoteVolumeCurrency(quote);
+    const value = currency ? formatChartLegendValue(volume, currency, "volume") : formatCompact(volume, { fixedDecimals: true });
+    stats.push({ label: "Volume", value, ...(basis ? { detail: basis } : {}) });
   }
   // Price-derived statistics follow the quote; see live-valuation for when a stored figure is kept.
+  // Market cap and EV read in the currency they are reported in, as the revenue and income beside them do, with
+  // the base currency's figure after them where it differs and a rate is held: 19.46T JPY 123.05B USD.
+  const inBase = (value: number, currency: string) => {
+    if (currency === baseCurrency) return undefined;
+    const converted = convertMarketCapitalization(value, currency, baseCurrency, marketCapExchangeRates);
+    return converted == null ? undefined : formatCompactCurrency(converted, baseCurrency, { fixedDecimals: true });
+  };
   const capitalization = liveMarketCapitalization(quote, fundamentals);
   if (capitalization) {
-    const converted = convertMarketCapitalization(capitalization.value, capitalization.currency, baseCurrency, marketCapExchangeRates);
     stats.push({
       label: "Market Cap",
-      value: formatCompactCurrency(
-        converted ?? capitalization.value,
-        converted == null ? capitalization.currency : baseCurrency,
-        { fixedDecimals: true },
-      ),
+      value: formatCompactCurrency(capitalization.value, capitalization.currency, { fixedDecimals: true }),
+      detail: inBase(capitalization.value, capitalization.currency),
     });
   }
   // A count read off a 10-K or 10-Q cover says when it was counted; the source's own is undated.
@@ -215,24 +256,45 @@ export function buildOverviewStats({
   if (finite(fundamentals?.floatShares) && fundamentals.floatShares > 0) {
     stats.push({ label: "Float", value: formatCompact(fundamentals.floatShares), ...counted(fundamentals.floatSharesAsOf) });
   }
+  // The shares one lot trades in, which an order on the venue is sized by.
+  if (boardLot != null && Number.isSafeInteger(boardLot) && boardLot > 0) {
+    stats.push({ label: "Board Lot", value: boardLot.toLocaleString("en-US"), detail: ["shares", "sh"] });
+  }
   // A receipt says how many shares it holds and a home line which receipt holds it, both opening ADR vs Home.
   if (depositaryPair) {
     const { pair, receiptSide } = depositaryPair;
     const count = ratioCount(pair.ratio);
     stats.push(receiptSide
-      ? { label: "ADR Ratio", value: `1:${count}`, detail: [adrRatioText(pair.ratio)!, `${count} sh per ADR`], link: ADR_PAIR }
-      : { label: "ADR", value: pair.receipt, detail: [`1 ADR = ${count} of these share${pair.ratio === 1 ? "" : "s"}`, `1:${count}`], link: ADR_PAIR });
+      ? { label: "ADR Ratio", value: `1:${count}`, detail: [adrRatioText(pair.ratio, pair.ordinary[0])!, `${count} sh per ADR`], link: ADR_PAIR }
+      : { label: "ADR", value: pair.receipt, detail: [`1 ADR = ${count} of these shares`, `1:${count}`], link: ADR_PAIR });
+  }
+  // An A+H company's other line, and the H price over the A price at spot, as ADR vs Home shows them.
+  if (ahPair) {
+    const premium = ahPair.premiumPercent == null ? null : premiumText(ahPair.premiumPercent);
+    stats.push({
+      label: ahPair.side === "h" ? "A Share" : "H Share",
+      value: ahPair.other,
+      ...(premium ? { detail: [`H ${premium} at spot`, `H ${premium.replace(/ (?:premium|discount|at par)$/, "")}`] } : {}),
+      ...(ahPair.linked ? { link: ADR_PAIR } : {}),
+    });
+  }
+  if (cedearRatio) {
+    const receipts = ratioCount(cedearRatio.receipts);
+    const shares = ratioCount(cedearRatio.shares);
+    stats.push({ label: "CEDEAR Ratio", value: `${receipts}:${shares}`, detail: [cedearRatioText(cedearRatio), `${receipts} per ${shares} sh`] });
   }
   const trailingPE = liveTrailingPE(quote, fundamentals);
   if (trailingPE != null) {
-    stats.push({ label: "P/E (TTM)", value: formatPriceEarnings(trailingPE) });
+    stats.push({ label: trailingEpsYear ? `P/E ${trailingEpsYear}` : "P/E (TTM)", value: formatPriceEarnings(trailingPE) });
   }
+  // Next fiscal year's consensus, and the year it is for: N/M over a loss, a dash when there is none.
   const forwardPE = liveForwardPE(quote, fundamentals);
-  if (forwardPE != null) {
-    stats.push({ label: "Fwd P/E", value: formatPriceEarnings(forwardPE) });
+  if (forwardPE != null || forwardPEAsked(fundamentals)) {
+    const year = forwardFiscalYear(fundamentals?.forwardEpsPeriodEnd);
+    stats.push({ label: year ? `Fwd P/E ${year}` : "Fwd P/E", value: formatPriceEarnings(forwardPE) });
   }
   if (fundamentals?.eps != null) {
-    stats.push({ label: "EPS", value: formatReportedMoney(fundamentals.eps, fundamentalsEpsCurrency({ fundamentals, financialCurrency, quote }), true) });
+    stats.push({ label: trailingEpsYear ? `EPS ${trailingEpsYear}` : "EPS", ...reported(fundamentals.eps, fundamentalsEpsCurrency({ fundamentals, financialCurrency, quote }), true) });
   }
   if (fundamentals?.pegRatio != null) {
     stats.push({ label: "PEG", value: formatPriceEarnings(fundamentals.pegRatio, 2) });
@@ -255,7 +317,8 @@ export function buildOverviewStats({
   const kind = bond ? "Dist" : "Div";
   const notSec = bond ? { detail: ["not SEC yield", "not SEC"] } : {};
   if (fundamentals && lapse) {
-    stats.push({ label: `Fwd ${kind} Yld`, value: NO_CURRENT_DIVIDEND });
+    // A monthly payer's history that ends early (MUB's at 2026-09-01) says so, beside the last ex-date it holds.
+    stats.push({ label: `Fwd ${kind} Yld`, value: lapseValue(lapse) });
   } else if (fundamentals && dividendYield != null && !dividend?.pending) {
     const basis = fundamentals.dividendYieldBasis;
     const label = basis === "forward" ? `Fwd ${kind} Yld` : basis === "trailing" ? `TTM ${kind} Yld` : `${kind} Yield`;
@@ -273,31 +336,36 @@ export function buildOverviewStats({
   if (exDividendDate && ISO_DATE.test(exDividendDate)) {
     const days = today ? daysUntil(exDividendDate, today) : -1;
     stats.push({
-      label: lapse ? "Last Paid" : "Ex-Dividend",
+      label: lapse ? (lapse.historyEnds ? "Last Ex" : "Last Paid") : "Ex-Dividend",
       value: calendarDate(exDividendDate, today ?? exDividendDate),
       detail: days >= 0 ? daysAhead(days) : undefined,
       link: DIVIDENDS,
     });
   }
   if (fundamentals?.revenue != null) {
-    stats.push({ label: "Revenue", value: money(fundamentals.revenue) });
+    // Which twelve months the revenue, net income and margin are, as Financials' TTM column names them.
+    const end = fundamentals.trailingPeriodEnd;
+    const revenue = money(fundamentals.revenue);
+    stats.push({ label: "Revenue", ...revenue, ...(end && ISO_DATE.test(end) && !revenue.detail ? { detail: [`TTM to ${end}`, `to ${end}`] } : {}) });
   }
   if (fundamentals?.netIncome != null) {
-    stats.push({ label: "Net Income", value: money(fundamentals.netIncome) });
+    stats.push({ label: "Net Income", ...money(fundamentals.netIncome) });
   }
   if (fundamentals?.freeCashFlow != null) {
-    stats.push({ label: "FCF", value: money(fundamentals.freeCashFlow) });
+    stats.push({ label: "FCF", ...money(fundamentals.freeCashFlow) });
   }
   const runwayField = runwayStat(runway);
   if (runwayField) stats.push(runwayField);
+  // A margin over revenue at or below zero, and growth off it, read N/M in N/M's own colour, never a sign's.
+  const notMeaningfulStat = (label: string): StatField => ({ label, value: NOT_MEANINGFUL_TEXT, valueColor: notMeaningfulColor() });
   if (fundamentals?.operatingMargin != null) {
-    stats.push({ label: "Op Margin", value: formatLevelPercent(fundamentals.operatingMargin) });
+    stats.push(notMeaningful.operatingMargin ? notMeaningfulStat("Op Margin") : { label: "Op Margin", value: formatLevelPercent(fundamentals.operatingMargin) });
   }
   if (fundamentals?.profitMargin != null) {
-    stats.push({ label: "Profit Marg", value: formatLevelPercent(fundamentals.profitMargin) });
+    stats.push(notMeaningful.profitMargin ? notMeaningfulStat("Profit Marg") : { label: "Profit Marg", value: formatLevelPercent(fundamentals.profitMargin) });
   }
   if (fundamentals?.revenueGrowth != null) {
-    stats.push({
+    stats.push(notMeaningful.revenueGrowth ? notMeaningfulStat("Rev Growth") : {
       label: "Rev Growth",
       value: formatPercent(fundamentals.revenueGrowth),
       valueColor: priceColor(fundamentals.revenueGrowth),
@@ -308,18 +376,25 @@ export function buildOverviewStats({
   const enterpriseValue = reportedEnterpriseValue(priced);
   // At or below zero, N/M as a P/E over a loss reads, with why in the space a stat has; valuation gives the full reason.
   if (enterpriseValueNotMeaningful(priced)) {
-    stats.push({ label: "EV", value: formatPriceEarnings(NOT_MEANINGFUL), detail: ["cash > cap + debt", "cash > cap"] });
+    // A bank's deposits and an insurer's float are funding, not debt (withFinancialEnterpriseValue);
+    // any other's cash exceeds the rest.
+    const financial = financialEnterpriseValue(priced);
+    stats.push({ label: "EV", value: formatPriceEarnings(NOT_MEANINGFUL),
+      detail: financial ? financial.replace(/^n\/m /, "") : ["cash > cap + debt", "cash > cap"] });
   } else if (fundamentals?.unavailableFields?.includes("enterpriseValue")) {
-    stats.push({ label: "EV", value: "—" });
+    stats.push({ label: "EV", value: MISSING_VALUE });
   } else if (enterpriseValue != null) {
-    // More than 5% from market cap + debt - cash: the provider's, with the computed figure where it fits.
+    // Market cap + debt - cash (+ minority interest) where the provider's is more than 5% from it, as every view
+    // shows it; the notice under the pane gives its inputs where the provider's is far off (enterpriseValueGapIsLarge).
     const check = enterpriseValueCheck(priced);
-    const computed = check?.status === "differs" && check.computed != null ? formatCompact(check.computed) : undefined;
+    const minority = (check?.minorityAndPreferred ?? 0) > 0 ? " + minority" : "";
     stats.push({
       label: "EV",
       value: formatCompactCurrency(enterpriseValue, quoteCurrency),
-      // An insurer's: its investment book is not netted as cash.
-      detail: computed ? [`provider vs ${computed}`, "provider"] : check?.investmentsKept ? ["investments in", "inv. in"] : undefined,
+      // An insurer's: its investment book is not netted as cash. How it was reached comes before the base figure.
+      detail: enterpriseValueComputed(priced)
+        ? [`cap + debt - cash${minority}`, "computed"]
+        : check?.investmentsKept ? ["investments in", "inv. in"] : inBase(enterpriseValue, quoteCurrency),
     });
   }
   if (finite(fundamentals?.beta)) {
@@ -413,7 +488,7 @@ export function buildPositionRows({
       currentPrice != null ? toBase(currentPrice, quoteCurrency) : null);
     const pnlValue = selectedPnl.value;
     const percent = portfolioPnlPercent(pnlValue, costBasisBase != null ? Math.abs(costBasisBase) : Number.NaN);
-    const returnPercent = percent === null ? "—" : formatPercentRaw(percent);
+    const returnPercent = percent === null ? MISSING_VALUE : formatPercentRaw(percent);
     const unit = metrics.priceBasis === "percent-of-par" ? "" : ticker.metadata.assetCategory === "BOND" ? " units" : metrics.multiplierHint > 1 ? " ct" : " sh";
 
     return {
@@ -434,10 +509,10 @@ export function buildPositionRows({
             priceBasis: currentPrice != null ? quote?.priceBasis : metrics.priceBasis,
             maxWidth: 9,
           }, fallbackMarkCurrency))
-        : "—",
-      cost: costBasisBase != null ? formatCurrency(costBasisBase, baseCurrency) : "—",
-      value: marketValueBase != null ? formatCurrency(marketValueBase, baseCurrency) : "—",
-      pnl: pnlValue != null ? `${pnlValue >= 0 ? "+" : ""}${formatCurrency(pnlValue, baseCurrency)}` : "—",
+        : MISSING_VALUE,
+      cost: costBasisBase != null ? formatCurrency(costBasisBase, baseCurrency) : MISSING_VALUE,
+      value: marketValueBase != null ? formatCurrency(marketValueBase, baseCurrency) : MISSING_VALUE,
+      pnl: pnlValue != null ? `${pnlValue >= 0 ? "+" : ""}${formatCurrency(pnlValue, baseCurrency)}` : MISSING_VALUE,
       ret: returnPercent,
       pnlValue,
       pnlBasis: selectedPnl.basis,

@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { logFailure } from "../../../utils/log-failure";
 import { useCallback, useMemo } from "react";
 import type { GasStorageRow } from "../../../api-client/europe-energy";
@@ -20,7 +21,7 @@ import {
 import { useGasStorageEvidence, type GasStorageSnapshot } from "./evidence";
 
 const PANELS = [{ id: "main" }];
-const formatAxis = spanAxisFormatter((value, digits) => `${value.toFixed(digits)}%`);
+const formatAxis = spanAxisFormatter((value, digits) => `${value.toFixed(digits)}%`, 2);
 /** One decimal in a legend, so this year, last year and the average fit a phone's width. */
 const formatLegend = (value: number) => `${value.toFixed(1)}%`;
 /** EU first, as the server lists it. */
@@ -72,7 +73,7 @@ function GasDetail({ row, width, height, focused }: { row: GasStorageRow; width:
     { id: "change", label: "1D pp", value: formatGasPoints(row.change), ...(row.previousGasDay ? { detail: `vs ${row.previousGasDay}` } : {}) },
     { id: "year", label: "1Y ago %", value: formatGasFull(row.yearAgo?.full), ...(row.yearAgo ? { detail: row.yearAgo.gasDay } : {}) },
     { id: "range", label: `${gasRangeLabel(five?.years.length ?? 0)} range %`,
-      value: five ? `${formatGasFull(five.min)} to ${formatGasFull(five.max)}` : "--",
+      value: five ? `${formatGasFull(five.min)} to ${formatGasFull(five.max)}` : MISSING_VALUE,
       ...(five ? { detail: `avg ${formatGasFull(five.average)}${five.years.length < 5 ? `, ${five.years.length} of 5 years` : ""}` } : {}) },
   ];
   return <StatChartDetail items={items} width={width} height={height} empty={!history.loading && (series[0]?.points.length ?? 0) < 2}
@@ -116,7 +117,7 @@ export function GasStorageView({ width, height, focused, snapshot }: {
   const seasonalLoading = !frozen && loaded.loading;
   useGasStorageEvidence(board, useMemo(() => rows.map((row) => row.id), [rows]), (!frozen && resource.loading) || seasonalLoading);
   useAutoRefresh(resource.updatedAt, resource.load);
-  usePaneRefreshKey(() => { void resource.reload(); void loaded.reload(); }, { focused });
+  usePaneRefreshKey(() => { resource.reload(); loaded.reload(); }, { focused });
   const open = rows.find((row) => row.id === openId);
   const series = useMemo(() => seasonal && seasonal.code === code ? gasSeasonalSeries(seasonal, colors, blendHex) : [], [seasonal, code, colors]);
   const year = seasonal?.code === code ? seasonal?.year : null;

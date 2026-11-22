@@ -79,6 +79,7 @@ test("watchlist and portfolio actions that change a list without a preview refus
     [watchlistCliCommand, ["remove", "growth", "SAN"], "watchlist remove has no --dry-run; it changes the watchlist when it runs."],
     [watchlistCliCommand, ["create", "Fresh"], "watchlist create has no --dry-run; it changes the watchlist when it runs."],
     [watchlistCliCommand, ["delete", "growth"], "watchlist delete has no --dry-run; it changes the watchlist when it runs."],
+    [watchlistCliCommand, ["move", "growth", "SAN", "--group", "Pharma"], "watchlist move has no --dry-run; it changes the watchlist when it runs."],
     [portfolioCliCommand, ["remove", "main", "SAN"], "portfolio remove has no --dry-run; it changes the portfolio when it runs."],
   ];
   for (const [command, args, message] of attempts) {
@@ -219,7 +220,7 @@ test("one pasted list where the list name goes is a list of symbols, not a missi
     watchlists: [{ id: "growth", name: "Growth" }, { id: "watch-two", name: "Watch Two" }],
   };
   const run = (command: CliCommandDef, args: string[]) => caught(command.execute(args, hintedContext({ config, store }).context));
-  const watchlistUsage = "Usage: gloom watchlist add <watchlist> <symbols...> [--file <path>]";
+  const watchlistUsage = "Usage: gloom watchlist add <watchlist> <symbols...> [--file <path>] [--group <name>]";
 
   const pasted = await run(watchlistCliCommand, ["add", "  usdngn=x , USDZAR=X;  usdsar=x\n"]);
   expect(pasted?.message).toBe(
@@ -242,6 +243,10 @@ test("one pasted list where the list name goes is a list of symbols, not a missi
   expect((await run(watchlistCliCommand, ["add", "watch two"]))?.message).toBe(watchlistUsage);
   expect((await run(watchlistCliCommand, ["add", "Groth"]))?.message).toBe('Watchlist "Groth" was not found.');
   expect((await run(watchlistCliCommand, ["add", "Groth", "NVDA"]))?.message).toBe('Watchlist "Groth" was not found.');
+  // Symbols typed with no watchlist first: the first reads as its name, so the failure names the form to type.
+  expect(await run(watchlistCliCommand, ["add", "USDJPY=X", "USDCHF=X"])).toMatchObject({
+    message: 'Watchlist "USDJPY=X" was not found.', details: `Watchlists: Growth, Watch Two\n${watchlistUsage}`,
+  });
   expect((await run(watchlistCliCommand, ["add", "My Lisst", "--file", "holdings.csv"]))?.message).toBe('Watchlist "My Lisst" was not found.');
 
   // With the name first the same paste adds.
@@ -605,6 +610,35 @@ test("a BIST bank typed GARAN.IS, GARAN:BIST or GARAN is one GARAN:BIST row on e
   expect((await saver.store.loadTicker("AKBNK"))!.metadata.watchlists).toEqual([]);
 });
 
+test("watchlist groups: add --group files the rows it adds and finds listed, move and ungroup change only the list's rows, and a removed row leaves its group", async () => {
+  const saver = await bistSaver(async () => { throw new ProviderBusyError(); });
+  const banks = async () => (await loadConfig(saver.dataDir)).watchlists[0]!;
+
+  await saver.run(watchlistCliCommand, "add", "Banks", "GARAN.IS", "--group", "Turkey");
+  expect((await banks()).groups).toEqual([{ name: "Turkey", symbols: ["GARAN"] }]);
+  // A list: the row added and the one already listed both go in, the group matched in any case.
+  const added = await saver.run(watchlistCliCommand, "add", "Banks", "GARAN, AKBNK", "--group", "turkey");
+  expect(added.data.map((row) => row.status)).toEqual(["already_listed", "added"]);
+  expect((await banks()).groups).toEqual([{ name: "Turkey", symbols: ["GARAN", "AKBNK"] }]);
+
+  const moved = await saver.run(watchlistCliCommand, "move", "Banks", "AKBNK.IS", "--group", "Private banks");
+  expect(moved.data).toMatchObject({ group: "Private banks", moved: ["AKBNK"] });
+  expect(moved.text).toBe('Moved AKBNK to group "Private banks" of "Banks".');
+  expect((await banks()).groups).toEqual([{ name: "Turkey", symbols: ["GARAN"] }, { name: "Private banks", symbols: ["AKBNK"] }]);
+
+  // One symbol not in the list stops the move before anything changes; so does a name no group may take.
+  const before = await banks();
+  expect((await caught(saver.run(watchlistCliCommand, "move", "Banks", "GARAN", "VOD", "--group", "Europe")))?.message).toBe('Not in "Banks": VOD.');
+  expect((await caught(saver.run(watchlistCliCommand, "move", "Banks", "GARAN", "--group", "Ungrouped")))?.message).toContain("name the group something else");
+  expect((await caught(saver.run(watchlistCliCommand, "move", "Banks", "GARAN")))?.message).toContain("watchlist move needs --group");
+  expect(await banks()).toEqual(before);
+
+  expect((await saver.run(watchlistCliCommand, "ungroup", "Banks", "--group", "TURKEY")).data).toMatchObject({ group: null, moved: ["GARAN"] });
+  expect((await banks()).groups).toEqual([{ name: "Private banks", symbols: ["AKBNK"] }]);
+  await saver.run(watchlistCliCommand, "remove", "Banks", "AKBNK");
+  expect(await banks()).toEqual({ id: "banks", name: "Banks" });
+});
+
 test("a symbol listed only abroad is still refused when it is more likely a slip for a US ticker or a currency", async () => {
   const saver = await bistSaver(async (query) => query === "AAPL"
     ? [{ providerId: "test", symbol: "AAPL", name: "Apple Inc.", exchange: "NASDAQ", type: "Common Stock", currency: "USD" }]
@@ -679,4 +713,18 @@ test("a bare symbol is its US listing in a fresh profile and in one that saved i
   expect(listed.data.map((row) => [row.status, row.listing])).toEqual([["already_listed", "SHEL:NYSE"], ["already_listed", "SHEL:LSE"]]);
   expect((await known.run(watchlistCliCommand, "remove", "Banks", "SHEL")).data).toMatchObject({ changed: true, listing: "SHEL:NYSE" });
   expect((await known.store.loadTicker("SHEL"))!.metadata.watchlists).toEqual(["banks"]);
+});
+
+test("a bare symbol added on a minor line abroad names the listing the service marks with the word, as quote does", async () => {
+  // As `search NTT` answers: Warsaw's NTT is NTT System; the service marks NTT, Inc.'s 9432 on JPX with the word.
+  const search: DataProvider["search"] = async (query) => query.toUpperCase() === "AKBNK" ? [
+    { providerId: "test", symbol: "AKBNK", name: "Akbank T.A.S.", exchange: "BIST", type: "Common Stock", currency: "TRY" },
+    { providerId: "test", symbol: "8306", name: "Akbank Holdings", exchange: "JPX", type: "Common Stock", currency: "JPY", searchAliases: ["akbnk"] },
+  ] : [];
+  const saver = await bistSaver(search);
+  const added = await saver.run(watchlistCliCommand, "add", "Banks", "AKBNK, GARAN");
+  expect(added.data.map((row) => [row.listing, row.abroad ?? null])).toEqual([
+    ["AKBNK:BIST", "AKBNK has no US listing; it trades on BIST, in TRY; also 8306:JPX Akbank Holdings."],
+    ["GARAN:BIST", "GARAN has no US listing; it trades on BIST, in TRY."],
+  ]);
 });

@@ -89,8 +89,8 @@ test("every command a hint suggests runs on the listing it names", async () => {
   expect((await resolveCliListing(forms[2]!, forms[3], deps)).key).toBe("SAN:LSE");
 });
 
-// Decided per command: `fn` reports are titled by function and symbol, so a bare
-// symbol several companies list gets quote's line; `news` heads its table with the listing.
+// Decided per command: `fn` reports are titled by function and symbol, so a bare symbol several companies list
+// gets quote's line (none on the company's own US line); `news` heads its table with the listing.
 test("a bare symbol several companies list is named once per report: fn by quote's line, news by its heading", async () => {
   const provider = createTestDataProvider({
     search: dataProvider.search,
@@ -100,8 +100,8 @@ test("a bare symbol several companies list is named once per report: fn by quote
     getNews: async () => [createTestArticle("avis", { title: "Avis results", tickers: ["CAR"] })],
   });
   const market = { ...deps, dataProvider: provider };
-  expect(await quotedListingChoiceNotes(await resolveCliListing("CAR", undefined, market), market))
-    .toEqual(["CAR = Avis Budget Group, NASDAQ (also XETRA)"]);
+  // Read on the company's own US line: what CAR means, so the companies sharing it abroad go unnamed.
+  expect(await quotedListingChoiceNotes(await resolveCliListing("CAR", undefined, market), market)).toEqual([]);
   expect(await quotedListingChoiceNotes(await resolveCliListing("CAR:ASX", undefined, market), market)).toEqual([]);
 
   const run = createTestCliContext({ dataProvider: provider });
@@ -123,4 +123,20 @@ test("fn names the coin's pair when a bare coin ticker is a fund", async () => {
   expect(await quotedListingChoiceNotes(await resolveCliListing("BTC", undefined, market), market))
     .toContain("BTC is Grayscale Bitcoin Mini Trust ETF, not bitcoin. For bitcoin use BTC-USD.");
   expect(await quotedListingChoiceNotes(await resolveCliListing("AAPL", undefined, market), market)).toEqual([]);
+});
+
+// `news ETH`: the stories are filed under the fund, and the header says so; the line says where the coin is.
+test("news names the coin's pair when a bare coin ticker is a fund, and says nothing of a named listing", async () => {
+  const provider = createTestDataProvider({
+    search: async () => [],
+    getQuote: async (symbol) => createTestQuote({ symbol, name: "Grayscale Ethereum Mini Trust ETF", instrumentType: "ETF", currency: "USD", listingExchangeName: "ARCA" }),
+    getNews: async () => [createTestArticle("eth", { title: "Ether staking", tickers: ["ETH"] })],
+  });
+  const news = async (args: string[]) => {
+    const run = createTestCliContext({ dataProvider: provider });
+    await marketDataCliCommands.find((command) => command.name === "news")!.execute(args, run.context);
+    return run.printed[0]!.result.warnings;
+  };
+  expect(await news(["ETH"])).toEqual(["ETH is Grayscale Ethereum Mini Trust ETF, not ethereum. For ethereum use ETH-USD."]);
+  expect(await news(["ETH", "--exchange", "ARCA"])).toBeUndefined();
 });

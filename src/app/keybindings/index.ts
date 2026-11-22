@@ -4,7 +4,6 @@ export {
   type CoreKeybindingActionId,
 } from "./actions";
 export {
-  formatKeyChord,
   isTypingChord,
   keyChordFromEvent,
   matchesKeyChord,
@@ -31,12 +30,14 @@ export {
   formatActionChords,
   formatAdvertisedChord,
   formatChordForHost,
+  formatShortcutForHost,
   menuAcceleratorFor,
   primaryModifierFor,
   shortActionLabel,
   takenChordMessage,
 } from "./labels";
 export { KeybindingsProvider, getDefaultKeybindings, useKeybindings, useResolvedKeybindings } from "./react";
+export { useTerminalReportsControlKeys } from "./terminal-keys";
 export {
   applyActionBinding,
   removeCommandBinding,

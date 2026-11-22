@@ -1,3 +1,4 @@
+import type { CompanyFrom } from "./company-from";
 import type { PerpBoardRow } from "../api-client/perps";
 import type { PriceBasis } from "./instrument";
 
@@ -49,6 +50,18 @@ export interface ListingDelisting {
   historyStart: string;
 }
 
+/**
+ * A listing its exchange withdrew, as its company announced it: Hang Seng
+ * Bank's 0011 left HKEX on 2026-01-27, privatised by HSBC. No source prices
+ * it any more, so only this is known.
+ */
+export interface ListingWithdrawal {
+  /** The day the listing went (YYYY-MM-DD); null when the notice does not say. */
+  on: string | null;
+  /** Why, in words: "Privatised by The Hongkong and Shanghai Banking Corporation Limited". */
+  reason: string | null;
+}
+
 /** Static listing facts from a quote observation, without an investable price. */
 export interface QuoteMetadataSource {
   providerId?: string;
@@ -87,6 +100,26 @@ export interface DepositaryPair {
   ordinary: string[];
 }
 
+/**
+ * A Buenos Aires CEDEAR's ratio from BYMA's published list, as Gloom Cloud
+ * serves it: 20 AAPL:BYMA are 1 Apple share. Its market cap is the company's,
+ * in the currency of the listing it stands for.
+ */
+export interface CedearRatio {
+  /** The CEDEAR's listing: AAPL:BYMA. */
+  listing: string;
+  /** CEDEARs that make `shares` of the company's shares: 20 for Apple. */
+  receipts: number;
+  /** The company's shares `receipts` CEDEARs stand for: 1 for Apple, 8 for BABA's 9 (one receipt of 8 shares). */
+  shares: number;
+  /** The company as the list names it: "Apple Inc.". */
+  company: string;
+  /** The listing it stands for, as a ticker: AAPL, VALE3.SA. */
+  underlying: string;
+  /** The date of BYMA's list. */
+  listedAt: string;
+}
+
 /** How a depositary receipt relates to the ordinary shares, as Gloom Cloud states it. */
 interface DepositaryReceiptFacts {
   /** Whether the listing is a depositary receipt; absent when unknown. */
@@ -95,6 +128,18 @@ interface DepositaryReceiptFacts {
   adrRatio?: number;
   /** The receipt and its home lines, on the receipt's records and each home line's. */
   depositaryPair?: DepositaryPair;
+  /** A Buenos Aires CEDEAR's ratio, on its records. */
+  cedearRatio?: CedearRatio;
+}
+
+/** A split in a quote's own session (Quote.sessionSplit). */
+export interface QuoteSessionSplit {
+  /** The first session on the new basis, YYYY-MM-DD. */
+  exDate: string;
+  /** What a price from before the split is multiplied by. */
+  priceFactor: number;
+  /** The previous close the source stated, on the old basis. */
+  sourcePreviousClose: number;
 }
 
 export interface Quote extends DepositaryReceiptFacts {
@@ -121,11 +166,34 @@ export interface Quote extends DepositaryReceiptFacts {
   changeBasis?: "24h" | "none";
   previousClose?: number;
   /**
+   * A split took effect in the quote's session, so the source's previous close
+   * was on the old share basis: previousClose is the close before it on the
+   * price's basis, the source's `sourcePreviousClose` times `priceFactor`
+   * (1/3 for a 3-for-1 split, 10 for a 1-for-10 reverse one), and change is
+   * measured from it. Gloom Cloud sets it; absent on any other quote.
+   */
+  sessionSplit?: QuoteSessionSplit;
+  /**
    * Exchange-local date of previousClose. The app's quote router reads it
    * from the listing's own daily closes where the venue's calendar cannot
    * date the close (PreviousCloseDates); a source may set it too.
    */
   previousCloseDate?: string;
+  /**
+   * A thin listing that did not trade in the session its venue's calendar
+   * puts before the move's, and whose daily closes do not say which day its
+   * previousClose is from (PreviousCloseDates): its move names no day.
+   */
+  previousCloseUndated?: boolean;
+  /**
+   * A listing that did not trade in the session its price is from: the price
+   * and previous close are the venue's nominal prices (an HKEX counter's
+   * USD line, untraded for days), dated by its daily bars
+   * (PreviousCloseDates). `session` is the venue date whose nominal price it
+   * is; `lastTraded` the latest day its bars show a trade, null when they
+   * reach back to none. `lastUpdated` stays the last print.
+   */
+  nominalPrice?: { session: string; lastTraded: string | null };
   /** Official close of a completed regular session, in this quote's currency. */
   regularClose?: number;
   /** Exchange-local date of regularClose; separate from the daily previous-close reference. */
@@ -137,11 +205,39 @@ export interface Quote extends DepositaryReceiptFacts {
   changeSessionDate?: string;
   high52w?: number;
   low52w?: number;
+  /**
+   * The 52-week range is the high and low of the stored daily bars over 52
+   * weeks, the source's own having been unusable (an index's that only
+   * repeated the day's range, or reached zero): said beside it.
+   */
+  yearRangeBasis?: "daily-bars";
+  /**
+   * What a coin's day range and volume measure, as the service says: the
+   * composite's across exchanges, or one exchange's own day (a real-time
+   * crypto feed's). Said beside each, so a source switch is never silent.
+   */
+  statsBasis?: "composite" | "exchange";
+  /** The composite's day range was widened to take in `priceVenue`'s price, which fell outside it. */
+  rangeWidened?: boolean;
+  /**
+   * No live quote: the price is the close of the latest stored daily bar of
+   * `session` (an exchange-local date), said beside the price.
+   */
+  dailyClose?: { session: string };
   marketCap?: number;
   volume?: number;
   name?: string;
   lastUpdated: number; // timestamp ms
   receivedAt?: number; // local receipt timestamp ms for streamed/display freshness
+  /**
+   * When Gloom fetched this quote from its source (epoch ms): Gloom Cloud's
+   * own fetch time for a copy it kept, a stale one included, else when this
+   * app read it. A quote served from a saved copy keeps the time that copy
+   * was fetched, so a cached quote can be told from a feed that stopped:
+   * `lastTradeTime` behind with `retrievedAt` recent is the feed,
+   * `retrievedAt` old is the copy.
+   */
+  retrievedAt?: number;
   delivery?: QuoteDelivery;
   stale?: boolean;
   /**
@@ -213,6 +309,11 @@ export interface Quote extends DepositaryReceiptFacts {
   /** Freshness class for the quote data. Provider identity lives in providerId/provenance. */
   dataSource?: QuoteDataSource;
   /**
+   * The spot exchange whose own last trade the price is (Coinbase, Kraken), on a coin's quote; absent on the
+   * composite price, which blends several exchanges. Sources name the quote by it (`quoteSourceName`).
+   */
+  priceVenue?: string;
+  /**
    * A perpetual contract's whole market row as of this quote (funding, open
    * interest, premium), so every view of the contract reads the figures that
    * came with its price, streamed or fetched.
@@ -245,10 +346,12 @@ export interface TtmConversion {
 }
 
 /**
- * How a served enterprise value ties to market cap + total debt - cash from the latest balance sheet served beside it.
+ * How a served enterprise value ties to market cap + total debt (+ leases, `leases`) - cash from the latest balance sheet
+ * served beside it.
  * `matches` within 5%; `differs` beyond it (or beyond 2% on the other side of the market cap from net debt), within
  * 0.7x to 1.5x, shown labelled as the provider's; `withdrawn` outside that band, with no EV or EV/revenue; `unchecked`
- * without a recent balance sheet carrying both lines. `computed`: an insurer's or a holding company's EV, which is
+ * without a recent balance sheet carrying both lines, or where that balance sheet has no minority interest and an
+ * earlier one's accounts for the gap (`minorityUnreported`): the provider's figure stands. `computed`: an insurer's or a holding company's EV, which is
  * `computed` itself, its investment book kept in (`investmentsKept`). `not-meaningful`: the EV comes out at or below
  * zero, served as no EV or EV/revenue, with `reason`; shown N/M.
  */
@@ -261,15 +364,37 @@ export interface EnterpriseValueCheck {
   /** The market cap the EV is measured on; absent only on a not-meaningful source EV served without one. */
   marketCap?: number;
   totalDebt?: number;
+  /** The balance sheet's lease liabilities the bridge adds to total debt, as FA's net debt does (utils/lease-liabilities); absent when none were added. */
+  leases?: number;
   cash?: number;
   /** YYYY-MM-DD of the balance sheet the debt and cash come from. */
   balanceSheetDate?: string;
-  /** marketCap + totalDebt - cash. */
+  /** marketCap + totalDebt + leases - cash. */
   computed?: number;
+  /**
+   * Minority interest and preferred equity on the same balance sheet (total equity including minority interest less
+   * common equity, else what the company's filing tags for its date, `minorityFiled`), where it is positive.
+   * `computed` plus this is the EV the provider's is checked against and that stands in for it (bridgeEnterpriseValue).
+   */
+  minorityAndPreferred?: number;
+  /** `minorityAndPreferred` comes from the company's filing: the balance sheet has no equity lines. */
+  minorityFiled?: true;
+  /**
+   * On an `unchecked` check: the balance sheet and its filing give no minority interest, and this earlier balance sheet's
+   * accounts for the provider's EV above `computed`, so the provider's figure stands.
+   */
+  minorityUnreported?: { balanceSheetDate: string; value: number };
   /** `cash` is cash and equivalents alone: an insurer's or a holding company's investments stay in its EV. */
   investmentsKept?: true;
-  /** Why the EV is not meaningful (`not-meaningful`). */
+  /** Why the EV is not meaningful (`not-meaningful`), or why a withdrawn EV no balance sheet checked is withdrawn. */
   reason?: string;
+  /** A balance sheet in another currency than the market cap: its currency and the rate at its date
+   * (`currency` per unit of `from`) that `totalDebt`, `leases` and `cash` were converted at. */
+  fx?: { from: string; rate: number };
+  /** The provider converted its EV from the statements' currency. */
+  convertedFrom?: string;
+  /** Withdrawn because the provider applied that conversion twice: its EV over `computed` is the conversion rate. */
+  convertedTwice?: true;
 }
 
 /** How a trailing P/E converts the EPS it divides by, when that EPS is in another currency than the price. */
@@ -313,24 +438,55 @@ export interface Fundamentals extends DepositaryReceiptFacts {
   epsCurrency?: string;
   /** Set when `trailingPE` divides the price by the trailing EPS converted from another currency. */
   trailingPEConversion?: TrailingPEConversion;
+  /**
+   * What the trailing EPS was worked out from where Gloom Cloud did not take
+   * its source's: `statements` (net income over shares), `home` (a receipt's
+   * home line, per receipt), `cpo` (a CPO line's company, per CPO).
+   */
+  trailingEpsBasis?: "statements" | "home" | "cpo";
+  /**
+   * `YYYY-MM-DD`, the last day of the twelve months `revenue`, `netIncome` and
+   * `profitMargin` are: the statements' trailing window (Financials' TTM)
+   * when they are its figures. Absent when Gloom Cloud cannot tie them to one.
+   */
+  trailingPeriodEnd?: string;
+  /** `statements`: the trailing revenue, net income and margin are the statements' window, in place of figures on no twelve months the EPS is on. */
+  trailingIncomeBasis?: "statements";
   /** Provider-reported issuer market cap; marketCapCurrency identifies its units when known. */
   marketCap?: number;
   marketCapCurrency?: string;
   trailingPE?: number;
+  /** The price over next fiscal year's consensus EPS; absent when that EPS is not positive or there is none. */
   forwardPE?: number;
   /**
-   * Forward EPS behind `forwardPE`, per share in the listing's major currency
-   * unit. Served only when its basis matches the multiple, so the multiple can
-   * be repriced from a live quote; absent otherwise.
+   * Next fiscal year's consensus EPS behind `forwardPE`, per share in the
+   * unit of the multiple's price, so the multiple can be repriced from a live
+   * quote. Served negative without a multiple (N/M); absent otherwise.
    */
   forwardEps?: number;
+  /** The currency `forwardEps` is in. */
+  forwardEpsCurrency?: string;
+  /**
+   * The end of the fiscal year the consensus is for (`2027-12-31` is FY27).
+   * Null when the source was asked and had no consensus for next year, or
+   * only one from before the listing's last split; absent from a block
+   * served before Gloom Cloud read consensus.
+   */
+  forwardEpsPeriodEnd?: string | null;
+  /** When the consensus was read. */
+  forwardEpsObservedAt?: string;
   pegRatio?: number;
   enterpriseValue?: number;
   enterpriseToRevenue?: number;
   /** Set where Gloom Cloud checked `enterpriseValue` against market cap + total debt - cash; pairs with that value only. */
   enterpriseValueCheck?: EnterpriseValueCheck;
   /** Explicit provider retractions; omitted fields alone remain eligible for fallback. */
-  unavailableFields?: Array<"enterpriseValue" | "enterpriseToRevenue">;
+  unavailableFields?: Array<"enterpriseValue" | "enterpriseToRevenue" | "marketCap">;
+  /**
+   * Why `marketCap` is retracted, with "marketCap" in `unavailableFields`: a depositary receipt its source priced as
+   * an ordinary share (the receipt's price times the company's ordinary shares), with no ratio to convert them.
+   */
+  marketCapUnavailable?: "receipt-priced-as-ordinary";
   operatingCashFlow?: number;
   freeCashFlow?: number;
   dividendYield?: number;
@@ -345,6 +501,24 @@ export interface Fundamentals extends DepositaryReceiptFacts {
   revenue?: number;
   netIncome?: number;
   eps?: number;
+  /**
+   * Where `eps` and `trailingPE` come from: `filed-quarters` when `eps` is the
+   * diluted EPS of the last four filed quarters (or the fiscal year they end
+   * with), as PEB and GE read the statements, its last period ending
+   * `trailingEpsPeriodEnd`, and `trailingPE` the price over it; `served` when
+   * those quarters give none (or one that cannot be priced: see
+   * time-series/filed-trailing-eps) and both are Gloom Cloud's trailing
+   * figures, including a P/E it serves with no EPS (a fund's). Absent when
+   * there is neither an EPS nor a P/E.
+   */
+  trailingEpsSource?: "filed-quarters" | "served";
+  trailingEpsPeriodEnd?: string;
+  /**
+   * Why a multiple is withdrawn though its figures are numbers (utils/share-multiples): a warrant's price over its
+   * company's EPS, a receipt's with no ratio on record, an EPS that is not net income over the shares. The multiple
+   * itself is absent; every view reads it as N/M with this reason.
+   */
+  notMeaningful?: Partial<Record<"trailingPE" | "forwardPE" | "pegRatio", string>>;
   operatingMargin?: number;
   profitMargin?: number;
   revenueGrowth?: number;
@@ -419,6 +593,8 @@ export interface HolderData extends DepositaryReceiptFacts {
   asOf?: string;
   summary?: HolderSummary;
   holders: HolderRecord[];
+  /** The company's home line the data is read from, when not the listing asked (a receipt, a foreign line). */
+  companyFrom?: CompanyFrom;
 }
 
 interface AnalystPriceTarget {
@@ -439,6 +615,18 @@ interface AnalystRecommendationTrend {
   strongSell?: number;
 }
 
+/** Why a firm took an action, as public news coverage of it quotes the firm, word for word. */
+export interface AnalystRatingReason {
+  /** One line from the article, as it prints it. */
+  text: string;
+  /** The article. */
+  url: string;
+  /** Its publisher, when known. */
+  source?: string;
+  /** ISO time the article was published. */
+  publishedAt?: string;
+}
+
 export interface AnalystRatingRecord {
   date: string;
   firm: string;
@@ -447,9 +635,12 @@ export interface AnalystRatingRecord {
   prior?: string;
   currentPriceTarget?: number;
   priorPriceTarget?: number;
+  /** Absent when no coverage of the action gives a reason. */
+  reason?: AnalystRatingReason;
 }
 
 export interface AnalystEstimateRecord {
+  epsBasis?: "gaap" | "adjusted" | "unknown";
   date: string;
   period: string;
   /** Explicit currency for these estimates; independent of the listing currency. */
@@ -483,20 +674,39 @@ export interface AnalystResearchData {
 export interface DividendAction {
   exDate: string;
   amount: number;
+  payDate?: string;
+  recordDate?: string;
+  /**
+   * Who published the row when it is not the listing's own history: a fund's
+   * sponsor, for a distribution the history lacks (iShares, SPDR, J.P. Morgan,
+   * VanEck), and the page it is published on. Absent elsewhere and from older servers.
+   */
+  source?: { publisher: string; url: string };
 }
 
 /**
  * A distribution the issuer has declared and not yet paid, as the source
- * states it. Kept apart from the paid `dividends`: no history, yield or growth
- * figure takes it.
+ * states it. Kept apart from paid `dividends`; issuer-confirmed declarations
+ * enter ex-date-based cash figures once ex-dated, with any conversion estimate.
  */
 export interface DeclaredDividendAction {
   exDate: string;
   /** Per share, in the listing's dividend currency (`currency`). */
   amount: number;
+  cashEstimate?: DividendCashEstimate;
   declarationDate?: string;
   recordDate?: string;
   payDate?: string;
+  /** A one-off beside the regular payments (AIOK's $3.50), as the server marks it. */
+  special?: true;
+}
+
+/** declaredAmount is in declaredCurrency's major unit; the enclosing amount keeps the history's currency/unit. */
+export interface DividendCashEstimate {
+  declaredCurrency: string;
+  declaredAmount?: number;
+  fixingDate?: string;
+  basis: string;
 }
 
 export interface SplitAction {
@@ -556,11 +766,54 @@ export interface CorporateActionsData {
   dividends: DividendAction[];
   /** Declared and unpaid, for the listings Gloom Cloud has them for; absent elsewhere and from older servers. */
   declaredDividends?: DeclaredDividendAction[];
+  /**
+   * What each paid row was declared as when the company declares in another
+   * currency than the listing pays (BP's dollars beside its London pence), per
+   * ordinary share, keyed by the paid row's ex-date. Absent elsewhere and from older servers.
+   */
+  declaredCash?: DeclaredCash;
+  /** Set when `dividends` is the last good history standing in for a refresh that could not read it: when that history was read. */
+  dividendsAsOf?: string;
   splits: SplitAction[];
   earnings: EarningsAction[];
+  /** Businesses demerged out of the listing into companies of their own; absent where none is on record and from older servers. */
+  demergers?: DemergerAction[];
+}
+
+/**
+ * A business demerged out of a listing (Tata Motors' commercial vehicles into
+ * TMCV): the listing's price falls by that business's value on the ex-date,
+ * which is no market move.
+ */
+export interface DemergerAction {
+  /** The first session the listing traded without the business, YYYY-MM-DD. */
+  exDate: string;
+  recordDate?: string;
+  /** The company the business went to, as it lists, and the day it first traded (null until it lists). */
+  successor: { symbol: string; exchange?: string; name?: string; listedOn?: string | null };
+  /** What the business does: "commercial vehicles". */
+  business?: string;
+  /** Shares of the demerged company per share of the listing. */
+  ratio?: number;
+  source?: string;
+}
+
+/** Declaration amounts (rows and announced.amount) are in the major unit of `currency`.
+ * announced.paidAmount uses the corporate-action history's currency/unit, like dividends. */
+export interface DeclaredCash {
+  currency: string;
+  rows: DividendAction[];
+  announced?: { exDate: string; payDate: string; amount: number; paidAmount?: number; fixingDate?: string };
+  fetchedAt?: string;
+  stale?: boolean;
+  verification?: "unavailable";
 }
 
 export interface CompanyProfile {
+  /** Who the profile is of, as the source names it beside its facts: another listing's name where one took the symbol. */
+  name?: string;
+  /** Where its issuer is domiciled, as the source gives it (NL, US). */
+  country?: string;
   description?: string;
   /**
    * Who published the description and where, when it is quoted from a
@@ -584,8 +837,8 @@ export interface NextEarnings {
   date: string;
   /** Before the open, during market hours, after the close. */
   timing: "bmo" | "dmh" | "amc" | null;
-  /** "history" when the timing is predicted from the last two reports. */
-  timingSource: "filing" | "calendar" | "history" | null;
+  /** "history" when the timing is predicted from the last two reports; "company" when the company announced the date itself. */
+  timingSource: "filing" | "calendar" | "history" | "company" | null;
 }
 
 export type IncomeStatementField = "netIncome" | "netIncomeIncludingNoncontrollingInterests" | "netIncomeCommonStockholders";
@@ -612,12 +865,74 @@ export type StatementGapField = IncomeStatementField | "totalRevenue" | "operati
 export type StatementFillField = "totalRevenue" | "netIncome" | "totalAssets" | "totalLiabilities";
 
 /** Where a row's filled lines came from: the exchange's figures, its page, and when they were read. */
-export interface StatementFill {
+export interface ExchangeStatisticsFill {
   source: "asx";
   page: string;
   retrievedAt: string;
   /** The lines taken from the exchange; the row's other figures are the statements source's. */
   fields: StatementFillField[];
+}
+
+/** Lines Gloom Cloud fills from a company's own results announcements and reports. */
+export type ResultsFillField =
+  | "totalRevenue" | "grossProfit" | "operatingIncome" | "netIncome" | "basicEps" | "eps"
+  | "operatingCashFlow" | "capitalExpenditure" | "freeCashFlow"
+  | "cashAndCashEquivalents" | "totalDebt" | "totalEquity" | "commonStockEquity" | "totalEquityGrossMinorityInterest"
+  | "totalAssets" | "totalLiabilities";
+
+export type StatementFilingKind = "annual_results" | "interim_results" | "quarterly_results" | "annual_report" | "interim_report";
+
+/** A results announcement or report on HKEXnews or SGXNet, with when it was published and read. */
+export interface StatementFilingDocument {
+  source: "hkex" | "sgx" | "lse" | "cninfo" | "ir";
+  kind: StatementFilingKind;
+  title: string;
+  url: string;
+  publishedAt: string;
+  fetchedAt: string;
+}
+
+/** A row's lines read from the company's results announcement or report, for a period the statements source lags on. */
+export interface ResultsStatementFill {
+  source: "results";
+  /** The lines taken from the documents; the row's other figures are the statements source's. */
+  fields: ResultsFillField[];
+  /** The documents, the one each line was read from first: the row is dated by the earliest publication. */
+  documents: StatementFilingDocument[];
+  /** Per line, its document (an index into `documents`) and page. */
+  lines: Partial<Record<ResultsFillField, { document: number; page: number | null }>>;
+  /** The months the row's flows cover where the list's usual is another: 6 for a half in the quarterly list. */
+  periodMonths?: number;
+  /** A quarter derived as the difference of two year-to-date periods ("6 months to 2026-06-30 − 3 months to 2026-03-31"). */
+  derived?: string;
+  /**
+   * Filled lines whose change over a year can be read against the statements source's row a year
+   * earlier: the document restates that period's figure as the source has it.
+   */
+  comparable?: ResultsFillField[];
+  /**
+   * A quarter's lines left blank because the announcements count them otherwise than the statements
+   * source (HSBC's revenue): set beside the source's quarters around it, the change would measure that.
+   */
+  omitted?: ResultsFillField[];
+}
+
+export type StatementFill = ExchangeStatisticsFill | ResultsStatementFill;
+
+/** How Gloom Cloud built a trailing twelve months the quarters do not give: the year plus the year to date since it, less a year earlier's. */
+export interface StatementTrailing {
+  method: "annual-plus-interim";
+  annual: string;
+  interim: { end: string; months: number };
+  priorInterim: { end: string; months: number };
+  /** "FY to 2025-12-31 + 6 months to 2026-06-30 − 6 months to 2025-06-30" */
+  basis: string;
+  /**
+   * Why the four quarters to the same end must not stand in for this: the latest quarters come from the
+   * company's announcements and the earlier ones from a source that defines a line otherwise. Absent where
+   * the quarters may be summed.
+   */
+  overQuarters?: string;
 }
 
 /** Per-share earnings lines that can be declared unavailable. */
@@ -726,6 +1041,11 @@ export interface FinancialStatement {
   date: string;
   /** Source of the fiscal period date; does not establish metric publication dates. */
   dateSource?: "sec" | "provider";
+  /**
+   * The accounting standard the issuer reports in, from the taxonomy of its latest annual report to the SEC (10-K,
+   * 20-F or 40-F): BABA's 20-F is US GAAP, NVO's IFRS. Absent for a company that files none with the SEC.
+   */
+  accountingStandard?: "us-gaap" | "ifrs";
   /** Original vendor period date when independent filing evidence changes it. */
   providerDate?: string;
   /** Filing evidence for the period identity only, not availability of every field. */
@@ -871,6 +1191,11 @@ export interface FinancialStatement {
   totalEquity?: number;
   totalEquityGrossMinorityInterest?: number;
   commonStockEquity?: number;
+  /**
+   * Minority interest and preferred equity as the company's 10-K or 10-Q tags them for the date: on a quarter Gloom
+   * Cloud reads from the filing alone, which has no equity lines.
+   */
+  minorityAndPreferredEquity?: number;
   commonStock?: number;
   capitalStock?: number;
   additionalPaidInCapital?: number;
@@ -917,12 +1242,37 @@ export interface PricePoint {
    * or comparison with a day's count takes it.
    */
   venueVolume?: { venue: string; volume: number };
+  /**
+   * What the bar's volume counts, when the source says: `aggregate` for a
+   * total across venues (a coin's daily bar), `3 spot venues` for a sum over
+   * those (a coin's intraday bar).
+   */
+  volumeBasis?: string;
   /** The bar's period had not ended when it was served: its close is the latest price, and it may have no volume yet. */
   partial?: boolean;
   /** The bar's prices were rebuilt from shorter bars where the source left it empty or too coarse. */
   filled?: boolean;
   /** A future's session that has closed but whose settlement is not confirmed yet: its close is the last trade. */
   unsettled?: boolean;
+  /** An index session's closing print as its last intraday bar, from its daily bar: the source keeps only the latest session's. */
+  sessionClose?: boolean;
+  /** An index session's last intraday bar, which ends before its close: its closing print was not at hand. */
+  beforeClose?: boolean;
+  /**
+   * The source served the bar in the wrong unit (a tenth or a hundredth of its price, ten or a hundred times its
+   * volume): the factor its prices were multiplied by to match the bars around it; its volume was divided by it.
+   */
+  rescaled?: number;
+  /** A continuous future's bar (NG=F): the contract it closes on (NGZ26). A change from the bar before is a roll. */
+  contract?: string;
+  /** A currency pair's daily bar whose source repeated its open as its close: the close is the next session's open. */
+  closeRebuilt?: boolean;
+  /**
+   * A currency pair's daily bar whose source repeated its open as its close, which no next open in its week rebuilds
+   * (none, or one over 5% away): its close is no day's close, and returns leave the bar out
+   * (pricePointCloseCopied).
+   */
+  closeCopied?: boolean;
 }
 
 export interface StatementHistoryAttempt {
@@ -995,6 +1345,8 @@ export interface TickerFinancials {
   nextEarnings?: NextEarnings;
   annualStatements: FinancialStatement[];
   quarterlyStatements: FinancialStatement[];
+  /** Twelve months to the latest half or quarter where the quarters do not give them (a half-yearly reporter). */
+  trailingStatement?: FinancialStatement & { trailing: StatementTrailing };
   priceHistory: PricePoint[];
   /** Acquired history cadence. Null explicitly marks an opaque provider default; absent on legacy snapshots. */
   priceHistoryResolution?: import("../time-series/resolution").ManualChartResolution | null;
@@ -1004,6 +1356,23 @@ export interface TickerFinancials {
   priceHistorySourceKey?: string;
   /** Present on extended statement history from the cloud. */
   epsEstimates?: EpsEstimateHistory;
+  /** The close a balance sheet in another currency than the market cap converts at, where the EV is bridged here (withBalanceSheetRate). */
+  balanceSheetRate?: BalanceSheetRate;
+}
+
+/**
+ * Units of `to` per unit of `from` at our daily FX closes on the balance sheet's `date`, or the last trading day
+ * before it (`closeDate`): what the enterprise value bridge converts a balance sheet's debt and cash at, as Gloom
+ * Cloud's bridge does (CNY/HKD 1.0921 for Pop Mart's June 2026 sheet).
+ */
+export interface BalanceSheetRate {
+  from: string;
+  to: string;
+  /** YYYY-MM-DD of the balance sheet. */
+  date: string;
+  rate: number;
+  /** YYYY-MM-DD of the close read: `date`, or the trading day before it. */
+  closeDate: string;
 }
 
 export interface OptionContract {
@@ -1024,6 +1393,18 @@ export interface OptionContract {
   lastTradeDate: number;
   /** Millisecond timestamp for the latest streamed quote applied to this snapshot. */
   lastUpdated?: number;
+  /**
+   * The quote cannot be priced: it is from before the chain's session, or its
+   * ask is under intrinsic value. Its bid and ask are shown, marked stale; no
+   * implied volatility, greek or surface point is read from it.
+   */
+  quoteStale?: boolean;
+  /**
+   * A contract adjusted for a corporate action (root ETHA1 beside ETHA): it
+   * prices another deliverable, so a chain lists it only when asked to, with
+   * what it delivers ("15 ETHA + 120.5 USD cash"; null when the source does not say).
+   */
+  adjusted?: { root: string; deliverable: string | null };
   /**
    * A venue's own mark, for a venue that marks every contract (Deribit): the
    * premium in `currency`, its implied volatility (a decimal) and Black-76

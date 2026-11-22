@@ -3,7 +3,7 @@ import { act, useReducer, useRef, type Dispatch } from "react";
 import { apiClient } from "../../../api-client";
 import { ApiRequestError } from "../../../api-client/errors";
 import { createSignedInBrokerAdapter } from "../../../brokers/signed-in/adapter";
-import { refreshSignedInBrokers, resetSignedInBrokerCatalog } from "../../../brokers/signed-in/catalog";
+import { refreshSignedInBrokersAndWait, resetSignedInBrokerCatalog } from "../../../brokers/signed-in/catalog";
 import type { SignedInBroker } from "../../../brokers/signed-in/client";
 import * as signInDialog from "../../../brokers/signed-in/sign-in-dialog";
 import { FormModalHost } from "../../../components/form-modal";
@@ -165,6 +165,27 @@ async function pressKey(key: Parameters<ReturnType<typeof tui.setup>["mockInput"
   await tui.setup().renderOnce();
 }
 
+/**
+ * Presses `key` and draws no frame until a 0 ms timer has run: what a fast
+ * machine does when the key lands within a frame interval of the last frame,
+ * which the renderer holds back. Anything that only waits for a timer then
+ * measures a layout the terminal has not drawn yet.
+ */
+async function pressKeyBeforeFrame(key: Parameters<ReturnType<typeof tui.setup>["mockInput"]["pressKey"]>[0]) {
+  const renderer = tui.setup().renderer as unknown as { loop: () => Promise<void> };
+  const loop = renderer.loop;
+  renderer.loop = async () => {};
+  try {
+    await act(async () => {
+      tui.setup().mockInput.pressKey(key);
+    });
+    await Bun.sleep(1);
+  } finally {
+    renderer.loop = loop;
+  }
+  await tui.setup().renderOnce();
+}
+
 async function pressArrow(direction: "up" | "down") {
   await act(async () => {
     tui.setup().mockInput.pressArrow(direction);
@@ -217,7 +238,7 @@ async function fakeCloud({ connects }: { connects: boolean }) {
     }
     return { status: connects ? "connected" : "not_connected" };
   }) as typeof apiClient.brokerRequest));
-  await refreshSignedInBrokers({ force: true });
+  await refreshSignedInBrokersAndWait({ force: true });
 }
 
 describe("BrokersPane", () => {
@@ -379,7 +400,8 @@ describe("BrokersPane", () => {
 
     await pressKey("e");
     expect(frame()).not.toContain("Cancel");
-    await pressKey("RETURN");
+    // Measured before the error line is drawn, the buttons are a row short and Save stays below the fold.
+    await pressKeyBeforeFrame("RETURN");
     await settle();
     expect(calls).toEqual([]);
     const lines = frame().split("\n");
@@ -520,6 +542,17 @@ describe("BrokersPane", () => {
     await settle();
     expect(frame()).toContain("No broker profiles.");
 
+    // With no profile, the state itself offers the add that a starts: pressed, or answering Enter.
+    expect(frame()).toContain("Add Broker Account");
+    await tui.clickFrameText("Add Broker Account");
+    await settle();
+    expect(frameLine("Robinhood")).toContain("Sign in");
+    await pressEscape();
+    expect(frame()).not.toContain("Robinhood");
+    await pressKey("RETURN");
+    expect(frameLine("Robinhood")).toContain("Sign in");
+    await pressEscape();
+
     await pressKey("a");
     expect(frame()).toContain("Add Broker Account");
     expect(frameLine("Robinhood")).toContain("Sign in");
@@ -527,7 +560,7 @@ describe("BrokersPane", () => {
     expect(frameLine("SimpleFIN")).toContain("On this device");
     expect(frameLine("Test Broker")).toContain("Sign in, or on this device");
     await pressEscape();
-    expect(frame()).not.toContain("Add Broker Account");
+    expect(frame()).not.toContain("Robinhood");
 
     // Offered both ways: how to connect comes first.
     await pressKey("a");
@@ -660,9 +693,9 @@ describe("BrokersPane", () => {
     expect(frame()).toContain("signed-in-new");
   }, 15_000);
 
-  test("c renews a sign-in the pane knows is connected or ending, and is a plain connect otherwise", async () => {
+  test("c renews a sign-in the pane knows is connected or has an end, and is a plain connect otherwise", async () => {
     const calls: string[] = [];
-    const asked: Array<{ renew?: boolean }> = [];
+    const asked: Array<{ renew?: boolean; replace?: string | null }> = [];
     const connectedAt = new Date(Date.now() - 6.5 * 24 * 3_600_000).toISOString();
     let connection: Record<string, unknown> = { status: "connected", connectedAt };
     spies.push(spyOn(apiClient, "isSignedIn").mockReturnValue(true));
@@ -670,7 +703,7 @@ describe("BrokersPane", () => {
       path === "" ? connection : { accounts: [], positions: [] }
     )) as typeof apiClient.brokerRequest));
     spies.push(spyOn(signInDialog, "requestBrokerSignIn").mockImplementation(async (_broker, options) => {
-      asked.push({ renew: options?.renew });
+      asked.push({ renew: options?.renew, replace: options?.replace });
       return false;
     }));
     const profile = (id: string): BrokerInstanceConfig => ({ id, brokerType: "signed-in", label: id, connectionMode: "ibkr", config: {}, enabled: true });
@@ -678,11 +711,25 @@ describe("BrokersPane", () => {
     const syncedAdapter = createSignedInBrokerAdapter({ findBroker: () => null });
     await syncedAdapter.listAccounts!(profile("synced"));
     const ending = { status: "connected", connectedAt, expiresAt: new Date(Date.now() + 5 * 3_600_000).toISOString(), expiresSoon: true };
+    // Days from its end: shown all the same, and renewable early.
+    const far = { status: "connected", connectedAt, expiresAt: new Date(Date.now() + 4 * 24 * 3_600_000).toISOString(), expiresSoon: false };
 
-    for (const [id, answer, renews] of [
-      ["synced", { status: "connected", connectedAt }, true],
-      ["flagged", ending, true],
-      ["plain", { status: "connected", connectedAt }, false],
+    const ended = { status: "reauth_required", connectedAt, expiresAt: null, expiresSoon: false };
+
+    // A Gloom server from before `replacePrompt` says nothing, and only a renewal of a broker that keeps one
+    // connection is known to ask (this one keeps several). One that says is followed, ended or not.
+    for (const [id, answer, renews, replace] of [
+      ["synced", { status: "connected", connectedAt }, true, null],
+      ["flagged", ending, true, null],
+      ["far", far, true, null],
+      ["plain", { status: "connected", connectedAt }, false, null],
+      ["live", { ...far, replacePrompt: "will" }, true, "will"],
+      // Ended on the broker's clock: it still lists Gloom's connection and asks to replace it.
+      ["clock", { ...ended, lastError: "invalid_grant: Authorization grant has expired", replacePrompt: "will" }, false, "will"],
+      // Another app took the account's one connection: nothing of Gloom's left to replace.
+      ["taken", { ...ended, lastError: "invalid_grant: Invalid authorization status", replacePrompt: null }, false, null],
+      // An end Gloom cannot tell from the user removing Gloom at the broker.
+      ["unsure", { ...ended, lastError: "HTTP 401", replacePrompt: "may" }, false, "may"],
     ] as const) {
       asked.length = 0;
       connection = answer;
@@ -690,9 +737,11 @@ describe("BrokersPane", () => {
       await tui.render(<Harness calls={calls} instances={[profile(id)]} adapters={[testBroker, adapter]} height={30} />, { width: 92, height: 30 });
       await settle();
       await settle();
+      // The row says when the broker ends the sign-in, whenever it has an end.
+      expect(frame().includes("Ends ")).toBe(Boolean(answer.expiresAt));
       await pressKey("c");
       await settle();
-      expect(asked).toEqual([{ renew: renews }]);
+      expect(asked).toEqual([{ renew: renews, replace }]);
       // Said in the profile's detail; nothing on the row changed.
       await pressKey("RETURN");
       expect(frame()).toContain(renews ? "sign-in was not renewed." : "was not connected.");

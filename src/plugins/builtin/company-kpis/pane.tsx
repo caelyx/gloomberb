@@ -3,8 +3,9 @@ import { isAccessDenied } from "../../../api-client/errors";
 import { usePlanAccess } from "../../../api-client/plan-access";
 import type { KpiObservation } from "../../../api-client/company-kpis";
 import { listingAbroad } from "../../../api-client/paths";
-import { ChartTableHeader, DataTableStackView, DetailScrollBody, EmptyState, KeyValueRow, PaneStatusBody, QueryBar, SectionHeading,
+import { ChartTableHeader, DataTableStackView, DetailScrollBody, EmptyState, KeyValueRow, Notice, PaneStatusBody, QueryBar, SectionHeading,
   useChartTableSelection, usePaneMenuItems, usePaneNoticeFooter, usePaneStatusFooter, usePaneTabs, type DataTableCell, type PaneHint } from "../../../components";
+import { useCompanyDataFooter } from "../../../components/layout/pane/status-footer";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { useAsyncResource, useAutoRefresh, usePaneSettingValue, usePluginAppActions, usePluginPaneState } from "../../../public/react";
 import { usePaneTickerIdentity } from "../../../state/hooks/pane-ticker";
@@ -20,12 +21,14 @@ import { Blurred, LockedOverlay, UpgradeLabel } from "../shared/locked-rows";
 import { isCloudSessionRequired, useResearchCloudSession } from "../shared/research-cloud-session";
 import { cachedCompanyData, loadCompanyData, KPI_UNAVAILABLE, validateCompanyData, type CompanyDataset, type CompanyMode } from "./client";
 import { useCompanyEvidence } from "./screenshot-evidence";
-import { allGuidance, allObservations, basisLabel, changeText, changeTone, companyCellText, companyColumns, dimensionLabel, directionLabel, directionTone, guideGroupKey, guidanceSeries, fiscalLabel,
+import { allGuidance, allObservations, basisLabel, changeText, changeTone, companyCellText, companyColumns, companyEmptyState, dimensionLabel, directionLabel, directionTone, fitCompanyColumns, guideGroupKey, guidanceSeries, guidanceIssueNote, fiscalLabel,
   isGuidance, exactObservation, observationValue, observationChange, observationChart, periodOrder, outcomeLabel, QUIET_COLUMNS, rangeText, scopeWords, seriesDetail, seriesLabel, seriesLabels, seriesName,
   seriesOrder, unitLabel, valueText, companyPreviewNote, type CompanyRow } from "./model";
 import { PriceSparkline } from "../../../components/price-sparkline/view";
 import type { PricePoint } from "../../../types/financials";
 import { toneColor, withoutQuietColumns } from "../shared/research-cells";
+import { logFailure } from "../../../utils/log-failure";
+import { currentKpiSeries } from "./latest";
 
 /** A locked placeholder, or with `note` the line above them saying what free shows and what Pro adds. */
 type Item = { id: string; row: CompanyRow } | { id: string; row: null; note?: string };
@@ -47,7 +50,7 @@ function DisclosureEvidence({ row, sourceId, onSource, width }: { row: CompanyRo
     <KeyValueRow label="Revision" value={`${row.revision}${row.current ? " · current" : " · superseded"}${!isGuidance(row) && (row.conflict || row.contested) ? " · conflicting disclosures" : ""}`} labelWidth={18} />
     {row.revisionReason ? <KeyValueRow label="Correction" value={row.revisionReason} labelWidth={18} /> : null}
     {isGuidance(row) ? <>
-      <KeyValueRow label="Issued" value={row.issuedDate} detail={directionLabel(row.direction)} labelWidth={18} />
+      <KeyValueRow label="Issued" value={row.issuedDate} detail={directionLabel(row)} labelWidth={18} />
       <KeyValueRow label="Source range" value={row.rangeText} labelWidth={18} />
       {row.conditions ? <KeyValueRow label="Conditions" value={row.conditions} labelWidth={18} /> : null}
       <KeyValueRow label="Later actual" value={row.actual ? valueText(row, row.actual.value) : "Pending"} detail={row.actual ? outcomeLabel(row) : undefined} labelWidth={18} />
@@ -91,7 +94,7 @@ function CompanyView({ symbol, exchange, name, mode, width, height, focused }: P
   const accessKey = `${session.requestKey}:${access.hasProAccess ? "full" : "preview"}`;
   const openUpgrade = useCloudUpgradeAction(mode === "kpis" ? "kpis" : "guide");
   const [snapshotSetting] = usePaneSettingValue<CompanyDataset | null>("companySnapshot", null);
-  const snapshot = useMemo(() => { try { return snapshotSetting ? validateCompanyData(snapshotSetting) : null; } catch { return null; } }, [snapshotSetting]);
+  const snapshot = useMemo(() => { try { return snapshotSetting ? validateCompanyData(snapshotSetting) : null; } catch (error) { return logFailure("company-kpis.pane", "Validate company disclosures snapshot failed", null)(error); } }, [snapshotSetting]);
   const loader = useCallback((force: boolean) => snapshot ? Promise.resolve({ payload: snapshot, stale: false, refreshError: null })
     : loadCompanyData(mode, symbol!, accessKey, force, { exchange, name }), [mode, symbol, exchange, name, accessKey, snapshot]);
   const resource = useAsyncResource(symbol ? loader : null, { initialData: () => symbol ? cachedCompanyData(mode, symbol, accessKey, { exchange, name }) : null, clearOnError: isAccessDenied });
@@ -115,6 +118,8 @@ function CompanyView({ symbol, exchange, name, mode, width, height, focused }: P
   const guides = useMemo(() => guidance ? allGuidance(guidance) : [], [guidance]);
   const allRows = useMemo<CompanyRow[]>(() => [...observations, ...guides], [observations, guides]);
   const eligible = useMemo(() => allRows.filter((row) => metric === "all" || row.metricId === metric), [allRows, metric]);
+  // The table lists the series the company still reports (currentKpiSeries); the chart and evidence every figure.
+  const latestIds = useMemo(() => new Set(kpis ? currentKpiSeries(kpis.series).map((series) => series.latest.id) : []), [kpis]);
   const plotOptions = useMemo(() => mode === "kpis"
     ? [...new Map(eligible.filter((row) => !isGuidance(row)).map((row) => [`${row.seriesKey}:${row.period.kind}`, { value: `${row.seriesKey}:${row.period.kind}`, label: `${desktop ? seriesName(row) : seriesLabel(row)} · ${row.period.kind}` }])).values()]
     : [...new Map(eligible.filter(isGuidance).map((row) => [guideGroupKey(row), { value: guideGroupKey(row), label: `${desktop ? seriesName(row) : seriesLabel(row)} · ${row.period.label}` }])).values()], [eligible, mode, desktop]);
@@ -122,7 +127,7 @@ function CompanyView({ symbol, exchange, name, mode, width, height, focused }: P
   const rows = useMemo(() => {
     const values = eligible.filter((row) => tab === "chart" ? (isGuidance(row) ? guideGroupKey(row) : `${row.seriesKey}:${row.period.kind}`) === activePlot
       : tab === "history" ? isGuidance(row) && !!row.actual
-      : tab === "evidence" ? true : isGuidance(row) ? guidance?.guidance.some((current) => current.id === row.id) : kpis?.series.some((series) => series.latest.id === row.id));
+      : tab === "evidence" ? true : isGuidance(row) ? guidance?.guidance.some((current) => current.id === row.id) : latestIds.has(row.id));
     const key = (row: CompanyRow): string | number | null => {
       const guide = isGuidance(row) ? row : null;
       return sort.column === "metric" ? row.metric.name : sort.column === "value" ? guide ? guide.point ?? guide.low ?? guide.high : (row as KpiObservation).value
@@ -130,7 +135,7 @@ function CompanyView({ symbol, exchange, name, mode, width, height, focused }: P
         : sort.column === "actual" ? guide?.actual?.value ?? null : sort.column === "outcome" ? guide ? outcomeLabel(guide) : null
         : sort.column === "basis" ? row.basis : sort.column === "unit" ? unitLabel(row) : sort.column === "scope" ? dimensionLabel(row.dimensions)
         : sort.column === "published" ? row.evidence[0]!.publishedAt : sort.column === "revision" ? row.revision
-        : sort.column === "quote" ? row.evidence[0]!.quote : sort.column === "change" ? guide ? guide.direction : observationChange(row as KpiObservation, observations).value
+        : sort.column === "quote" ? row.evidence[0]!.quote : sort.column === "change" ? guide ? directionLabel(guide) : observationChange(row as KpiObservation, observations).value
         : periodOrder(row);
     };
     const direction = sort.direction === "asc" ? 1 : -1;
@@ -139,15 +144,19 @@ function CompanyView({ symbol, exchange, name, mode, width, height, focused }: P
       return x === null || y === null ? x === y ? a.id.localeCompare(b.id) : x === null ? 1 : -1
         : (x < y ? -1 : x > y ? 1 : a.metric.name.localeCompare(b.metric.name) || dimensionLabel(a.dimensions).localeCompare(dimensionLabel(b.dimensions)) || a.id.localeCompare(b.id)) * direction;
     });
-  }, [eligible, tab, activePlot, guidance, kpis, sort, observations, desktop]);
+  }, [eligible, tab, activePlot, guidance, latestIds, sort, observations, desktop]);
   const selected = rows.find((row) => row.id === selectedId) ?? rows[0];
   const openRow = allRows.find((row) => row.id === openId);
   const activeRow = openRow ?? selected;
   const preview = data?.access === "preview" && data.lockedRows > 0;
   const lockedCount = preview ? Math.min(3, data.lockedRows) : 0;
   const previewNote = preview ? companyPreviewNote(data, mode === "guidance") : null;
-  const items = useMemo<Item[]>(() => [...rows.map((row) => ({ id: row.id, row })), ...(previewNote ? [{ id: "note:preview", row: null, note: previewNote }] : []),
-    ...Array.from({ length: lockedCount }, (_, index) => ({ id: `locked:${index}`, row: null }))], [rows, lockedCount, previewNote]);
+  const items = useMemo<Item[]>(() => [...rows.map((row) => ({ id: row.id, row })),
+    ...Array.from({ length: lockedCount }, (_, index) => ({ id: `locked:${index}`, row: null }))], [rows, lockedCount]);
+  const issueNotes = guidance?.guidance.flatMap((row) => {
+    const note = guidanceIssueNote(row, guidance.guidance);
+    return note ? [`${row.metric.name}: ${note}.`] : [];
+  }) ?? [];
   // One trend per series beside its latest value, once a series has three comparable points.
   const trends = useMemo(() => {
     const map = new Map<string, PricePoint[]>();
@@ -158,8 +167,13 @@ function CompanyView({ symbol, exchange, name, mode, width, height, focused }: P
     }
     return map;
   }, [kpis]);
-  const columns = useMemo(() => withoutQuietColumns(companyColumns(mode === "guidance", tab === "evidence", tab === "history", mode === "kpis" && tab === "table" && trends.size > 0 && width >= 100, desktop),
-    rows, (row, id) => id === "basis" ? basisLabel(row.basis) : id === "scope" ? dimensionLabel(row.dimensions) || "Consolidated" : "", QUIET_COLUMNS), [mode, tab, trends, rows, width, desktop]);
+  const columns = useMemo(() => {
+    const shown = withoutQuietColumns(companyColumns(mode === "guidance", tab === "evidence", tab === "history", mode === "kpis" && tab === "table" && trends.size > 0 && width >= 100, desktop),
+      rows, (row, id) => id === "basis" ? basisLabel(row.basis) : id === "scope" ? dimensionLabel(row.dimensions) || "Consolidated" : "", QUIET_COLUMNS);
+    // Evidence is a wide ledger that scrolls; the other tabs fit the pane.
+    return tab === "evidence" ? shown : fitCompanyColumns(shown, width, tab === "history");
+  }, [mode, tab, trends, rows, width, desktop]);
+  const emptyState = companyEmptyState(mode, symbol ?? "", { tab, hasRows: allRows.length > 0 });
   const metricOptions = useMemo(() => [{ value: "all", label: "All metrics" }, ...[...new Map(allRows.map((row) => [row.metricId, { value: row.metricId, label: row.metric.name }])).values()]], [allRows]);
   const kpiChart = useMemo(() => observationChart(rows.filter((row): row is KpiObservation => !isGuidance(row)), colors.warning), [rows, colors.warning]);
   const series = useMemo(() => tab !== "chart" ? [] : mode === "kpis" ? kpiChart.series
@@ -171,7 +185,7 @@ function CompanyView({ symbol, exchange, name, mode, width, height, focused }: P
     ...(mode === "guidance" ? [{ value: "history", label: "History" }] : []), { value: "evidence", label: "Evidence" }], activeValue: tab,
     onSelect: (value) => { setTab(value); setOpen(null); }, focused, dense: true } : null);
   useAutoRefresh(resource.updatedAt, resource.load);
-  usePaneRefreshKey(() => void resource.reload(), { focused });
+  usePaneRefreshKey(() => resource.reload(), { focused });
   useCompanyEvidence(data ?? null, mode, tab, rows.map((row) => row.id));
   const hints: PaneHint[] = [
     ...(activeRow ? [{ id: "evidence", key: "e", label: "vidence", onPress: () => setOpen(activeRow.id) },
@@ -190,6 +204,8 @@ function CompanyView({ symbol, exchange, name, mode, width, height, focused }: P
   usePaneNoticeFooter({ registrationId: "company-kpis:notices", focused, notices: [resource.data?.refreshError,
     data?.truncated && data.access === "full" ? "The response reached its stored-record limit. Narrow the metric or date range in a CLI or REST query." : null,
     data?.coverage.conflicts ? "Conflicting disclosures are retained in Evidence and excluded from comparable trends." : null].filter((value): value is string => !!value) });
+  // A receipt's or foreign line's disclosures are its company's, read from the home line.
+  useCompanyDataFooter(data?.companyFrom);
   if (!symbol) return <EmptyState title="Select a ticker." />;
   if (signInWall) return <SignInWall placement="company-kpis-signin" action={mode === "guidance" ? "view company guidance" : "view company KPIs"} needsVerification={session.needsVerification} />;
   const bodyHeight = Math.max(3, height - tabRows);
@@ -209,12 +225,12 @@ function CompanyView({ symbol, exchange, name, mode, width, height, focused }: P
       if (!points) return { text: "" };
       const change = observationChange(row as KpiObservation, observations).value;
       const tone = changeTone(row as KpiObservation, change);
-      return { text: "", content: <PriceSparkline priceHistory={points} width={column.width} period="all" trend={tone === "muted" ? "neutral" : tone} /> };
+      return { text: "", content: <PriceSparkline priceHistory={points} width={column.width} period="all" trend={tone === "positive" || tone === "negative" ? tone : "neutral"} /> };
     }
     if (column.id === "change") {
-      if (guide) return { text: directionLabel(guide.direction), color: toneColor(directionTone(guide.direction), colors), keepColorWhenSelected: guide.direction === "raised" || guide.direction === "cut" };
+      if (guide) return { text: directionLabel(guide), color: toneColor(directionTone(guide), colors), keepColorWhenSelected: guide.direction === "raised" || guide.direction === "cut" };
       const change = observationChange(row as KpiObservation, observations);
-      return { text: changeText(change), value: change.value, color: toneColor(changeTone(row as KpiObservation, change.value), colors) };
+      return { text: changeText(change), value: change.value, color: toneColor(changeTone(row as KpiObservation, change.value, change.notMeaningful), colors) };
     }
     if (desktop && column.id === "metric") {
       // The series in plain words: the metric bright, what tells it apart dim. The detail starts from no width and takes
@@ -225,7 +241,9 @@ function CompanyView({ symbol, exchange, name, mode, width, height, focused }: P
         {detail ? <ClippedText fg={state.selected ? colors.selectedText : colors.textDim} lead="  " text={detail} width={column.width} flex="1 1 0%" /> : null}
       </Box> };
     }
-    const text = companyCellText(row, column.id, observations);
+    const text = column.id === "metric" && !columns.some((entry) => entry.id === "basis")
+      ? [row.metricId === "eps" ? "EPS" : row.metric.name, seriesDetail(row)].filter(Boolean).join(" · ")
+      : companyCellText(row, column.id, observations);
     return { text, ...(column.id === "value" && !guide ? { value: exactObservation(row as KpiObservation) ? (row as KpiObservation).value : observationValue(row as KpiObservation) } : column.id === "actual" ? { value: guide?.actual?.value } : {}),
       color: column.id === "metric" ? colors.textBright : column.id === "value" || column.id === "actual" ? colors.textBright
         : column.id === "outcome" && guide?.actual ? guide.actual.favorable === "beat" ? colors.positive : guide.actual.favorable === "miss" ? colors.negative : colors.text
@@ -244,12 +262,17 @@ function CompanyView({ symbol, exchange, name, mode, width, height, focused }: P
         detailScrollRef={detailScrollRef} detailContent={openRow ? <DetailScrollBody ref={detailScrollRef} resetScrollKey={openRow.id}><DisclosureEvidence row={openRow} sourceId={sourceId} onSource={setSource} width={width} /></DetailScrollBody> : null}
         sortColumnId={sort.column} sortDirection={sort.direction} onHeaderClick={(column) => setSort((previous) => ({ column, direction: previous.column === column && previous.direction === "desc" ? "asc" : "desc" }))}
         resetScrollKey={`${mode}:${symbol}:${tab}:${metric}:${activePlot}`}
-        emptyStateTitle={tab === "history" ? "Actuals have not been matched to these guidance periods yet." : "No disclosed observations for this selection yet."}
+        emptyStateTitle={emptyState.title} emptyStateHint={emptyState.hint}
         rootBefore={<ChartTableHeader width={width} height={bodyHeight} tableRows={items.length} tableColumns={columns} query={query}
           chart={tab === "chart" ? { series, ...(mode === "kpis" ? { xAxis: kpiChart.xAxis, viewport: kpiChart.viewport } : {}), empty: preview ? "Full history is available with Pro." : "History is accumulating. Two comparable disclosures are needed for a trend.",
             formatValue: (value) => selected ? `${valueText(selected, value)}${selected.currency ? ` ${unitLabel(selected)}` : ""}` : String(value),
             formatAxisValue: (value) => selected ? valueText(selected, value) : String(value), remoteKind: "company-disclosure-history", ...link } : null} />}
-        bodyAfter={lockedCount && desktop ? <LockedOverlay rows={lockedCount} text="Upgrade for all disclosures and history" onPress={openUpgrade} /> : undefined}
+        bodyAfter={<Box flexDirection="column" width={width}>
+          {mode === "guidance" && selected && !columns.some((column) => column.id === "period") ? <Notice tone="muted">{`${seriesName(selected)} · ${fiscalLabel(selected)}`}</Notice> : null}
+          {issueNotes.map((note) => <Notice key={note}>{note}</Notice>)}
+          {previewNote ? <Notice tone="muted">{previewNote}</Notice> : null}
+          {lockedCount && desktop ? <LockedOverlay rows={lockedCount} text="Upgrade for all disclosures and history" onPress={openUpgrade} /> : null}
+        </Box>}
       /> : null}
     </PaneStatusBody>
   </Box>;

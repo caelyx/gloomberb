@@ -2,18 +2,18 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DataTableView, EmptyState, PaneStatusBody, usePaneFooter, usePaneNoticeFooter, usePaneTabs,
   type DataTableCell, type DataTableColumn, type PaneHint } from "../../../components";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
-import { getTableWidth } from "../../../components/ui/table-layout";
+import { getTableWidth, markHiddenTableColumns } from "../../../components/ui/table-layout";
 import { usePlanAccess } from "../../../api-client/plan-access";
 import { useAsyncResource, useAutoRefresh, usePaneSettingValue, usePluginAppActions, usePluginPaneState, useTickers } from "../../../public/react";
 import type { PaneProps } from "../../../types/plugin";
 import { Box } from "../../../ui";
 import { isUsListingExchange } from "../../../utils/exchanges";
-import { displayWidth } from "../../../utils/format";
+import { MISSING_VALUE, displayWidth } from "../../../utils/format";
 import { CLOUD_PLAN_KEY, useCloudUpgradeAction } from "../shared/cloud-upgrade";
 import { UpgradeLabel } from "../shared/locked-rows";
 import { useResearchCloudSession } from "../shared/research-cloud-session";
 import { cachedRippleSources, loadRipple, rippleRouteSettings } from "./client";
-import { hopLabel, revenueOwner, RIPPLE_DAYS, type RippleRow, type SecondHopRow } from "./model";
+import { hopLabel, revenueOwner, rippleEmptyText, type RippleRow, type SecondHopRow } from "./model";
 
 /** Calls per refresh stay bounded: one disclosure request per holding, plus one graph request per holding on the second hop. */
 const RIPPLE_HOLDINGS_LIMIT = 60;
@@ -23,7 +23,7 @@ const TABS = [{ value: "direct", label: "1 hop" }, { value: "two-hop", label: "2
 const COLUMNS: DataTableColumn[] = [
   { id: "date", label: "Date", width: 11, align: "left" },
   { id: "timing", label: "Time", width: 5, align: "left" },
-  { id: "company", label: "Reports", width: 24, align: "left" },
+  { id: "company", label: "Reports", width: 24, flexGrow: 1, align: "left" },
   { id: "link", label: "Link", width: 13, align: "left" },
   { id: "holding", label: "Holding", width: 9, align: "left" },
   { id: "pct", label: "Revenue share", width: 15, align: "right" },
@@ -91,36 +91,36 @@ function secondHopLayout(width: number, rows: readonly SecondHopRow[]) {
     add();
     if (room() < 0) undo();
   }
-  return { columns: columns(), firstHopWidth };
+  return { columns: markHiddenTableColumns(SECOND_HOP_COLUMNS, columns()), firstHopWidth };
 }
 
 const move = (row: RippleRow | SecondHopRow): DataTableCell =>
-  ({ text: row.averageMove == null ? "--" : `±${(row.averageMove * 100).toFixed(1)}%`, value: row.averageMove });
+  ({ text: row.averageMove == null ? MISSING_VALUE : `±${(row.averageMove * 100).toFixed(1)}%`, value: row.averageMove });
 
 function renderCell(row: RippleRow, column: DataTableColumn): DataTableCell {
   switch (column.id) {
     case "date": return { text: row.date };
-    case "timing": return { text: row.timing?.toUpperCase() ?? "--" };
+    case "timing": return { text: row.timing?.toUpperCase() ?? MISSING_VALUE };
     case "company": return { text: `${row.company} ${row.companyName}` };
     case "link": return { text: row.link === "customer" ? "customer of" : "supplier to" };
     case "holding": return { text: row.holding };
     case "pct": return { text: `${row.pctOfRevenue}%${row.pctScope ? "*" : ""} of ${revenueOwner(row)}`, value: row.pctOfRevenue };
     case "move": return move(row);
-    default: return { text: row.holdingDate ?? "--" };
+    default: return { text: row.holdingDate ?? MISSING_VALUE };
   }
 }
 
 function renderSecondHopCell(row: SecondHopRow, column: DataTableColumn, firstHopWidth: number): DataTableCell {
   switch (column.id) {
     case "date": return { text: row.date };
-    case "timing": return { text: row.timing?.toUpperCase() ?? "--" };
+    case "timing": return { text: row.timing?.toUpperCase() ?? MISSING_VALUE };
     case "company": return { text: `${row.company} ${row.companyName}` };
     case "link": return { text: row.link === "customer" ? "customer's customer" : "supplier's supplier" };
     case "via": return { text: row.via };
     case "holding": return { text: row.holding };
     case "shares": return { text: shareText(row, firstHopWidth, column.width), value: shareText(row, 0) };
     case "move": return move(row);
-    default: return { text: row.holdingDate ?? "--" };
+    default: return { text: row.holdingDate ?? MISSING_VALUE };
   }
 }
 
@@ -161,7 +161,7 @@ export function EarningsRipplePane({ width, height, focused }: PaneProps) {
   [holdingsKey, accessKey, graphHop]);
   const ripple = useAsyncResource(holdings.length ? loader : null);
   useAutoRefresh(ripple.updatedAt, ripple.load);
-  usePaneRefreshKey(() => { void ripple.reload(); }, { focused });
+  usePaneRefreshKey(() => { ripple.reload(); }, { focused });
   const { strip, rows: tabRows } = usePaneTabs(holdings.length ? { tabs: TABS, activeValue: tab, onSelect: setTab, focused, dense: true } : null);
 
   const rows = ripple.data?.rows ?? [];
@@ -213,8 +213,7 @@ export function EarningsRipplePane({ width, height, focused }: PaneProps) {
       : <PaneStatusBody subject={secondHop ? "two-hop supply chains" : "earnings ripple"} loading={ripple.loading && (!ripple.data || (secondHop && !second))}
         error={!ripple.data ? ripple.error : null}
         empty={secondHop ? !!second && !secondRows.length : !!ripple.data && !rows.length}
-        emptyTitle={secondHop ? `No company two disclosed hops from these holdings reports in the next ${RIPPLE_DAYS} days.`
-          : `No disclosed customer or supplier of these holdings reports in the next ${RIPPLE_DAYS} days.`}>
+        emptyTitle={ripple.data ? rippleEmptyText({ holdings, checked: ripple.data.checked, from: ripple.data.from, to: ripple.data.to, preview: truncated.length > 0, secondHop }) : undefined}>
         {secondHop
           ? <DataTableView<SecondHopRow> focused={focused} columns={secondLayout.columns} items={secondRows} rootWidth={width} rootHeight={bodyHeight}
             getItemKey={(row) => row.id} emptyStateTitle="No reports." sortColumnId={null} sortDirection="asc"

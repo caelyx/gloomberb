@@ -8,10 +8,12 @@ import type {
   BuildoutTabId,
   SortComparable,
 } from "./model/types";
+import { dropColumnsToFit } from "../../../components/ui/table-layout";
 import type { SortDirection } from "../../../utils/sort-values";
-import { metricNumber, sourceDetailEntries, textOrNull, tickerSymbol } from "./format";
+import { LIST_TIER_ORDER, listingKey, metricNumber, sourceDetailEntries, textOrNull, tickerSymbol } from "./format";
 
 export const tabs: Array<{ label: string; value: BuildoutTabId }> = [
+  { label: "Themes", value: "themes" },
   { label: "Companies", value: "companies" },
   { label: "Sites", value: "sites" },
   { label: "Intel", value: "intel" },
@@ -29,8 +31,12 @@ const listColumns: BuildoutColumn[] = [
 
 const favoriteColumn: BuildoutColumn = { id: "favorite", label: "", width: 2, align: "left" };
 
+/** A ticker chip takes its own column, as in every ticker and name table; the name takes the spare width. */
+const tickerColumn: BuildoutColumn = { id: "ticker", label: "Ticker", width: 12, align: "left" };
+
 const companyColumns: BuildoutColumn[] = [
-  { id: "company", label: "Company", width: 26, align: "left", flexGrow: 2 },
+  tickerColumn,
+  { id: "company", label: "Company", width: 16, align: "left", flexGrow: 2 },
   { id: "description", label: "Description", width: 34, align: "left", flexGrow: 2 },
   { id: "sectorTech", label: "Sector & Tech", width: 26, align: "left", flexGrow: 1 },
   { id: "criticality", label: "Criticality", width: 12, align: "left" },
@@ -44,6 +50,18 @@ const companyColumns: BuildoutColumn[] = [
   { id: "return1y", label: "1Y Rtn", width: 8, align: "right" },
   { id: "employees", label: "Employees", width: 9, align: "right" },
 ];
+
+/** A theme's companies under its board: what each does in the theme, then the figures. */
+const themeCompanyColumns: BuildoutColumn[] = [
+  tickerColumn,
+  { id: "company", label: "Company", width: 16, align: "left", flexGrow: 2 },
+  { id: "listRole", label: "Role", width: 15, align: "left" },
+  { id: "listTier", label: "Tier", width: 9, align: "left" },
+  { id: "marketCap", label: "Mkt Cap", width: 10, align: "right" },
+  { id: "revenueGrowth", label: "Growth", width: 9, align: "right" },
+  { id: "return1y", label: "1Y", width: 8, align: "right" },
+];
+const THEME_COMPANY_DROP_ORDER: readonly BuildoutColumnId[] = ["listTier", "revenueGrowth", "listRole"];
 
 const siteColumns: BuildoutColumn[] = [
   { id: "site", label: "Site Name", width: 28, align: "left", flexGrow: 2 },
@@ -159,11 +177,16 @@ export function activeRows(
   selectedList: BuildoutList | null,
 ): BuildoutRow[] {
   if (state.status !== "ready") return [];
+  if (activeTab === "themes") {
+    return selectedList && state.companies.listSlug === selectedList.slug
+      ? state.companies.items.map((item) => ({ kind: "company", item }))
+      : [];
+  }
   if (activeTab === "companies") {
     if (!selectedList) {
       return state.lists.map((item) => ({ kind: "list", item }));
     }
-    return state.companies.items.map((item) => ({ kind: "company", item }));
+    return state.companies.listSlug === selectedList.slug ? state.companies.items.map((item) => ({ kind: "company", item })) : [];
   }
   if (activeTab === "sites") {
     return state.sites.items.map((item) => ({ kind: "site", item }));
@@ -171,9 +194,32 @@ export function activeRows(
   return state.intel.items.map((item) => ({ kind: "intel", item }));
 }
 
-export function columnsForTab(activeTab: BuildoutTabId, selectedList: BuildoutList | null, canFavorite: boolean) {
+/**
+ * What the Companies tab gives up when the pane is too narrow for its figures,
+ * least needed first: the descriptions, then the columns that only add to a
+ * figure already shown, instead of the right edge cutting Market Cap or a
+ * median. The star and the names stay at every width.
+ */
+const LIST_DROP_ORDER: readonly BuildoutColumnId[] = ["listDescription", "avgMargin", "avgReturn1y", "avgSectorGrowth"];
+const COMPANY_DROP_ORDER: readonly BuildoutColumnId[] = [
+  "description", "employees", "dividendYield", "forwardPE", "netIncome", "margin", "sectorTech", "criticality",
+];
+
+/** The columns of a tab for a pane `width` cells wide; the table's scrollbar keeps its cell. */
+export function columnsForTab(
+  activeTab: BuildoutTabId,
+  selectedList: BuildoutList | null,
+  canFavorite: boolean,
+  width: number,
+): BuildoutColumn[] {
+  if (activeTab === "themes") {
+    return dropColumnsToFit(canFavorite ? [favoriteColumn, ...themeCompanyColumns] : themeCompanyColumns, width - 1, THEME_COMPANY_DROP_ORDER);
+  }
   if (activeTab === "companies") {
-    return selectedList && canFavorite ? [favoriteColumn, ...companyColumns] : selectedList ? companyColumns : listColumns;
+    const columns = selectedList
+      ? canFavorite ? [favoriteColumn, ...companyColumns] : companyColumns
+      : listColumns;
+    return dropColumnsToFit(columns, width - 1, selectedList ? COMPANY_DROP_ORDER : LIST_DROP_ORDER);
   }
   if (activeTab === "sites") return canFavorite ? [favoriteColumn, ...siteColumns] : siteColumns;
   return intelColumns;
@@ -239,6 +285,8 @@ function sortValue(row: BuildoutRow, columnId: BuildoutColumnId): SortComparable
     switch (columnId) {
       case "favorite":
         return numberSort(company.starred ? 1 : 0);
+      case "ticker":
+        return stringSort(listingKey(company.ticker, company.exchange) ?? tickerSymbol(company.ticker));
       case "company":
         return stringSort(company.name);
       case "description":
@@ -265,6 +313,10 @@ function sortValue(row: BuildoutRow, columnId: BuildoutColumnId): SortComparable
         return numberSort(company.return1y);
       case "employees":
         return numberSort(company.employeeCount);
+      case "listRole":
+        return stringSort(company.listRole);
+      case "listTier":
+        return numberSort(company.listTier && LIST_TIER_ORDER.includes(company.listTier) ? LIST_TIER_ORDER.indexOf(company.listTier) : null);
       default:
         return stringSort(rowTitle(row));
     }
@@ -352,7 +404,8 @@ export function defaultSortDirection(columnId: BuildoutColumnId | null): SortDir
 export function rowTickerSymbols(row: BuildoutRow): string[] {
   switch (row.kind) {
     case "company":
-      return [tickerSymbol(row.item.ticker)].filter((symbol): symbol is string => symbol != null);
+      return [listingKey(row.item.ticker, row.item.exchange) ?? tickerSymbol(row.item.ticker)]
+        .filter((symbol): symbol is string => symbol != null);
     case "site":
       return [
         tickerSymbol(row.item.ownerTicker),

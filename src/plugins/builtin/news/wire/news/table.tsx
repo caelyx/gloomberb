@@ -1,5 +1,6 @@
+import { MISSING_VALUE } from "../../../../../utils/format";
 import { useCallback, useEffect, useMemo, useRef, type ReactNode, type RefObject } from "react";
-import { TextAttributes, type ScrollBoxRenderable } from "../../../../../ui";
+import type { ScrollBoxRenderable } from "../../../../../ui";
 import {
   DataTableStackView,
   TickerBadgeList,
@@ -14,12 +15,13 @@ import type { MarketNewsItem } from "../../../../../types/news-source";
 import { colors } from "../../../../../theme/colors";
 import { collectNewsDisplayTickers } from "../../../../../news/ticker-symbols";
 import { useLoadNewsStory } from "../../../../../news/hooks";
-import { formatFeedTime } from "../../../../../utils/datetime-format";
 import { logFailure } from "../../../../../utils/log-failure";
 import { nextHeaderSort } from "../../../../../utils/sort-values";
-import { formatNewsCategory } from "../categories";
+import { localTimeZoneShortName } from "../../../../../utils/datetime-format";
+import { formatNewsCategoryForColumn } from "../categories";
 import { useOpenTickerChoice } from "../../../shared/ticker-choice";
 import { usePinnedMoment } from "../../../../../components/use-pinned-moment";
+import { MIN_HEADLINE_WIDTH, NEWS_SOURCE_WIDTH, NEWS_TIME_WIDTH, newsHeadlineCell, newsSourceCell, newsTimeCell } from "./row";
 
 export type NewsColumnId =
   | "rank"
@@ -114,10 +116,8 @@ function sortNewsArticles(
 
 const FIXED_COLUMN_WIDTHS: Record<Exclude<NewsColumnId, "title">, number> = {
   rank: 4,
-  // "Mon 09:10", or "Sep 18, 25" for a story from another year.
-  time: 10,
-  // Publishers and X handles: "GlobeNewswire", "@unusual_whales".
-  source: 15,
+  time: NEWS_TIME_WIDTH,
+  source: NEWS_SOURCE_WIDTH,
   tickers: 18,
   categories: 10,
   sentiment: 4,
@@ -125,9 +125,8 @@ const FIXED_COLUMN_WIDTHS: Record<Exclude<NewsColumnId, "title">, number> = {
   importance: 7,
 };
 
-const COLUMN_LABELS: Record<NewsColumnId, string> = {
+const COLUMN_LABELS: Record<Exclude<NewsColumnId, "time">, string> = {
   rank: "#",
-  time: "TIME",
   source: "SOURCE",
   title: "HEADLINE",
   tickers: "TICKERS",
@@ -140,15 +139,21 @@ const COLUMN_LABELS: Record<NewsColumnId, string> = {
 const COLUMN_TITLES: Partial<Record<NewsColumnId, string>> = {
   sentiment: "Sentiment",
 };
+/**
+ * A column's header. The times are the host's, so TIME names its zone
+ * ("TIME GMT+8"), as the story's own header names it after its time: a Hong
+ * Kong reader's "Wed 11:26" said nothing of which 11:26 (9 Nov 2026).
+ */
+function columnLabel(id: NewsColumnId, timeZone?: string): string {
+  return id === "time" ? `TIME ${localTimeZoneShortName(Date.now(), timeZone)}` : COLUMN_LABELS[id];
+}
+
 const SPELLED_SENTIMENT = "SENTIMENT";
 /** A headline at least this wide still reads with SENTIMENT spelled out beside it. */
 const SPELLED_SENTIMENT_MIN_HEADLINE_WIDTH = 60;
 
 const columnAlign = (id: NewsColumnId): "left" | "right" =>
   id === "rank" || id === "importance" ? "right" : "left";
-
-/** Below this the headline takes room back from the other columns. */
-const MIN_HEADLINE_WIDTH = 40;
 
 /**
  * What a narrowing pane gives up, in order, to keep the headline readable: a
@@ -165,7 +170,8 @@ const NARROW_STEPS: { id: Exclude<NewsColumnId, "title">; width?: number }[] = [
   { id: "importance" },
 ];
 
-export function buildColumns(width: number, requestedIds: NewsColumnId[]): NewsTableColumn[] {
+/** `timeZone` is the host's unless named, as the times are. */
+export function buildColumns(width: number, requestedIds: NewsColumnId[], timeZone?: string): NewsTableColumn[] {
   const widths = { ...FIXED_COLUMN_WIDTHS };
   let columnIds = requestedIds;
 
@@ -176,7 +182,7 @@ export function buildColumns(width: number, requestedIds: NewsColumnId[]): NewsT
   const headlineWidth = () => width + 1 - getTableWidth(columnIds.map((id) => (
     id === "title"
       ? { width: 1, align: columnAlign(id) }
-      : { width: widths[id], label: COLUMN_LABELS[id], align: columnAlign(id) }
+      : { width: widths[id], label: columnLabel(id, timeZone), align: columnAlign(id) }
   )));
 
   if (columnIds.includes("title")) {
@@ -205,7 +211,7 @@ export function buildColumns(width: number, requestedIds: NewsColumnId[]): NewsT
 
   return columnIds.map((id) => ({
     id,
-    label: id === "sentiment" && sentimentSpelled ? SPELLED_SENTIMENT : COLUMN_LABELS[id],
+    label: id === "sentiment" && sentimentSpelled ? SPELLED_SENTIMENT : columnLabel(id, timeZone),
     ...(COLUMN_TITLES[id] && !(id === "sentiment" && sentimentSpelled) ? { title: COLUMN_TITLES[id] } : {}),
     width: id === "title" ? titleWidth : widths[id],
     align: columnAlign(id),
@@ -330,19 +336,13 @@ export function NewsArticleStackView({
       case "rank":
         return { text: String(index + 1), color: tone(colors.textDim) };
       case "time":
-        return { text: formatFeedTime(item.publishedAt), value: item.publishedAt, color: tone(colors.textDim) };
+        return { ...newsTimeCell(item, { later }), value: item.publishedAt };
       case "source":
-        return { text: item.source, color: colors.textMuted };
+        return newsSourceCell(item);
       case "title":
-        return {
-          // Unclipped: the table fits it to the width the column really gets,
-          // which on desktop is wider than the width it was laid out at.
-          text: titleForArticle?.(item) ?? item.title,
-          color: tone(colors.text),
-          attributes: later || readArticleIds?.has(item.id)
-            ? TextAttributes.NONE
-            : TextAttributes.BOLD,
-        };
+        // Unclipped: the table fits it to the width the column really gets,
+        // which on desktop is wider than the width it was laid out at.
+        return newsHeadlineCell(item, { later, read: readArticleIds?.has(item.id), title: titleForArticle?.(item) });
       case "tickers": {
         const tickers = fitTickerSymbols(collectNewsDisplayTickers(item.tickers), column.width);
         return {
@@ -359,13 +359,13 @@ export function NewsArticleStackView({
       }
       case "categories":
         return {
-          text: formatNewsCategory(item.categories[0]) || "-",
+          text: formatNewsCategoryForColumn(item.categories[0]) || MISSING_VALUE,
           color: tone(colors.textDim),
         };
       case "sentiment": {
         const sentiment = item.sentiment;
         return {
-          text: sentiment ? sentiment.slice(0, 3) : "-",
+          text: sentiment ? sentiment.slice(0, 3) : MISSING_VALUE,
           color: tone(
             sentiment === "positive"
               ? colors.positive

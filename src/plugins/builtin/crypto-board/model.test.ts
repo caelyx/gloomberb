@@ -15,6 +15,7 @@ import {
   formatPegTarget,
   nextCryptoSort,
   offPegBasisPoints,
+  offPegSeverity,
   sortCryptoRows,
 } from "./model";
 import { CRYPTO_FIXTURE_NOW, cryptoFixture } from "./test-fixture";
@@ -48,6 +49,73 @@ test("a newer live quote moves price, day change, returns and market cap", () =>
   const older = entry({ price: 90, lastUpdated: Date.parse(btc.quoteTime!) - 1 });
   const [kept] = buildCryptoRows(data.assets, "coin", new Map([[cryptoQuoteKey(btc), older]]), CRYPTO_FIXTURE_NOW);
   expect(kept).toMatchObject({ price: 100, live: false });
+});
+
+test("each stablecoin row says whose its price is, and an extreme one exchange alone reached is that exchange's, kept as served", () => {
+  const data = cryptoFixture();
+  const usdt = data.assets.find((asset) => asset.code === "USDT")!;
+  const checked = ["Coinbase", "Kraken", "Bitstamp"];
+  usdt.range24h = { ...usdt.range24h!, low: 0.9901, lowVenues: ["Coinbase"], highVenues: ["Kraken", "Bitstamp"], venuesChecked: checked };
+  const rows = (quote?: Partial<Quote>) => buildCryptoRows(data.assets, "stablecoin",
+    quote ? new Map([[cryptoQuoteKey(usdt), entry({ lastUpdated: CRYPTO_FIXTURE_NOW, price: 0.9989, ...quote })]]) : new Map(), CRYPTO_FIXTURE_NOW);
+  const [board] = rows();
+  // In plain words: the low on Coinbase only, the high on two of the three exchanges read.
+  expect(board).toMatchObject({ low24h: 0.9901, low24hText: "0.9901", low24hVenueText: "Coinbase only", high24hVenueText: "2 of 3", priceVenueText: "composite" });
+  expect(rows({ price: 0.9989, priceVenue: "Coinbase", dataSource: "live" })[0]).toMatchObject({ price: 0.9989, priceVenueText: "Coinbase" });
+  // A live quote that names no exchange is its source's, not the board's composite.
+  expect(rows({ price: 0.9988, dataSource: "live", providerId: "gloomberb-cloud" })[0]).toMatchObject({ price: 0.9988, priceVenueText: "Gloom Cloud" });
+  // A composite held back says so on its own row.
+  expect(rows({ price: 0.9989, dataSource: "delayed" })[0]).toMatchObject({ delayed: true, priceVenueText: "15m delayed" });
+  // A row is reused for its asset object: each case below is a fresh board.
+  const lowVenue = (lowVenues: string[], venuesChecked: string[]) => {
+    const board = cryptoFixture();
+    const asset = board.assets.find((entry) => entry.code === "USDT")!;
+    asset.range24h = { ...asset.range24h!, lowVenues, venuesChecked };
+    return buildCryptoRows(board.assets, "stablecoin", new Map(), CRYPTO_FIXTURE_NOW)[0]!.low24hVenueText;
+  };
+  // None of those read reached it: the composite's wick was another exchange's.
+  expect(lowVenue([], checked)).toBe("other exchange");
+  // One read and not reaching it says the same; one read and reaching it is not claimed as its alone.
+  expect(lowVenue([], ["Kraken"])).toBe("other exchange");
+  expect(lowVenue(["Kraken"], ["Kraken"])).toBe("Kraken");
+  expect(lowVenue(checked, checked)).toBe("all 3");
+  // Two read and both reached it.
+  expect(lowVenue(["Coinbase", "Kraken"], ["Coinbase", "Kraken"])).toBe("both");
+});
+
+test("an extreme whose exchanges are still being read says so, never that none was read", () => {
+  const board = cryptoFixture();
+  const usdt = board.assets.find((asset) => asset.code === "USDT")!;
+  usdt.range24h = { ...usdt.range24h!, venuesPending: true };
+  expect(buildCryptoRows(board.assets, "stablecoin", new Map(), CRYPTO_FIXTURE_NOW)[0]).toMatchObject({
+    low24hVenueText: "checking", high24hVenueText: "checking",
+  });
+  // No exchange read, and none being read: a dash.
+  const read = cryptoFixture();
+  read.assets.find((asset) => asset.code === "USDT")!.range24h!.venuesPending = undefined;
+  expect(buildCryptoRows(read.assets, "stablecoin", new Map(), CRYPTO_FIXTURE_NOW)[0]).toMatchObject({ low24hVenueText: "—" });
+});
+
+test("an exchange's price outside the 24h range widens it, however old the trade, and the extreme says whose", () => {
+  // The board's prices are from 09:30 and its range runs to 11:59. Kraken's last trade, at 09:40, is newer than the
+  // board's price but inside the range's window, and above the composite's high of 1.0004.
+  const traded = Date.parse("2026-09-23T09:40:00Z");
+  const row = (quote: Partial<Quote> & Pick<Quote, "price">) => {
+    const board = cryptoFixture();
+    const usdt = board.assets.find((asset) => asset.code === "USDT")!;
+    usdt.quoteTime = "2026-09-23T09:30:00.000Z";
+    return buildCryptoRows(board.assets, "stablecoin", new Map([[cryptoQuoteKey(usdt), entry({ lastUpdated: traded, ...quote })]]), CRYPTO_FIXTURE_NOW)[0]!;
+  };
+  expect(row({ price: 1.0011, priceVenue: "Kraken", dataSource: "live" })).toMatchObject({
+    price: 1.0011, high24h: 1.0011, high24hAt: traded, high24hVenueText: "+ Kraken", high24hWidened: true,
+    low24h: 0.9983, low24hWidened: false,
+  });
+  expect(row({ price: 0.9971, priceVenue: "Coinbase", dataSource: "live" })).toMatchObject({
+    low24h: 0.9971, low24hVenueText: "+ Coinbase", low24hWidened: true, high24h: 1.0004, high24hWidened: false,
+  });
+  // Inside the range, nothing moves; nor for a composite price no newer than the range, which took it in already.
+  expect(row({ price: 1.0001, priceVenue: "Kraken", dataSource: "live" })).toMatchObject({ high24h: 1.0004, high24hWidened: false });
+  expect(row({ price: 1.0011, dataSource: "live" })).toMatchObject({ high24h: 1.0004, high24hWidened: false });
 });
 
 test("a live quote without a change percent is restated from the previous close", () => {
@@ -106,26 +174,34 @@ test("numeric columns sort largest first, then smallest, then back to rank", () 
 test("narrow panes drop 1Y, the sparkline, 30D, volume and name in that order", () => {
   const ids = (width: number) => buildCryptoColumns(width).map((column) => column.id);
   expect(ids(140)).toEqual([
-    "rank", "code", "name", "price", "changePercent", "return7d", "return30d", "return1y", "trend", "volume24h", "marketCap",
+    "rank", "code", "name", "price", "priceVenueText", "changePercent", "return7d", "return30d", "return1y", "trend", "volume24h", "marketCap",
   ]);
   expect(ids(100)).not.toContain("return1y");
   expect(ids(90)).not.toContain("trend");
   expect(ids(60)).toEqual(["rank", "code", "price", "changePercent", "return7d", "marketCap"]);
   const wide = buildCryptoColumns(200).find((column) => column.id === "name")!;
   expect(wide.width).toBe(24);
-  // Stablecoins keep the peg and the low. Supply adds its columns after the
+  // Stablecoins keep the price's venue, the peg, the low and whose it is. Supply adds its columns after the
   // market cap, and they all leave before the name, which drops where it does without them.
   const stable = (width: number, withSupply: boolean) => buildCryptoColumns(width, "stablecoin", withSupply).map((column) => column.id);
-  expect(stable(177, true)).toEqual([
-    "rank", "code", "name", "price", "pegText", "offPegBp", "low24h", "low24hAt", "high24h", "high24hAt",
-    "volume24h", "marketCap", "supply", "supply7dPercent", "supply7d", "supply30dPercent", "supply30d", "supplyShare",
+  expect(stable(209, true)).toEqual([
+    "rank", "code", "name", "price", "priceVenueText", "pegText", "offPegBp", "low24h", "low24hAt", "low24hVenueText",
+    "high24h", "high24hAt", "high24hVenueText", "volume24h", "marketCap", "supply", "supply7dPercent", "supply7d", "supply30dPercent", "supplyShare",
   ]);
-  expect(stable(119, true)).toEqual([
-    "rank", "code", "name", "price", "pegText", "offPegBp", "low24h", "low24hAt", "high24h", "high24hAt", "marketCap", "supply",
+  expect(stable(152, true)).toEqual([
+    "rank", "code", "name", "price", "priceVenueText", "pegText", "offPegBp", "low24h", "low24hAt", "low24hVenueText",
+    "high24h", "high24hAt", "high24hVenueText", "marketCap",
   ]);
-  for (const width of [109, 110]) expect(stable(width, true)).toEqual(stable(width, false));
-  expect(stable(110, false)).toContain("name");
-  expect(stable(109, false)).not.toContain("name");
+  expect(stable(111, true)).toEqual([
+    "rank", "code", "price", "priceVenueText", "pegText", "offPegBp", "low24h", "low24hAt", "low24hVenueText", "marketCap",
+  ]);
+  for (const width of [151, 152]) expect(stable(width, true)).toEqual(stable(width, false));
+  expect(stable(152, false)).toContain("name");
+  expect(stable(151, false)).not.toContain("name");
+  // Whose the low is leaves after the high, whose the price is last: each label keeps its full width while shown.
+  expect(stable(102, false)).not.toContain("low24hVenueText");
+  expect(stable(102, false)).toContain("priceVenueText");
+  expect(stable(87, false)).not.toContain("priceVenueText");
 });
 
 test("a move that rounds to zero is unsigned", () => {
@@ -145,7 +221,7 @@ test("prices show four significant digits and at least two decimals", () => {
   expect(formatCryptoPrice(null)).toBe("—");
 });
 
-test("a stablecoin is off its own target: a dollar, a euro at EUR/USD, and never a coin that accrues yield", () => {
+test("a stablecoin is off its own target: a dollar, a euro at EUR/USD, and never a coin that accrues yield or a bond token", () => {
   const usd = { currency: "USD", accrues: false, price: 1, asOf: null };
   expect(offPegBasisPoints(0.99871, usd)).toBe(-12.9);
   expect(formatOffPeg(offPegBasisPoints(1.0003, usd))).toBe("+3.0bp");
@@ -159,6 +235,11 @@ test("a stablecoin is off its own target: a dollar, a euro at EUR/USD, and never
   expect(offPegBasisPoints(1.1497, yieldCoin)).toBeNull();
   expect(formatOffPeg(null)).toBe("");
   expect(formatPegTarget(yieldCoin)).toBe("USD yield");
+  // Bond USD0 at 0.9762 is a bond priced toward par at maturity, not 238bp off a peg.
+  const bond = { currency: "USD", accrues: true, kind: "bond" as const, price: null, asOf: null };
+  expect(formatPegTarget(bond)).toBe("USD bond");
+  expect(offPegBasisPoints(0.9762, bond)).toBeNull();
+  expect(offPegSeverity(offPegBasisPoints(0.9762, bond))).toBe("none");
   // A euro coin whose rate could not be read keeps its currency and reads no deviation.
   expect(offPegBasisPoints(1.12, { ...eur, price: null })).toBeNull();
   expect(formatPegTarget({ ...eur, price: null })).toBe("EUR");

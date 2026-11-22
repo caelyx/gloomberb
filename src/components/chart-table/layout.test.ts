@@ -3,15 +3,38 @@ import { statGridRows, type StatItem } from "../ui/stat-grid";
 import { CHART_MIN_ROWS, chartTableLayout } from "./layout";
 
 const FIGURES: StatItem[] = [
-  { id: "level", label: "5Y spread", value: "235bp", detail: "2026-09-25" },
-  { id: "change", label: "1M", value: "+13bp" },
-  { id: "range", label: "Range", value: "34 to 235bp", detail: "since 2025-02-24" },
+  { id: "level", label: "5Y spread", value: "235bp", detail: "2026-09-25", essential: false },
+  { id: "change", label: "1M", value: "+13bp", essential: false },
+  { id: "range", label: "Range", value: "34 to 235bp", detail: "since 2025-02-24", essential: false },
 ];
 const CHART = { minRows: CHART_MIN_ROWS };
 // At 90 columns the three figures pack into two StatGrid rows.
 const FIGURE_ROWS_90 = statGridRows(FIGURES, 90);
 
 describe("chartTableLayout", () => {
+  test("explicitly essential figures are retained ahead of the chart", () => {
+    const figures = FIGURES.map((item) => ({ ...item, essential: true }));
+    const layout = chartTableLayout({ width: 40, height: 10, figures, tableRows: 250, chart: CHART });
+    expect(layout.figures).toEqual(figures);
+    expect(layout.mode).not.toBe("full");
+  });
+  test.each([9, 10, 12, 16])("optional figures preserve four table rows at height %i", (height) => {
+    const figures = Array.from({ length: 12 }, (_, index) => ({ label: `Metric ${index}`, value: "1234.56" }));
+    const layout = chartTableLayout({ width: 28, height, figures, tableRows: 250, chart: CHART });
+    expect(height - layout.figureRows - layout.chartRows - 1).toBeGreaterThanOrEqual(4);
+  });
+  test("essential dates survive optional figures and take room from the chart", () => {
+    const figures: StatItem[] = [
+      { label: "TTM yield", value: "3.33%", essential: true },
+      ...FIGURES,
+      { label: "Next ex", value: "2026-11-19", essential: true },
+      { label: "Next pay", value: "2027-02-03", essential: true },
+    ];
+    const layout = chartTableLayout({ width: 28, height: 10, figures, tableRows: 20, chart: CHART });
+    expect(layout.figures.filter((item) => item.essential)).toEqual(figures.filter((item) => item.essential));
+    expect(layout.figureRows).toBeGreaterThan(1);
+    expect(layout.mode).not.toBe("full");
+  });
   test("gives the chart 40% of a long table's pane", () => {
     const layout = chartTableLayout({ width: 90, height: 26, figures: FIGURES, tableRows: 250, chart: CHART });
     expect(FIGURE_ROWS_90).toBe(2);
@@ -68,9 +91,44 @@ describe("chartTableLayout", () => {
     expect(chartTableLayout({ width: 90, height: 16, tableRows: 6, chart: curve })).toMatchObject({ mode: "full", chartRows: 9 });
   });
 
+  // The stablecoin board's supply chart took about half the pane above the pegs it is read for.
+  test("a zone capped at a share of the height never takes more, its figures one row and then its chart a strip when short", () => {
+    const third = { ...CHART, maxShare: 1 / 3 };
+    // A short table would leave the chart 31 rows; a third of 40 is 13, the query bar and two figure rows among them.
+    expect(chartTableLayout({ width: 90, height: 40, queryRows: 1, figures: FIGURES, tableRows: 6, chart: third }))
+      .toMatchObject({ mode: "full", figureRows: 2, chartRows: 10 });
+    expect(chartTableLayout({ width: 90, height: 60, figures: FIGURES, tableRows: 250, chart: third })).toMatchObject({ figureRows: 2, chartRows: 18 });
+    // A third of 24 is 8: two figure rows would leave the chart less than it draws in, so the figures keep one.
+    expect(chartTableLayout({ width: 90, height: 24, queryRows: 1, figures: FIGURES, tableRows: 250, chart: third }))
+      .toMatchObject({ mode: "full", figureRows: 1, chartRows: CHART_MIN_ROWS });
+    // A third of 15 is less than the six rows a chart draws in: a strip, and the table keeps the rest.
+    expect(chartTableLayout({ width: 90, height: 15, tableRows: 250, chart: third })).toMatchObject({ mode: "strip", chartRows: 1 });
+  });
+
   test("with no chart the table and figures share the pane", () => {
     expect(chartTableLayout({ width: 90, height: 30, figures: FIGURES, tableRows: 40, chart: null }))
       .toMatchObject({ mode: "none", chartRows: 0, figureRows: FIGURE_ROWS_90 });
+  });
+
+  test("a whole-row figure wraps into rows the figures leave, never at the cost of one that fits a line; a one-row band cuts it", () => {
+    // DDIS at 45 columns, with a 10-Q row that wraps; the 13 weeks' figure wraps too.
+    const debt: StatItem[] = [
+      { id: "10q", label: "10-Q 2026-09-30", value: "Current 0 · Non-current 6.84B USD", detail: "filed 2026-10-27", detailVariants: [""], wide: true },
+      { id: "principal", label: "Principal total", value: "6.17B USD", detail: "68 pctl 10Y" },
+      { id: "next12", label: "Due next 12 months", value: "9.5%", detail: "41 pctl 10Y" },
+      { id: "13w", label: "Next 13 weeks", value: "1.2%", detail: "since 2026-10-27 · 4 pctl 10Y" },
+      { id: "as-of", label: "As of", value: "2025-12-31" },
+    ].map((item) => ({ ...item, essential: false }));
+    expect(statGridRows(debt, 43)).toBe(7);
+    // A quarter of 20 rows is 5, the five a line each; a third is 6: the 10-Q wraps, the 13 weeks keep
+    // one line, cut, and the As of stays (wrapping both would have cost it).
+    const tall = chartTableLayout({ width: 43, height: 20, figures: debt, tableRows: 6, chart: CHART });
+    expect(tall).toMatchObject({ figureMaxLines: 6, figureRows: 6 });
+    expect(tall.figures.map((item) => item.id)).toEqual(["10q", "principal", "next12", "13w", "as-of"]);
+    // A short pane's one row keeps the leading figure on its line, cut, rather than none.
+    const short = chartTableLayout({ width: 36, height: 10, figures: debt, tableRows: 250, chart: CHART });
+    expect(short).toMatchObject({ figureMaxLines: 1, figureRows: 1 });
+    expect(short.figures.map((item) => item.id)).toEqual(["10q"]);
   });
 
   test("never gives a full band fewer rows than the chart can draw in", () => {

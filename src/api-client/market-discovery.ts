@@ -21,6 +21,12 @@ export interface ScreenerQuote {
   previousClose?: number;
   /** The quote's sessions beside the live print the server ranked the row by, when the server sends them. */
   sessions?: CloudMoverSessionFields;
+  /** The listing's float as the equity screener serves it; absent where the server serves none or predates it. */
+  floatShares?: number;
+  /** Set with a float the source states no measurement date for: `partial`. */
+  floatSharesState?: "partial";
+  /** Why the float is partial, as the server says it. */
+  floatSharesReason?: string;
 }
 
 
@@ -105,6 +111,8 @@ export interface DividendSummary {
   /** The ex-date of the distribution that rate annualizes, YYYY-MM-DD. */
   forwardRateAsOf?: string | null;
   payoutRatio: number | null;
+  /** The trailing EPS fundamentals serve for the listing; only its sign is read, since a payout over a loss is not meaningful. Absent from older servers. */
+  trailingEps?: number | null;
   exDividendDate: number | null;
   dividendDate: number | null;
   currency: string | null;
@@ -117,4 +125,6 @@ export interface MarketDividendsPayload {
   summary: DividendSummary | null;
   historyError?: string;
   summaryError?: string;
+  /** When Gloom Cloud last asked for the history and the summary, ISO. Absent from older servers. */
+  triedAt?: string;
 }

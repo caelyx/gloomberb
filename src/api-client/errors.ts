@@ -1,3 +1,5 @@
+import { isNetworkFailure } from "../utils/network-failure";
+
 const HARD_SESSION_INVALID_PATTERNS = [
   /\b(user|account)\b.*\b(not found|deleted|removed|disabled|deactivated|suspended)\b/i,
   /\b(user|account)\b.*\bdoes(?:\s+not|n't)\s+exist\b/i,
@@ -18,6 +20,16 @@ export class ApiRequestError extends Error {
     super(message);
     this.name = "ApiRequestError";
   }
+}
+
+/** What a pane screenshot's local proxy answers (403) to a request the capture does not send. */
+export const SHOT_REQUEST_REFUSED = "The pane screenshot does not send this request.";
+/** What a pane draws in place of what that refusal kept from it (TheBuildout's plan). */
+export const SHOT_UNAVAILABLE = "Not available in screenshots.";
+
+/** Whether `error` is the capture's own refusal of a request, not an answer of the service. */
+export function isShotRequestRefused(error: unknown): boolean {
+  return error instanceof ApiRequestError && error.status === 403 && error.code === SHOT_REQUEST_REFUSED;
 }
 
 /**
@@ -61,6 +73,62 @@ export function isRetryableApiError(error: unknown): boolean {
   return error.code === "retryable_error" || status === 408 || status === 429 || (status !== undefined && status >= 500);
 }
 
+/**
+ * A 200 reply saying its data is unavailable this time (a board's `unavailable`
+ * status, a market answer's `retryable_error`): the server's own source did
+ * not answer. Like a 5xx it may pass, so a saved copy answers it with its note.
+ * A permanent reason (a route not served yet, an unsupported symbol or series,
+ * sign-in or entitlement) comes as its status, or as a plain error, and stays
+ * the error.
+ */
+export function sourceDidNotAnswer(message: string): ApiRequestError {
+  return new ApiRequestError(message, undefined, undefined, "retryable_error");
+}
+
+// Registered, so a mark set by another copy of this module is still read.
+const ASKED_TWICE = Symbol.for("gloomberb.listingReadAskedTwice");
+
+/**
+ * Marks a listing read's failure, or its failed answer, as the second of two
+ * asks (`CloudDataApi.readListing`). Only such a failure is said to be the data
+ * service not answering; any other 5xx keeps the server's own words.
+ */
+export function markAskedTwice<T>(value: T): T {
+  if (value && typeof value === "object" && Object.isExtensible(value) && !wasAskedTwice(value)) {
+    Object.defineProperty(value, ASKED_TWICE, { value: true });
+  }
+  return value;
+}
+
+/** Whether a failure, or a failed answer, came from a listing read asked twice (`markAskedTwice`). */
+export function wasAskedTwice(value: unknown): boolean {
+  return !!value && typeof value === "object" && (value as Record<symbol, unknown>)[ASKED_TWICE] === true;
+}
+
+/** Codes of a connection that dropped or stalled after it opened: Node's and the system's, then Bun's. */
+const INTERRUPTED_CODES = new Set(["ECONNRESET", "ECONNABORTED", "EPIPE", "ETIMEDOUT", "ConnectionClosed"]);
+
+/**
+ * A failure asking again later may get past, which a copy saved earlier may
+ * answer for: no connection, a connection that dropped, a timeout, or a server
+ * that was rate limited or overloaded (408, 429, 5xx). Anything else the
+ * server answered (another 4xx) and an answer that failed validation are
+ * refusals to show as errors, saved copy or not. A bare throw with nothing to
+ * classify is not taken for a refusal.
+ */
+export function isTransientFailure(error: unknown): boolean {
+  if (!error || typeof error !== "object") return typeof error !== "string" || isNetworkFailure(error);
+  if (isNetworkFailure(error) || isRetryableApiError(error)) return true;
+  for (let current: unknown = error, depth = 0; current && typeof current === "object" && depth < 4; depth += 1) {
+    if (current instanceof ApiRequestError) return false;
+    const { name, code } = current as { name?: unknown; code?: unknown };
+    if (name === "AbortError" || name === "TimeoutError") return true;
+    if (typeof code === "string" && INTERRUPTED_CODES.has(code)) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 /** Reads `Retry-After` as milliseconds, accepting seconds or an HTTP date. */
 export function parseRetryAfterMs(
   header: string | null,
@@ -75,22 +143,34 @@ export function parseRetryAfterMs(
 }
 
 export function parseApiErrorMessage(body: string): string {
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(body) as Record<string, unknown>;
-    const parts = [
-      parsed.message,
-      parsed.error,
-      parsed.code,
-      parsed.reason,
-    ].filter(
-      (value): value is string =>
-        typeof value === "string" && value.trim().length > 0,
-    );
-    return parts.join(" ") || validationErrorText(parsed) || body;
+    parsed = JSON.parse(body);
   } catch {
     return htmlErrorTitle(body) ?? body;
   }
+  if (typeof parsed === "string") return parsed.trim() ? parsed : body;
+  if (!parsed || typeof parsed !== "object") return body;
+  // A JSON object or list that says nothing in words (a route's own payload
+  // sent with its error status) is never shown as it came: an object stays
+  // in `details`.
+  if (Array.isArray(parsed)) return NO_MESSAGE;
+  const record = parsed as Record<string, unknown>;
+  const parts = [
+    record.message,
+    record.error,
+    record.code,
+    record.reason,
+  ].filter(
+    (value): value is string =>
+      typeof value === "string" && value.trim().length > 0,
+  );
+  // A route can send the schema's refusal as its message, the same object written out as text.
+  const wrapped = parts.length === 1 ? parseApiErrorDetails(parts[0]!) : undefined;
+  return (wrapped && validationErrorText(wrapped)) || parts.join(" ") || validationErrorText(record) || NO_MESSAGE;
 }
+
+const NO_MESSAGE = "The server returned an error without a message.";
 
 /**
  * A request the API's schema refused comes back as the values it was sent

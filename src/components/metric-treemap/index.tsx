@@ -1,9 +1,11 @@
 import { useCallback, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Box, Text, TextAttributes, useUiCapabilities } from "../../ui";
 import { blendHex, colors, priceColor } from "../../theme/colors";
+import { useSelectionFill } from "../ui/selection-fill";
 import { blendForContrast, higherContrast } from "../../theme/color-utils";
 import { t } from "../../i18n";
 import { padTo } from "../../utils/format";
+import { readableError } from "../../utils/reason-codes";
 import {
   buildMetricTreemap,
   buildMetricTreemapRects,
@@ -97,7 +99,8 @@ function Tile<T>({ tile, selected, onSelect, onActivate, pointerMoved }: {
   const renderWidth = Math.max(1, tile.width - (tile.width > 2 ? 1 : 0));
   const renderHeight = Math.max(1, tile.height - (tile.height > 2 ? 1 : 0));
   const innerWidth = Math.max(1, renderWidth - 1);
-  const backgroundColor = selected ? colors.selected : metricTileColor(tile.item);
+  const selectionFill = useSelectionFill();
+  const backgroundColor = selected ? selectionFill.bg : metricTileColor(tile.item);
   const textColor = tileTextColor(backgroundColor);
   const attributes = selected ? TextAttributes.BOLD : TextAttributes.NONE;
   const lines = visibleLines(tile.item);
@@ -249,7 +252,7 @@ function DesktopMetricTreemapSurface<T>({ items, width, height, selectedId, onSe
   if (tiles.length === 0) {
     return (
       <Box width={width} height={height} paddingX={1} paddingY={1}>
-        <Text fg={colors.textDim}>{t(emptyStateTitle ?? "No chart data")}</Text>
+        <Text fg={colors.textDim}>{t(readableError(emptyStateTitle ?? "No chart data"))}</Text>
       </Box>
     );
   }
@@ -328,7 +331,7 @@ export function MetricTreemapSurface<T>({
   if (tiles.length === 0) {
     return (
       <Box width={width} height={height} paddingX={1} paddingY={1}>
-        <Text fg={colors.textDim}>{t(emptyStateTitle ?? "No chart data")}</Text>
+        <Text fg={colors.textDim}>{t(readableError(emptyStateTitle ?? "No chart data"))}</Text>
       </Box>
     );
   }

@@ -171,3 +171,53 @@ test("the text report lists a story's tickers and prints every time to the secon
     { publishedAt: "2026-09-04T20:00:00.000Z", tickers: ["AMD"] },
   ]);
 });
+
+test("fn CN prints a summary on one line under its row and none that repeats the headline, while exports keep each summary whole", async () => {
+  const losses = { ...story("losses", "negative", 33, "2026-10-15T11:52:00.000Z"),
+    headline: "September 2026 Monthly Release",
+    summary: "Allstate estimated September catastrophe losses at $220 million,\n\nbringing third-quarter losses to $1.65 billion." };
+  const echo = { ...story("echo", "neutral", 0, "2026-10-14T09:00:00.000Z"), headline: "Allstate declares dividend", summary: "Allstate declares dividend" };
+  const definition = createTickerNewsHeadless({
+    loadNews: async () => ({ items: [losses, echo], nextCursor: null }),
+    now: () => new Date("2026-10-16T00:00:00.000Z"),
+  });
+  const loadArgs = args("ALL", { sentiment: "any", minImportance: 0, limit: 50 });
+  const result = await definition.load(loadArgs, context);
+  const text = renderHeadlessPaneText(definition, result, loadArgs, "CN").split("\n");
+  const row = text.findIndex((line) => line.includes("September 2026 Monthly Release"));
+  expect(text[row + 1]).toBe("  Allstate estimated September catastrophe losses at $220 million, bringing third-quarter losses to $1.65 billion.");
+  const dividend = text.findIndex((line) => line.includes("Allstate declares dividend"));
+  expect(text[dividend + 1]?.trim().startsWith("Allstate declares dividend")).toBe(false);
+  const json = serializeHeadlessPaneResult(definition, result) as { items: Array<{ summary: string | null }> };
+  expect(json.items.map((item) => item.summary)).toEqual([losses.summary, echo.summary]);
+});
+
+test("fn CN says how many routine notices a folded row stands for, and exports keep the count", async () => {
+  const notice: CloudNewsPayload = {
+    ...story("buyback", "positive", 18, "2026-11-10T18:19:26.000Z"),
+    headline: "Transaction in own shares",
+    summary: "HSBC bought 510,000 ordinary shares for cancellation on 10 November under its buyback announced on 28 October.",
+    routine: { kind: "buyback", notices: 8, since: "2026-10-30T18:32:16.000Z", programme: "buy-back announced on 2026-10-28", storyIds: [] },
+  };
+  // A server that lists each notice sends no `routine`; one notice is no fold.
+  const single: CloudNewsPayload = { ...story("single", "neutral", 18, "2026-11-09T18:26:49.000Z"), headline: "Transaction in own shares", routine: { kind: "buyback", notices: 1, since: "2026-11-09T18:26:49.000Z" } };
+  const definition = createTickerNewsHeadless({
+    loadNews: async () => ({ items: [notice, single], nextCursor: null }),
+    now: () => new Date("2026-11-12T19:00:00.000Z"),
+  });
+  const loadArgs = args("0005:HKEX", { sentiment: "any", minImportance: 0, limit: 50 });
+  const result = await definition.load(loadArgs, context);
+  const text = renderHeadlessPaneText(definition, result, loadArgs, "CN");
+  expect(text).toContain("Transaction in own shares (8 notices since 30 Oct)");
+  expect(text.match(/notices since/g)).toHaveLength(1);
+  const json = serializeHeadlessPaneResult(definition, result) as { items: Array<Record<string, unknown>> };
+  // The export's headline is the story's; the count is in fields of its own.
+  expect(json.items[0]).toMatchObject({
+    headline: "Transaction in own shares",
+    routineKind: "buyback",
+    routineNotices: 8,
+    routineSince: "2026-10-30T18:32:16.000Z",
+    routineProgramme: "buy-back announced on 2026-10-28",
+  });
+  expect(json.items[1]).not.toHaveProperty("routineNotices");
+});

@@ -6,13 +6,16 @@ import type {
 } from "../../../types/plugin";
 import type { NewsArticle, NewsQuery } from "../../../news/types";
 import {
-  coinNewsFallbackNotice,
+  newsFallbackNotice,
   mapCloudNewsArticle,
   readCloudNews,
   type CloudNewsRead,
 } from "../../../sources/gloomberb-cloud/news";
 import { parsePublicTickerKey } from "../../../utils/exchanges";
+import { companyDataNotes, readCompanyFrom } from "../../../types/company-from";
 import { formatUtcSeconds } from "../../../utils/utc-time";
+import { listedRowHeadline, newsSummaryLine, routineNoticeFields } from "../../../news/news-model";
+import { shortStoryId } from "../../../news/story-id";
 import { cloudNewsFreshness, cloudRealtimeAccess } from "../shared/report-freshness";
 import { REPORT_FILTER, REPORT_ROWS } from "../shared/headless-options";
 
@@ -20,10 +23,17 @@ import { REPORT_FILTER, REPORT_ROWS } from "../shared/headless-options";
 const NEWS_COLUMNS = [
   { key: "publishedAt", header: "Published", textFormat: formatUtcSeconds },
   { key: "source", header: "Source" },
-  { key: "headline", header: "Headline" },
+  // A row standing for a company's routine notices (a buy-back's daily ones) says how many; exports keep the
+  // headline as the story's and the count in its own fields.
+  { key: "headline", header: "Headline", textFormat: listedRowHeadline },
   { key: "tickers", header: "Tickers", textFormat: (value: unknown) => Array.isArray(value) ? value.join(", ") : String(value ?? "") },
   { key: "sentiment", header: "Sentiment" },
   { key: "importance", header: "Score", align: "right" as const },
+  // The short id `fn news-story-pane` opens the story by, and its summary on one line under the row; exports keep both whole.
+  { key: "id", header: "ID", textFormat: (value: unknown) => typeof value === "string" ? shortStoryId(value) : "" },
+  { key: "summary", header: "Summary", underRow: "line" as const,
+    textFormat: (value: unknown, row: Record<string, unknown>) =>
+      newsSummaryLine({ title: String(row.headline ?? ""), summary: typeof value === "string" ? value : undefined }) ?? "" },
 ];
 
 export interface NewsHeadlessDependencies {
@@ -49,6 +59,7 @@ function newsRow(article: NewsArticle) {
     source: article.source,
     headline: article.title,
     summary: article.summary ?? null,
+    ...routineNoticeFields(article),
     topic: article.topic,
     topics: article.topics,
     sectors: article.sectors,
@@ -94,8 +105,9 @@ function projectNewsHeadless(
     freshness: cloudNewsFreshness(realtime),
     // A coin pair no story is filed under shows the stories that mention the coin, and says so.
     ...(response.searchedFor && args.symbols[0]
-      ? { notes: [coinNewsFallbackNotice(parsePublicTickerKey(args.symbols[0]).symbol, response.searchedFor)] }
-      : {}),
+      ? { notes: [newsFallbackNotice(parsePublicTickerKey(args.symbols[0]).symbol, response.searchedFor)] }
+      // A receipt's or foreign line's stories are its company's, read from the home line.
+      : response.companyFrom ? { notes: companyDataNotes(readCompanyFrom(response.companyFrom)) } : {}),
     metadata: {
       nextCursor: response.nextCursor,
       sentiment,

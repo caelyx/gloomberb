@@ -2,6 +2,7 @@ import type { GloomPlugin } from "../../../types/plugin";
 import { apiClient } from "../../../api-client";
 import { createGloomberbCloudCapabilities, createGloomberbCloudProvider } from "../../../sources/gloomberb-cloud";
 import { accountManagementModule } from "../account-management";
+import { buildoutModule } from "../buildout";
 import { chatModule } from "../chat";
 import {
   CONGRESS_TRADES_PANE_ID,
@@ -19,6 +20,7 @@ import { registerMcpConnectCommand } from "./mcp-connect/command";
 import { registerCloudUpgradeCommand } from "./upgrade-command";
 import { CloudUpgradeStatusWidget } from "./upgrade-status-widget";
 import { registerTrialOfferCommand, TrialOfferStatusWidget } from "./trial-offer-status-widget";
+import { OneTapPrompt } from "./one-tap/one-tap-prompt";
 import { CloudVerificationStatusWidget } from "./verification-status-widget";
 import { createPublicPaneShare } from "../shared/public-pane";
 import { teamModule } from "./team/module";
@@ -46,7 +48,11 @@ function createCloudDataModule(): PluginModule {
   };
 }
 
-/** Sign-in, upgrade and MCP setup commands, and the email verification, upgrade and trial prompts. */
+/**
+ * Sign-in, upgrade and MCP setup commands, and the email verification,
+ * upgrade and trial prompts, and the hosted terminal's Google One Tap, which
+ * draws nothing in the status bar itself.
+ */
 const cloudAccountModule: PluginModule = {
   slots: {
     "status:widget": () => (
@@ -54,6 +60,7 @@ const cloudAccountModule: PluginModule = {
         <CloudVerificationStatusWidget />
         <CloudUpgradeStatusWidget />
         <TrialOfferStatusWidget />
+        <OneTapPrompt />
       </>
     ),
   },
@@ -88,14 +95,17 @@ const askgModule: PluginModule = {
   },
   panes: [{
     id: ASKG_PANE_ID,
-    reportFreshness: { status: "not-a-feed", basis: "generated answer" },
+    reportFreshness: { status: "not-a-feed", basis: "generated answer", local: true },
     reportLockNote: askgLockNote,
+    // Without a session the wall is all there is, so `fn ASKG` prints it at once.
+    signInWall: true,
     name: "Ask Gloom",
     personalData: "messages",
     icon: "K",
     component: ASKGPane,
     defaultPosition: "right",
     defaultMode: "floating",
+    utilityWindow: true,
     defaultFloatingSize: { width: 96, height: 32 },
     portableShare: {
       // A conversation and the panes it read are personal to the account.
@@ -109,6 +119,8 @@ const askgModule: PluginModule = {
     description: "Ask a question about your panes and watch the tools Gloom runs",
     keywords: ["ask", "gloom", "assistant", "ai", "question", "askg"],
     shortcut: { prefix: "ASKG", argPlaceholder: "question", argKind: "text" },
+    // createInstance asks the open pane a question, so catalog discovery must not run it with a sample one.
+    catalogSettings: {},
     createInstance: (_context, options) => {
       // The question is handed to the pane directly, so it is never persisted
       // with the layout and never replayed on the next launch.
@@ -177,8 +189,7 @@ const congressTradesModule: PluginModule = {
   }],
 };
 
-/** The desktop and browser builds differ only in the modules they add here. */
-export function createGloomberbCloudPlugin(extraModules: readonly PluginModule[] = []): GloomPlugin {
+export function createGloomberbCloudPlugin(): GloomPlugin {
   return composeBuiltinPlugin({
     id: "gloomberb-cloud",
     name: "Gloom Cloud",
@@ -186,6 +197,8 @@ export function createGloomberbCloudPlugin(extraModules: readonly PluginModule[]
     description: "Free market, macro, and chat services. Chat requires signup.",
     toggleable: true,
     order: 10,
+    // TheBuildout's panes read its API directly.
+    hosts: ["api.thebuildout.ai"],
     modules: [
       createCloudDataModule(),
       chatModule,
@@ -195,7 +208,7 @@ export function createGloomberbCloudPlugin(extraModules: readonly PluginModule[]
       cloudAccountModule,
       askgModule,
       terminalRelayModule,
-      ...extraModules,
+      buildoutModule,
       congressTradesModule,
       cloudTweetsModule,
     ],

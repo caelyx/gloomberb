@@ -16,8 +16,8 @@ import {
   type TickerSearchCandidate,
   type TickerSearchInstrumentClass,
 } from "../../../../tickers/search";
-import type { ResultItem } from "../../list/model";
-import { delistingLabel, parseListingDelisting } from "../../../../market-data/quotes/delisting";
+import type { ResultItem, TickerPick } from "../../list/model";
+import { delistingLabel, parseListingDelisting, parseListingWithdrawal, withdrawalLabel } from "../../../../market-data/quotes/delisting";
 import {
   buildTickerSearchCacheKey,
   createQuickLookTickerCandidates,
@@ -25,6 +25,8 @@ import {
 } from "./results";
 
 interface UseCommandBarTickerSearchActionsOptions {
+  /** Ticker search's Enter: the focused pane, or its linked group, takes the ticker. */
+  changePaneTicker?: (symbol: string, options?: PinTickerOptions) => void;
   closeAll: (options?: { revertThemePreview?: boolean }) => void;
   dispatch: (action: any) => void;
   focusTicker: (symbol: string, options?: PinTickerOptions) => void;
@@ -34,6 +36,7 @@ interface UseCommandBarTickerSearchActionsOptions {
 }
 
 export function useCommandBarTickerSearchActions({
+  changePaneTicker,
   closeAll,
   dispatch,
   focusTicker,
@@ -55,54 +58,58 @@ export function useCommandBarTickerSearchActions({
     return ticker;
   }, [dispatch, pluginRegistry.events, tickerRepository]);
 
-  const openTickerResearch = useCallback((result: InstrumentSearchResult, options?: { forceNewPane?: boolean }) => {
+  const pickTicker = useCallback((symbol: string, selection: PinTickerOptions, how: TickerPick) => {
+    if (how === "pane" && changePaneTicker) changePaneTicker(symbol, selection);
+    else focusTicker(symbol, how === "new" ? { forceNewPane: true, ...selection } : selection);
+    closeAll({ revertThemePreview: false });
+  }, [changePaneTicker, closeAll, focusTicker]);
+
+  const openTickerResearch = useCallback((result: InstrumentSearchResult, how: TickerPick) => {
     (async () => {
       const ticker = await resolveSearchTicker(result);
-      focusTicker(ticker.metadata.ticker, { ...options, ...tickerSelectionFromSearchResult(result) });
-      closeAll({ revertThemePreview: false });
+      pickTicker(ticker.metadata.ticker, tickerSelectionFromSearchResult(result), how);
     })();
-  }, [closeAll, focusTicker, resolveSearchTicker]);
+  }, [pickTicker, resolveSearchTicker]);
 
   const mapTickerSearchCandidateToResultItem = useCallback((candidate: TickerSearchCandidate): ResultItem => {
     const detail = formatTickerSearchDetail(candidate);
     // The class lives in the badge, so the trailing text carries only the
     // venue rather than saying "Equity" twice on one row. An unclassified
-    // instrument has no class to show, so the badge column lifts its venue
-    // instead (a short exchange code qualifies on its own) and the trailing
-    // text goes quiet rather than repeating it.
+    // instrument leaves the badge column empty and keeps its venue on the
+    // right, where every listing's is.
     const badge = formatInstrumentBadge(candidate);
     const right = candidate.exchangeLabel || candidate.primaryExchangeLabel || candidate.right || undefined;
     // The candidate's detail leads with the name; the rest repeats the badge or venue.
     const leadingName = candidate.detail.split(" | ")[0]?.trim();
     const name = leadingName && leadingName.toUpperCase() !== candidate.label.toUpperCase() ? leadingName : undefined;
-    // A listing that no longer trades says so under its row, with its last session.
+    // A listing that no longer trades says so under its row, with its last session, or when and why its exchange withdrew it.
     const delisting = parseListingDelisting(candidate.result?.delisting);
-    const lines = delisting ? [{ segments: [{ text: delistingLabel(delisting), emphasis: "muted" as const }] }] : undefined;
+    const withdrawal = delisting ? undefined : parseListingWithdrawal(candidate.result?.withdrawal);
+    const ended = delisting ? delistingLabel(delisting) : withdrawal ? withdrawalLabel(withdrawal) : null;
+    const lines = ended ? [{ segments: [{ text: ended, emphasis: "muted" as const }] }] : undefined;
 
     if (candidate.kind === "ticker" && candidate.ticker) {
+      const pick = (how: TickerPick) => pickTicker(candidate.ticker!.metadata.ticker, tickerSelectionFromSearchResult(candidate.result), how);
       return {
         id: candidate.id,
         contractKey: candidate.contractKey,
         ...tickerSelectionFromSearchResult(candidate.result),
         label: candidate.label,
         instrumentType: candidate.instrumentType,
+        // The names search found the saved listing by ("micro" for MSFT): it is an exact match as its search row is.
+        searchAliases: candidate.searchAliases,
         detail,
         badge,
         name,
         right,
-        ...(lines ? { lines } : {}),
+        ...(lines ? { lines, stoppedTrading: true } : {}),
         category: candidate.category,
         kind: "ticker",
         resolveTicker: async () => candidate.ticker!,
         prefetchInstrument: rowPrefetchInstrument(candidate, tickersRef.current),
-        secondaryAction: () => {
-          focusTicker(candidate.ticker!.metadata.ticker, { forceNewPane: true, ...tickerSelectionFromSearchResult(candidate.result) });
-          closeAll({ revertThemePreview: false });
-        },
-        action: () => {
-          focusTicker(candidate.ticker!.metadata.ticker, { ...tickerSelectionFromSearchResult(candidate.result) });
-          closeAll({ revertThemePreview: false });
-        },
+        pickTicker: pick,
+        secondaryAction: () => pick("new"),
+        action: () => pick("des"),
       };
     }
 
@@ -117,7 +124,7 @@ export function useCommandBarTickerSearchActions({
       badge,
       name,
       right,
-      ...(lines ? { lines } : {}),
+      ...(lines ? { lines, stoppedTrading: true } : {}),
       category: candidate.category,
       kind: "search",
       resolveTicker: () => resolveSearchTicker(candidate.result!, publicTickerKey(
@@ -126,10 +133,11 @@ export function useCommandBarTickerSearchActions({
           : candidate.result!.exchange || candidate.result!.primaryExchange,
       )),
       prefetchInstrument: rowPrefetchInstrument(candidate, tickersRef.current),
-      secondaryAction: () => openTickerResearch(candidate.result!, { forceNewPane: true }),
-      action: () => openTickerResearch(candidate.result!),
+      pickTicker: (how) => openTickerResearch(candidate.result!, how),
+      secondaryAction: () => openTickerResearch(candidate.result!, "new"),
+      action: () => openTickerResearch(candidate.result!, "des"),
     };
-  }, [closeAll, focusTicker, openTickerResearch, resolveSearchTicker]);
+  }, [openTickerResearch, pickTicker, resolveSearchTicker]);
 
   const buildTickerSearchResultItems = useCallback((candidates: TickerSearchCandidate[], query: string): ResultItem[] => (
     candidates.length > 0

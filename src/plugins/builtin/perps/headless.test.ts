@@ -1,7 +1,11 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { expect, test } from "bun:test";
 import { deriveHeadlessFreshness, formatFreshnessLine, paneStatusLine } from "../../../cli/pane-functions/freshness";
-import { renderHeadlessPaneText, serializeHeadlessPaneResult } from "../../../cli/pane-functions/headless";
+import { headlessReportTables, renderHeadlessPaneText, serializeHeadlessPaneResult } from "../../../cli/pane-functions/headless";
+import { renderReportNdjson } from "../../../cli/report-tables";
+import { setCliWidthOverride } from "../../../utils/cli-output";
 import type { PerpMarketPayload } from "../../../api-client/perps";
+import { normalizeCapabilityOptions, type PaneFunctionCapability } from "../../../cli/pane-functions/capabilities";
 import { createTestHeadlessArgs, createTestHeadlessContext } from "../../../test-support/headless";
 import { perpFreshness } from "./freshness";
 import { perpsHeadless } from "./headless";
@@ -32,6 +36,30 @@ async function report(tab: string, rows = [market]) {
 }
 const longest = (text: string) => Math.max(...text.split("\n").map((line) => line.length));
 
+test("at 80 columns one market's row keeps its APR, and the raw rates it annualises move under the row", async () => {
+  const binance = venueRow("binance", { markPrice: 74_875.62, fundingRate: 0.0001, fundingRate8h: 0.0001, fundingApr: 0.1095, openInterestUsd: 7.2e9,
+    observedAt: "2026-11-09T04:47:00.000Z", longShortRatio: longShort() });
+  setCliWidthOverride(80);
+  try {
+    const apiClient = { getCloudPerpsBoard: async () => perpBoard({ rows: [binance] }), getCloudPerpsCompare: async () => perpBoard({ rows: [binance] }),
+      getCloudPerpsMarket: async () => ({ ...perpBoard({ rows: [binance] }), evidence: [], methodologyUrl: "" }),
+      getCloudPerpsHistory: async () => perpHistory({ marketId: binance.marketId }) } as never;
+    const args = createTestHeadlessArgs({ argument: "BTC", rawArgument: "BTC", options: { tab: "history", days: "7", metric: "funding" } });
+    const result = await perpsHeadless.load(args, createTestHeadlessContext({ apiClient }));
+    const text = renderHeadlessPaneText(perpsHeadless, result, args, "PERP");
+    const lines = text.split("\n");
+    const header = lines.findIndex((line) => line.startsWith("Market ") && line.includes("Venue"));
+    expect(lines[header]).toContain("APR %");
+    expect(lines[header]).not.toContain("Funding %/int");
+    const row = lines.findIndex((line, index) => index > header && line.startsWith("BTC "));
+    expect(lines[row]).toContain("+10.95%");
+    expect(lines[row + 1]).toMatch(/^\s+Funding %\/int \+0\.01000% \/8h\s+Observed /);
+    expect(longest(text)).toBeLessThanOrEqual(80);
+  } finally {
+    setCliWidthOverride(null);
+  }
+});
+
 test("history report reads as units and the rows keep every raw field", async () => {
   const { result, text } = await report("history");
   expect(text).toContain("84,724.00 USDC");
@@ -41,13 +69,14 @@ test("history report reads as units and the rows keep every raw field", async ()
   expect(text).toContain("-0.12%");
   expect(text).toContain("2026-10-03 23:20 UTC");
   // A missing figure is "--", never undefined, NaN or a stray hyphen.
-  expect(text).toMatch(/--\s+--\s+--\s+--\s/);
+  expect(text).toMatch(new RegExp(String.raw`${MISSING_VALUE}\s+${MISSING_VALUE}\s+${MISSING_VALUE}\s+${MISSING_VALUE}\s`));
   expect(text).not.toMatch(/undefined|NaN|\d\.\d{9,}/);
   expect(longest(text)).toBeLessThanOrEqual(140);
   const json = serializeHeadlessPaneResult(perpsHeadless, result) as { sections: Array<{ title: string; rows: unknown[] }>; metadata: { rates: string } };
   expect(json.metadata.rates).toBe("fraction");
   expect(json.sections.map((section) => section.title)).toEqual(["Latest market", "Own observations", "Paid funding", "Hourly candles", "Long/short history"]);
-  expect(json.sections[0]!.rows).toEqual([market]);
+  // The market row adds what an export cites it by: its venue, funding interval and long-share bucket.
+  expect(json.sections[0]!.rows).toEqual([{ ...market, venueName: "Hyperliquid", fundingInterval: "1h", longShareBucketAt: null }]);
   expect(json.sections[1]!.rows).toEqual(history.rows);
   expect(json.sections[2]!.rows).toEqual(history.funding);
   expect(json.sections[3]!.rows).toEqual(history.candles);
@@ -57,14 +86,14 @@ test("history report reads as units and the rows keep every raw field", async ()
 
 test("an underlying without data and the revision payloads stay short and honest", async () => {
   const { result, text } = await report("evidence", [bare]);
-  expect(text).toContain("TSLA · XYZ");
+  expect(text).toContain("xyz:TSLA");
   expect(text).toContain("Superseded 2026-10-04 01:00 UTC");
   expect(text).toContain("9f2c41d7");
   expect(text).not.toContain("9f2c41d7a0");
   expect(text).not.toMatch(/undefined|NaN|payload|\d\.\d{9,}/);
   expect(longest(text)).toBeLessThanOrEqual(140);
-  const json = serializeHeadlessPaneResult(perpsHeadless, result) as { sections: Array<{ rows: unknown[] }> };
-  expect(json.sections[1]!.rows).toEqual(evidence);
+  const json = serializeHeadlessPaneResult(perpsHeadless, result) as { sections: Array<{ title: string; rows: unknown[] }> };
+  expect(json.sections.find((section) => section.title === "Observation revisions")!.rows).toEqual(evidence);
 });
 
 test("evidence reads an OKX reading as derived from its ratio, keeps raw fractions in JSON, and a venue that publishes none says why", async () => {
@@ -115,12 +144,12 @@ test("a named market with no tab still reports its history, and no market report
   expect(deriveHeadlessFreshness(perpsHeadless, board, Date.parse("2026-10-03T23:30:00Z"))).toMatchObject({ source: "Binance, Bybit, Hyperliquid", oldestAgeMinutes: 18,
     sources: [{ source: "Binance", asOf: "2026-10-03T23:20:09.000Z" }, { source: "Bybit", asOf: "2026-10-03T23:11:40.000Z" }, { source: "Hyperliquid", asOf: "2026-10-03T23:20:09.000Z" }] });
   expect(longest(text)).toBeLessThanOrEqual(140);
-  // The venue narrows what the server returned; asset class, search and order go to the server.
+  // Asset class, venue, search and order go to the server; a server that does not filter by venue is narrowed here.
   const narrowed = await perpsHeadless.load(args("btc", { tab: "board", "asset-class": "crypto", venue: "bybit", sort: "funding" }), boardContext);
-  expect(queries.at(-1)).toEqual({ assetClass: "crypto", search: "btc", sort: "funding" });
+  expect(queries.at(-1)).toEqual({ assetClass: "crypto", venue: "bybit", search: "btc", sort: "funding" });
   const json = serializeHeadlessPaneResult(perpsHeadless, narrowed) as { sections: Array<{ rows: unknown[] }>; metadata: { locked: number } };
   // JSON keeps the whole row, rates as fractions.
-  expect(json.sections[0]!.rows).toEqual([rows[1]!]);
+  expect(json.sections[0]!.rows).toMatchObject([rows[1]!]);
   expect(json.metadata.locked).toBe(2501);
 });
 
@@ -163,10 +192,10 @@ test("a Market column label opens its market, and a label nothing carries fails 
     getCloudPerpsHistory: async () => perpHistory({ marketId: sp500.marketId }),
   } as never;
   const args = (argument: string, tab = "history") => createTestHeadlessArgs({ argument, rawArgument: argument, options: { tab, days: "7", metric: "funding" } });
-  const opened = await perpsHeadless.load(args("SP500 · XYZ"), createTestHeadlessContext({ apiClient }));
+  const opened = await perpsHeadless.load(args("xyz:SP500"), createTestHeadlessContext({ apiClient }));
   expect(opened.metadata).toMatchObject({ marketId: sp500.marketId });
-  expect((await perpsHeadless.load(args("SP500 · XYZ", "board"), createTestHeadlessContext({ apiClient }))).sections[0]).toMatchObject({ rows: [sp500] });
-  await expect(perpsHeadless.load(args("FOO · XYZ"), createTestHeadlessContext({ apiClient }))).rejects.toThrow('No perpetual market matches "FOO · XYZ". Try BTC, ETH, SP500, xyz:SP500.');
+  expect((await perpsHeadless.load(args("xyz:SP500", "board"), createTestHeadlessContext({ apiClient }))).sections[0]).toMatchObject({ rows: [sp500] });
+  await expect(perpsHeadless.load(args("xyz:FOO"), createTestHeadlessContext({ apiClient }))).rejects.toThrow('No perpetual market matches "xyz:FOO". Try BTC, ETH, SP500, xyz:SP500.');
 });
 
 test("a pair or plain name opens the market it stands for, and a name nothing matches names the nearest board markets", async () => {
@@ -198,19 +227,20 @@ test("a pair or plain name opens the market it stands for, and a name nothing ma
   expect((await load("BRENTOIL")).metadata).not.toHaveProperty("notices");
   // Brent is BZ on the Binance board and BRENTOIL on Hyperliquid's xyz dex: the nearest is shown and the other named.
   const brent = await load("brent");
-  expect(brent.metadata).toMatchObject({ marketId: bz.marketId, notices: ['Showing BZ for "brent". Also on the board: BRENTOIL · XYZ.'] });
-  expect(brent.text).toContain('Showing BZ for "brent". Also on the board: BRENTOIL · XYZ.');
+  expect(brent.metadata).toMatchObject({ marketId: bz.marketId, notices: ['Showing BZ for "brent". Also on the board: xyz:BRENTOIL.'] });
+  expect(brent.text).toContain('Showing BZ for "brent". Also on the board: xyz:BRENTOIL.');
   // The same names compare their base asset across venues, and the comparison says which it read.
+  requests.length = 0;
   const compared = await load("Bitcoin", "compare");
   expect(compared.metadata).toMatchObject({ baseAsset: "BTC", notices: ['Showing BTC for "Bitcoin".'] });
   expect(requests).toEqual(["BITCOIN", "BTC"]);
   expect((await load("btc", "compare")).metadata).not.toHaveProperty("notices");
   // A pair searches the board by its base asset.
-  expect(((await load("BTC-USD", "board")).result.sections[0] as { rows: unknown[] }).rows).toEqual([market]);
+  expect(((await load("BTC-USD", "board")).result.sections[0] as { rows: unknown[] }).rows).toMatchObject([market]);
 
   // A name nothing matches suggests the board markets nearest it, as the Market column writes them; free text and an unknown name keep the examples.
-  await expect(load("brentt")).rejects.toThrow('No perpetual market matches "brentt". Try BZ, BRENTOIL · XYZ.');
-  await expect(load("brentt", "compare")).rejects.toThrow('No perpetual market matches "brentt". Try BZ, BRENTOIL · XYZ.');
+  await expect(load("brentt")).rejects.toThrow('No perpetual market matches "brentt". Try BZ, xyz:BRENTOIL.');
+  await expect(load("brentt", "compare")).rejects.toThrow('No perpetual market matches "brentt". Try BZ, xyz:BRENTOIL.');
   await expect(load("ethereun")).rejects.toThrow('No perpetual market matches "ethereun". Try ETH.');
   await expect(load("XYZZY")).rejects.toThrow('No perpetual market matches "XYZZY". Try BTC, ETH, SP500, xyz:SP500.');
   await expect(load("what is a perp")).rejects.toThrow('No perpetual market matches "what is a perp". Try BTC, ETH, SP500, xyz:SP500.');
@@ -233,6 +263,27 @@ test("a report that shows the APR % column footnotes what it annualises, and the
   // An empty table has no column to footnote.
   const empty = createTestHeadlessContext({ apiClient: { getCloudPerpsBoard: async () => perpBoard({ rows: [], access: "preview", locked: 5 }) } as never });
   expect((await perpsHeadless.load(createTestHeadlessArgs({ argument: null, rawArgument: "", options: { tab: "board" } }), empty)).notes).toBeUndefined();
+});
+
+test("an exported comparison cites every row apart: its venue, URL, observed time, contract, quote unit and interval, with a numeric Mark", async () => {
+  const binance = venueRow("binance", { markPrice: 77_915.8, observedAt: "2026-11-04T07:00:43.000Z", sourceUrl: "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT",
+    qualityFlags: ["stablecoin-usd-parity-assumed"], longShortRatio: longShort({ bucketAt: "2026-11-04T06:00:00.000Z" }) });
+  const args = createTestHeadlessArgs({ argument: "BTC", rawArgument: "BTC", options: { tab: "compare" } });
+  const result = await perpsHeadless.load(args, createTestHeadlessContext({ apiClient: { getCloudPerpsCompare: async () => perpBoard({ rows: [binance, market] }) } as never }));
+  const freshness = deriveHeadlessFreshness(perpsHeadless, result);
+  const tables = headlessReportTables(perpsHeadless, result, args, "PERP", freshness, { complete: true, unavailableSymbols: [] });
+  const [first, second] = renderReportNdjson(tables, freshness).split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+  expect(first).toMatchObject({ section: "Contracts", Mark: 77_915.8, "Long % bucket UTC": "2026-11-04T06:00:00.000Z",
+    "Source URL": "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT", symbol_or_series: "binance:BTCUSDT", currency_or_unit: "USDT",
+    interval: "8h", source: "Binance", as_of: "2026-11-04T07:00:43.000Z" });
+  expect(second).toMatchObject({ Mark: market.markPrice, symbol_or_series: market.marketId, currency_or_unit: "USDC", interval: "1h", source: "Hyperliquid",
+    as_of: new Date(market.observedAt).toISOString() });
+  // The text keeps the pane's columns and says once what OI USD assumes and when Long % was counted.
+  expect(result.notes).toContain("OI USD values USDT at 1 USD.");
+  expect(result.notes).toContain("Long % is each venue's hourly account bucket from 11-04 06:00 UTC, not its Observed time.");
+  const text = renderHeadlessPaneText(perpsHeadless, result, args, "PERP");
+  expect(text).toContain("77,915.80 USDT");
+  expect(text).not.toContain("Source URL");
 });
 
 test("a free account's locked tables are left out, and one Pro line says what free shows and what Pro adds, apart from the errors", async () => {
@@ -266,7 +317,7 @@ test("a free account's locked tables are left out, and one Pro line says what fr
   expect(evidence.text).toContain("Pro: Free shows BTC's latest evidence and positioning. Gloom Pro adds its observation revisions · gloom.sh/cloud");
 });
 
-test("a venue filter names no count it does not have, and a venue with no contract to show is said", async () => {
+test("a venue filter shows the venue's free markets and names no count it does not have; a preview without the venue says whose markets it holds", async () => {
   const rows = [venueRow("binance"), venueRow("bybit", { marketId: "bybit:BTCUSDT" })];
   // Hyperliquid's BTC is outside the free board preview, but an individual market is fetched whole.
   const known = [...rows, market];
@@ -283,10 +334,12 @@ test("a venue filter names no count it does not have, and a venue with no contra
   const all = await load(null, { tab: "board", venue: "all" });
   expect(all.text).toContain("Pro: 2,501 more markets need Gloom Pro");
   const bybit = await load(null, { tab: "board", venue: "bybit" });
-  expect(bybit.text).toContain("Pro: Bybit markets beyond the free preview need Gloom Pro");
+  expect(bybit.text).toMatch(/\nBTC +Bybit +84,724\.00 USDT/);
+  expect(bybit.text).toContain("Pro: Free shows 1 Bybit market, its largest in each asset class; the rest need Gloom Pro");
   expect(bybit.text).not.toContain("2,501");
-  const none = await load(null, { tab: "board", venue: "kraken" });
-  expect(none.text).toMatch(/Perpetual markets\n\nPro: Kraken markets beyond the free preview need Gloom Pro · gloom.sh\/cloud\n/);
+  // A server that does not filter by venue answers with a preview of other venues' markets: it says which.
+  const none = await load(null, { tab: "board", venue: "okx" });
+  expect(none.text).toMatch(/Perpetual markets\n\nPro: The free preview's 2 markets are on Binance and Bybit, none on OKX; OKX markets need Gloom Pro · gloom.sh\/cloud\n/);
   expect(none.text.match(/Pro:/g)).toHaveLength(1);
   expect(none.text).not.toContain("No data");
 
@@ -296,8 +349,8 @@ test("a venue filter names no count it does not have, and a venue with no contra
     expect(opened).toMatchObject({ marketId });
     expect(opened).not.toHaveProperty("notices");
   }
-  expect((await load("BTC", { venue: "kraken" })).result.metadata).toMatchObject({ marketId: "binance:BTCUSDT", notices: ["Kraken has no BTC contract in the free preview; showing Binance."] });
-  expect((await load("BTC", { venue: "kraken" }, "pro")).result.metadata).toMatchObject({ notices: ["Kraken has no BTC contract; showing Binance."] });
+  expect((await load("BTC", { venue: "okx" })).result.metadata).toMatchObject({ marketId: "binance:BTCUSDT", notices: ["OKX has no BTC contract in the free preview; showing Binance."] });
+  expect((await load("BTC", { venue: "okx" }, "pro")).result.metadata).toMatchObject({ notices: ["OKX has no BTC contract; showing Binance."] });
   expect((await load("hyperliquid:default:BTC", { venue: "bybit" })).result.metadata).toMatchObject({ notices: ["hyperliquid:default:BTC is a Hyperliquid market, so the Bybit filter does not apply."] });
 });
 
@@ -318,4 +371,15 @@ test("fn PERP dates the board as the pane footer does: each venue's time and the
   // A venue that stopped answering for a market still says so.
   const stopped = deriveHeadlessFreshness({ shape: "rows" }, { rows: [], freshness: perpFreshness(rows.map((row) => ({ ...row, stale: true })), { now }) }, now);
   expect(paneStatusLine(stopped)).toContain("stale");
+});
+
+test("--venue lists the venues Gloom collects, and one it does not says so instead of a free preview", () => {
+  const capability = { id: "perps", botSafe: true, options: perpsHeadless.options } as unknown as PaneFunctionCapability;
+  const normalize = (venue: string) => normalizeCapabilityOptions(capability, { venue }, { strict: true, code: "PERP" }).venue;
+  expect(perpsHeadless.options.find((option) => option.key === "venue")!.values!.map(({ value }) => value)).toEqual(["all", "hyperliquid", "binance", "bybit", "okx"]);
+  expect(normalize("OKX")).toBe("okx");
+  for (const [venue, name] of [["deribit", "Deribit"], ["kraken", "Kraken"], ["coinbase", "Coinbase International"], ["dydx", "dYdX"]] as const) {
+    expect(() => normalize(venue)).toThrow(`Invalid --venue value "${venue}". Gloom doesn't cover ${name} perps yet. Use one of: all, hyperliquid, binance, bybit, okx.`);
+  }
+  expect(() => normalize("nowhere")).toThrow('Invalid --venue value "nowhere". Use one of: all, hyperliquid, binance, bybit, okx.');
 });

@@ -1,12 +1,11 @@
 import "./opentui-libc";
+import { installJsxDevFallback } from "../react/jsx-dev-fallback";
 import { inferCliErrorOptions, printCliError } from "./errors";
 import { isCliHelpFlag } from "./options";
-import { plainByDefault, setCliPlainOverride } from "../utils/cli-output";
-import { loadExternalPlugins } from "../plugins/loader";
-import { restoreExtractedPlugins } from "./restore-plugins";
+import { cliAsciiEnabled, plainByDefault, setCliPlainOverride } from "../utils/cli-output";
+import { localeMayNotReadUtf8 } from "../utils/ascii-text";
+import { writeAsciiWhile } from "./ascii-output";
 import { measurePerfAsync } from "../utils/perf-marks";
-import { flushCrashReports, reportCrash } from "../telemetry/crash-reports";
-import { CRASH_REPORT_EXIT_FLUSH_MS } from "../telemetry/crash-reports-node";
 import type { CliLaunchRequest } from "../types/plugin";
 import { detectUpdateAction } from "../updater";
 import { linkStandaloneCommand } from "../updater/command-names";
@@ -21,21 +20,35 @@ import {
   smokeShotView,
 } from "./native-smoke";
 
+// Before the first module with JSX loads, which is never one of the imports
+// above: every command reaches those through a dynamic import.
+installJsxDevFallback();
+
 async function launchOpenTuiApp(cliLaunchRequest: CliLaunchRequest | null = null): Promise<void> {
   // Before anything in the app can reach for the render library, so a temp
   // folder that cannot run it is worked around (or named) first.
+  const { prepareExtractedPluginSeed } = await import("./restore-plugins");
+  const { loadExternalPlugins } = await import("../plugins/loader");
   const { loadRenderLib } = await import("../renderers/opentui/render-lib");
   await measurePerfAsync("startup.opentui.render-lib", loadRenderLib);
   const { startOpenTuiApp } = await import("../renderers/opentui/start");
-  // Before the catalog is read, so a plugin that moved out of this repository is
-  // available in the same session rather than only after a restart.
-  await measurePerfAsync("startup.opentui.restore-plugins", restoreExtractedPlugins);
+  // Plugins that moved out of this repository are planned before the config
+  // is read, which records the ones already settled, and installed once the
+  // app is drawn: cloning them first held a blank screen for seconds, or for
+  // good on a connection that hangs. The app brings each in as it lands.
+  const seed = await measurePerfAsync("startup.opentui.restore-plugins", () => prepareExtractedPluginSeed());
   const externalPlugins = await measurePerfAsync("startup.opentui.load-external-plugins", () => loadExternalPlugins("tui"));
   try {
     await startOpenTuiApp({ externalPlugins, cliLaunchRequest });
+    if (seed?.start) {
+      const { logFailure } = await import("../utils/log-failure");
+      void seed.start().catch(logFailure("plugin-seed", "Plugin restore failed"));
+    }
   } catch (error) {
     // A failed launch still prints and exits as before; the report is only
     // sent when the config was read far enough to install the reporter.
+    const { flushCrashReports, reportCrash } = await import("../telemetry/crash-reports");
+    const { CRASH_REPORT_EXIT_FLUSH_MS } = await import("../telemetry/crash-reports-node");
     reportCrash(error, { kind: "uncaught" });
     await flushCrashReports({ timeoutMs: CRASH_REPORT_EXIT_FLUSH_MS });
     throw error;
@@ -74,21 +87,25 @@ export async function runCliEntrypoint(rawArgs = process.argv.slice(2)): Promise
     return;
   }
 
-  // Loaded only for a command: a bare launch never reads the commands, and
-  // their modules are a noticeable part of what it would load before drawing.
-  const { dispatchCli, failUnknownCliCommand } = await import("./index");
-  // For a screen reader, a pipe or NO_COLOR: no rule lines, arrows in words, fixed table columns. Set
-  // for this process only; `--plain` / `--no-plain` decide it in dispatchCli, and commands run in-process keep theirs.
+  // For a screen reader, a pipe or NO_COLOR: no rule lines, arrows in words, fixed table columns.
   setCliPlainOverride(plainByDefault());
-  const externalPlugins = await loadExternalPlugins();
-  const dispatchResult = await dispatchCli(rawArgs, { externalPlugins });
+  if (inferCliErrorOptions(rawArgs).format === "text" && localeMayNotReadUtf8()) writeAsciiWhile(cliAsciiEnabled);
+  const { dispatchEarlyCommand } = await import("./early-command");
+  if (await dispatchEarlyCommand(rawArgs)) return;
+
+  const { dispatchCli, failUnknownCliCommand } = await import("./index");
+  let plugins: Promise<import("../plugins/loader").LoadedExternalPlugin[]> | undefined;
+  const options = {
+    loadExternalPlugins: () => plugins ??= import("../plugins/loader").then(({ loadExternalPlugins }) => loadExternalPlugins()),
+  };
+  const dispatchResult = await dispatchCli(rawArgs, options);
   if (dispatchResult.kind === "handled") return;
   if (dispatchResult.kind === "launch-ui") {
     await launchOpenTuiApp(dispatchResult.request);
     return;
   }
 
-  await failUnknownCliCommand(rawArgs, { externalPlugins });
+  await failUnknownCliCommand(rawArgs, options);
 }
 
 runCliEntrypoint().catch((error) => {

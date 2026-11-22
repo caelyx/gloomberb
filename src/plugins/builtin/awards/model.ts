@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { AwardAggregate, AwardFilter, AwardHistoryPoint, AwardRow, AwardsPayload, AwardType } from "../../../api-client/awards";
 import { staticSeries } from "../../../components/chart/static/series";
 import type { ResolvedSeries } from "../../../time-series/types";
@@ -9,15 +10,15 @@ export type AwardTab = typeof AWARD_TABS[number]["value"];
 export const awardTab = (value: unknown): AwardTab => AWARD_TABS.find((tab) => tab.value === value)?.value ?? "feed";
 export const awardTypeLabel = (value: AwardType) => ({ prime: "Prime", subaward: "Subaward", modification: "Modification", notice: "Notice" })[value];
 export function money(value: string | number | null | undefined): string {
-  if (value == null) return "--";
+  if (value == null) return MISSING_VALUE;
   const amount = Number(value), absolute = Math.abs(amount);
   for (const [scale, suffix] of [[1e12, "T"], [1e9, "B"], [1e6, "M"], [1e3, "K"]] as const) {
     if (absolute >= scale) return `${(amount / scale).toFixed(2)}${suffix}`;
   }
   return amount.toLocaleString("en-US", { maximumFractionDigits: 2 });
 }
-export const awardPeriod = (row: AwardRow) => row.periodStart || row.periodEnd ? `${row.periodStart ?? "--"} / ${row.periodEnd ?? "--"}` : "--";
-export const awardPercent = (row: AwardRow) => row.revenueComparison ? `${row.revenueComparison.percent.toFixed(2)}%` : "--";
+export const awardPeriod = (row: AwardRow) => row.periodStart || row.periodEnd ? `${row.periodStart ?? MISSING_VALUE} / ${row.periodEnd ?? MISSING_VALUE}` : MISSING_VALUE;
+export const awardPercent = (row: AwardRow) => row.revenueComparison ? `${row.revenueComparison.percent.toFixed(2)}%` : MISSING_VALUE;
 export const aggregateId = (row: AwardAggregate) => JSON.stringify([row.key, row.source, row.currency, row.awardType]);
 const historyDate = (row: AwardHistoryPoint) => new Date(`${row.month.slice(0, 7)}-01T00:00:00Z`);
 export const awardScope = (source: string) => ({ usaspending: "US federal contracts", "usaspending-subawards": "US federal subcontracts", "usaspending-transactions": "US contract actions", "uk-contracts-finder": "UK contract notices",
@@ -83,6 +84,51 @@ export function awardsEmptyReason(data: Pick<AwardsPayload, "gaps">): string | n
  */
 export function awardsCoverageNotes(data: Pick<AwardsPayload, "gaps">): string[] {
   return data.gaps.filter((gap) => gap !== NO_AWARDS);
+}
+
+/**
+ * The statements the licences of the sources shown ask for wherever their
+ * data is shown, each once, in the server's source order: the pane, the
+ * award's detail and `fn AWARDS` print them under the awards they cover.
+ */
+export function awardsAttributions(data: Pick<AwardsPayload, "sources"> | undefined, shown: Iterable<string>): string[] {
+  return sourceStatements(data, shown, "attribution");
+}
+
+/**
+ * How the amounts of the sources shown read, each once: GeBIZ's says it
+ * withholds an amount under S$6,000 or one that several suppliers of a tender
+ * print alike. The award's detail and `fn AWARDS` print them beside a
+ * withheld value.
+ */
+export function awardsAmountNotices(data: Pick<AwardsPayload, "sources"> | undefined, shown: Iterable<string>): string[] {
+  return sourceStatements(data, shown, "amountNotice");
+}
+
+function sourceStatements(data: Pick<AwardsPayload, "sources"> | undefined, shown: Iterable<string>, key: "attribution" | "amountNotice"): string[] {
+  const sources = new Set(shown);
+  return [...new Set((data?.sources ?? []).flatMap((source) => {
+    const statement = source[key];
+    return sources.has(source.source) && typeof statement === "string" && statement.trim() ? [statement.trim()] : [];
+  }))];
+}
+
+/** What an award's value reads when its source withholds it, never 0 and never the unreported mark. */
+export const WITHHELD_AMOUNT = "withheld";
+
+/**
+ * Why an award's value is withheld by its source rather than unreported, or
+ * null: the award's own reason (GeBIZ's "under S$6,000"), never its source's,
+ * so an amount the source never printed still reads unreported.
+ */
+export function amountWithheld(row: Pick<AwardRow, "awardAmount" | "amountWithheld">): string | null {
+  const why = row.amountWithheld;
+  return row.awardAmount == null && typeof why === "string" && why.trim() ? why.trim() : null;
+}
+
+/** A source's statement as served, or nothing: an older or malformed answer's non-string is never read as one. */
+export function statementText(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 /** Award dates after the response's own date are the source's, not a mapping slip; they say so instead of passing as past awards. */

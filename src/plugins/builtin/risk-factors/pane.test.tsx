@@ -11,7 +11,7 @@ import { createStatefulTestPluginRuntime } from "../../../test-support/plugin-ru
 import { Box, useRendererHost } from "../../../ui";
 import { attachRiskFactorsPersistence, resetRiskFactorsPersistence } from "./data";
 import { RiskFactorsPane } from "./pane";
-import { list, report } from "./test-fixtures";
+import { list, noRiskFactorsReport, report } from "./test-fixtures";
 
 blockExternalNetwork();
 
@@ -114,7 +114,7 @@ afterEach(() => {
   opened = [];
 });
 
-test("stale discovery is disclosed; standard refresh follows latest until an explicit historical selection", async () => {
+test("discovery answered from its saved copy says when it was saved; standard refresh follows latest until an explicit historical selection", async () => {
   const store = new MemoryPluginPersistence();
   store.seedResource("reports", "ACME", list([2025]), { sourceKey: "risk-factors", schemaVersion: 1, stale: true });
   store.seedResource("report", "ACME:2025", report(2025), { sourceKey: "risk-factors", schemaVersion: 1 });
@@ -130,15 +130,18 @@ test("stale discovery is disclosed; standard refresh follows latest until an exp
   await mount();
   const stale = frame();
   expect(stale).toContain("Only 2025 risk analysis");
-  expect(stale).toContain("Discovery unavailable");
+  // The footer line every pane gives a saved copy, not the failure or a cache stamp of its own.
+  expect(stale).toContain("saved copy from");
+  expect(stale).not.toContain("Discovery unavailable");
+  expect(stale).not.toContain("cached");
 
   unavailable = false;
   await key("r");
   const latest = frame();
   expect(latest).toContain("Only 2026 risk analysis");
-  expect(latest).toContain("Filed 2026-02-03");
-  expect(latest).toContain("updated 2026-02-04");
-  expect(latest).not.toContain("Discovery unavailable");
+  expect(latest).toContain("Filed 03 Feb 2026");
+  expect(latest).toContain("updated 04 Feb 2026");
+  expect(latest).not.toContain("saved copy");
 
   await click("2025 10-K");
   newest = 2027;
@@ -205,6 +208,21 @@ test("a ticker without a 10-K report shows the empty state, not a load error", a
   expect(requests).toEqual(["/cloud/risks/ACME"]);
 });
 
+test("a 10-K that lists no risk factors says so, with its filing date and the filing to open", async () => {
+  transport((path) => path.endsWith("/ACME") ? Response.json(list([2026])) : Response.json(noRiskFactorsReport(2026)));
+
+  await mount();
+  const none = frame();
+  expect(none).toContain("This 10-K lists no risk factors (the company is not required to).");
+  expect(none).toContain("2026 10-K · Filed 03 Feb 2026");
+  // Nothing to list or compare: no section headings, no prior-year note.
+  expect(none).not.toContain("What Dominates");
+  expect(none).not.toContain("All Risk Factors");
+  expect(none).not.toContain("no prior year on file");
+  await click("[o]pen filing");
+  expect(opened.at(-1)).toBe(noRiskFactorsReport(2026).docUrl);
+});
+
 test("changing ticker while a historical report is pending cannot adopt the old security or year", async () => {
   const pending = Promise.withResolvers<Response>();
   const otherList = list([2024]);
@@ -251,7 +269,7 @@ test("in-memory report survives transient refresh with its source dates but clea
   const failed = frame();
   expect(failed).toContain("Only 2026 risk analysis");
   expect(failed).toContain("Temporary report outage");
-  expect(failed).toContain("Filed 2026-02-03");
+  expect(failed).toContain("Filed 03 Feb 2026");
 
   status = 402;
   await key("r");

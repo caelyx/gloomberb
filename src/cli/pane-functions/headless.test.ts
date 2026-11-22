@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../utils/format";
 import { afterAll, beforeAll, describe, expect, setSystemTime, test } from "bun:test";
 import { DEFAULT_CLI_OPTIONS } from "../options";
 import { serializeCliResult } from "../result";
@@ -76,6 +77,19 @@ describe("headless pane printer", () => {
     } as ResolvedPaneFunction, { config: createDefaultConfig("/tmp/gloomberb-headless-points") } as MarketContext, "");
     expect(report.data).toMatchObject({ rowCount: 2, empty: false });
     expect(report.text.split("\n").find((line) => line.startsWith("AAPL P/E"))?.trimEnd()).toMatch(/ 2$/);
+  });
+
+  test("series served in different bars name their own in a Bars column; series in one bar size need none", () => {
+    const series: HeadlessPaneDefinition<"series"> = { shape: "series", argument: { kind: "none" }, options: [], load: () => ({ series: [] }) };
+    const bars = (label: string, interval: string) => ({ id: label, label, interval, points: [{ date: "2026-11-17T16:30:00Z", close: 6 }] });
+    // G COPX, HG=F, where copper's 5-minute bars timed out and its daily ones answered.
+    const lines = renderHeadlessPaneText(series, { series: [bars("COPX Price", "5m"), bars("HG=F Price", "1d"), bars("CPI", "monthly")] }, args, "Chart")
+      .split("\n");
+    expect(lines.find((line) => line.startsWith("Series"))).toContain("Bars");
+    expect(lines.find((line) => line.startsWith("HG=F Price"))).toMatch(/ 1d +1$/);
+    expect(lines.find((line) => line.startsWith("COPX Price"))).toMatch(/ 5m +1$/);
+    const alike = renderHeadlessPaneText(series, { series: [bars("COPX Price", "5m"), bars("HG=F Price", "5m")] }, args, "Chart");
+    expect(alike).not.toContain("Bars");
   });
 
   test("--width wraps the notes, errors and source line under a table, and never cuts a cell", () => {
@@ -490,16 +504,17 @@ test("series text distinguishes explicit percent, basis-point, multiple and inde
   // A multiple prints to two decimals, or three significant digits where two would flatten it; the export keeps every digit.
   expect(text.split("\n").find(line => line.includes("Trailing P/E"))).toMatch(/38\.33\s+x/);
   expect(text.split("\n").find(line => line.includes("ETH over BTC"))).toMatch(/0\.0307\s+x/);
-  expect(text.split("\n").find(line => line.includes("Unknown unit"))).toMatch(/0\s+-/);
-  expect(text.split("\n").find(line => line.includes("Missing value"))).toMatch(/-\s+%/);
+  expect(text.split("\n").find(line => line.includes("Unknown unit"))).toMatch(new RegExp(String.raw`0\s+${MISSING_VALUE}`));
+  expect(text.split("\n").find(line => line.includes("Missing value"))).toMatch(new RegExp(String.raw`${MISSING_VALUE}\s+%`));
   expect(jsonData(definition, result)).toMatchObject({ data: { series: result.series } });
   // The unit is each row's currency_or_unit, beside a bare Value.
   const freshness = deriveHeadlessFreshness(definition, result);
   const csv = renderReportCsv(headlessReportTables(definition, result, args, "Research", freshness, { complete: true, unavailableSymbols: [] }), freshness);
-  const identity = "symbol_or_series,currency_or_unit,interval,source,as_of";
-  expect(csv).toContain(`# section: Credit percent\nDate,Value,${identity}\n2026-09-10,2.7,,%,,Gloom Cloud,2026-09-10\n`);
-  expect(csv).toContain(`# section: Credit basis points\nDate,Value,${identity}\n2026-09-10,270,,bp,,Gloom Cloud,2026-09-10\n`);
-  expect(csv).toContain(`# section: Trailing P/E\nDate,Value,${identity}\n2026-09-10,38.3292383292,,x,,Gloom Cloud,2026-09-10\n`);
+  const identity = "symbol_or_series,currency_or_unit,interval,source,as_of,retrieved_at";
+  const retrieved = freshness.retrievedAt;
+  expect(csv).toContain(`# section: Credit percent\nDate,Value,${identity}\n2026-09-10,2.7,,%,,Gloom Cloud,2026-09-10,${retrieved}\n`);
+  expect(csv).toContain(`# section: Credit basis points\nDate,Value,${identity}\n2026-09-10,270,,bp,,Gloom Cloud,2026-09-10,${retrieved}\n`);
+  expect(csv).toContain(`# section: Trailing P/E\nDate,Value,${identity}\n2026-09-10,38.3292383292,,x,,Gloom Cloud,2026-09-10,${retrieved}\n`);
   expect(renderHeadlessPaneText(definition, { series: [result.series.find(({ id }) => id === "missing")!] }, args, "Unknown")).not.toContain("Unit");
 });
 
@@ -510,24 +525,26 @@ test("a rows report of several symbols names each row's symbol and unit only whe
   ];
   const rows = [{ symbol: "NESN:SWX", currency: "CHF", price: 83.24 }, { symbol: "AAPL", currency: "USD", price: 348.27 }];
   const twoSymbols: HeadlessPaneLoadArgs = { rawArgument: "NESN:SWX AAPL", argument: "NESN:SWX AAPL", symbols: ["NESN:SWX", "AAPL"], options: {} };
+  let retrieved = "";
   const csvOf = (result: HeadlessRowsResult) => {
     const definition: HeadlessPaneDefinition<"rows"> = { shape: "rows", argument: { kind: "none" }, options: [], load: () => result };
     const freshness = deriveHeadlessFreshness(definition, result);
+    retrieved = freshness.retrievedAt;
     return renderReportCsv(headlessReportTables(definition, result, twoSymbols, "Peers", freshness, { complete: true, unavailableSymbols: [] }), freshness).split("\n");
   };
   // Reports that name their row fields (fn RV) write each row's own ticker and currency, the price bare under its header.
   const named = csvOf({ symbols: ["NESN:SWX", "AAPL"], columns, rows, rowSymbolKey: "symbol", rowUnitKey: "currency" });
   expect(named.slice(0, 3)).toEqual([
-    "Symbol,Last,status,symbol_or_series,currency_or_unit,interval,source,as_of",
-    "NESN:SWX,83.24,,NESN:SWX,CHF,,Gloom Cloud,",
-    "AAPL,348.27,,AAPL,USD,,Gloom Cloud,",
+    "Symbol,Last,status,symbol_or_series,currency_or_unit,interval,source,as_of,retrieved_at",
+    `NESN:SWX,83.24,,NESN:SWX,CHF,,Gloom Cloud,,${retrieved}`,
+    `AAPL,348.27,,AAPL,USD,,Gloom Cloud,,${retrieved}`,
   ]);
   // One that does not keeps the rows as it wrote them: a field called `currency` is not claimed to be the unit of every figure.
   const unnamed = csvOf({ symbols: ["NESN:SWX", "AAPL"], columns: [columns[0]!, { key: "price", header: "Last" }], rows });
   expect(unnamed.slice(0, 3)).toEqual([
-    "Symbol,Last,symbol_or_series,currency_or_unit,interval,source,as_of",
-    "NESN:SWX,83.24,,,,Gloom Cloud,",
-    "AAPL,348.27,,,,Gloom Cloud,",
+    "Symbol,Last,symbol_or_series,currency_or_unit,interval,source,as_of,retrieved_at",
+    `NESN:SWX,83.24,,,,Gloom Cloud,,${retrieved}`,
+    `AAPL,348.27,,,,Gloom Cloud,,${retrieved}`,
   ]);
 });
 
@@ -541,6 +558,41 @@ test("a series that asks for decimals prints them in text, while JSON and CSV ke
   expect(JSON.stringify(jsonData(definition, result))).not.toContain("textDecimals");
   const freshness = deriveHeadlessFreshness(definition, result);
   expect(renderReportCsv(headlessReportTables(definition, result, args, "Relationship", freshness, { complete: true, unavailableSymbols: [] }), freshness)).toContain("2026-10-21,0.418953387895,");
+});
+
+test("a continuous future's and a formula's contracts close each row, a roll marked on the window's first row as on any other", () => {
+  const definition: HeadlessPaneDefinition<"series"> = { shape: "series", argument: { kind: "none" }, options: [], load: () => ({ series: [] }) };
+  const result: HeadlessSeriesResult = { series: [
+    // CL=F rolled on the 16th, the first day in view: the bar before the window is the November contract.
+    { id: "cl", label: "CL=F", unit: "USD / barrel", points: [
+      { date: "2026-10-16", value: 87.1, contract: "CLZ26", roll: true }, { date: "2026-10-19", value: 87.4, contract: "CLZ26" }] },
+    { id: "crack", label: "3-2-1 crack spread", unit: "USD / barrel", formulaLegs: ["RB=F", "HO=F", "CL=F"], points: [
+      { date: "2026-10-16", value: 55.1452, roll: true, legs: [{ contract: "RBZ26", price: 2.4 }, { contract: "HOZ26", price: 3.1 }, { contract: "CLZ26", price: 87.1 }] }] },
+  ] };
+  const freshness = deriveHeadlessFreshness(definition, result);
+  const csv = renderReportCsv(headlessReportTables(definition, result, args, "Custom Chart", freshness, { complete: true, unavailableSymbols: [] }), freshness).split("\n");
+  const rowOf = (date: string, section: string) => csv.slice(csv.indexOf(`# section: ${section}`)).find((line) => line.startsWith(date))!;
+  expect(csv[csv.indexOf("# section: CL=F") + 1]).toEndWith(",retrieved_at,Contract,Roll,Partial");
+  expect(rowOf("2026-10-16", "CL=F")).toEndWith(",CLZ26,true,false");
+  expect(rowOf("2026-10-19", "CL=F")).toEndWith(",CLZ26,false,false");
+  expect(csv[csv.indexOf("# section: 3-2-1 crack spread") + 1]).toEndWith(",retrieved_at,RB=F Contract,HO=F Contract,CL=F Contract,Roll,Partial");
+  expect(rowOf("2026-10-16", "3-2-1 crack spread")).toEndWith(",RBZ26,HOZ26,CLZ26,true,false");
+});
+
+test("a series of a reported total prints compact in text, while JSON and CSV keep every digit and do not carry the flag", () => {
+  const definition: HeadlessPaneDefinition<"series"> = { shape: "series", argument: { kind: "none" }, options: [], load: () => ({ series: [] }) };
+  const result: HeadlessSeriesResult = { series: [
+    { id: "revenue", label: "CSCO Revenue", unit: "USD", textCompact: true, points: [{ date: "2026-07-25", value: 63_325_000_000 }] },
+    { id: "eps", label: "CSCO EPS", unit: "USD/share", textCompact: true, points: [{ date: "2026-07-25", value: 2.2 }] },
+  ] };
+  const lines = renderHeadlessPaneText(definition, result, args, "Fundamental Graph").split("\n");
+  expect(lines.find((line) => line.startsWith("CSCO Revenue"))).toMatch(/2026-07-25 +63\.33B +USD/);
+  // A figure under a thousand is not compacted into a different number.
+  expect(lines.find((line) => line.startsWith("CSCO EPS"))).toMatch(/2026-07-25 +2\.2 +USD\/share/);
+  expect(JSON.stringify(jsonData(definition, result))).not.toContain("textCompact");
+  expect(JSON.stringify(jsonData(definition, result))).toContain("63325000000");
+  const freshness = deriveHeadlessFreshness(definition, result);
+  expect(renderReportCsv(headlessReportTables(definition, result, args, "Fundamental Graph", freshness, { complete: true, unavailableSymbols: [] }), freshness)).toContain("2026-07-25,63325000000,");
 });
 
 test("a series observed by the day is dated without a time in text and CSV, one read at a time of day keeps it, and ratios and scores print rounded", () => {
@@ -654,7 +706,7 @@ describe("fn --csv", () => {
       "HP,2026-10-01,37614444,",
       "SBK.JO,2026-10-01,1838873,",
       "",
-      "# Source: SEC EDGAR · Thu 1 Oct 2026 00:00 UTC · not a live feed (filed data)",
+      "# Source: SEC EDGAR · Thu 1 Oct 2026 · not a live feed (filed data)",
       "# Publisher: U.S. Securities and Exchange Commission",
       "# Observation date: 2026-10-01T00:00:00.000Z",
       "# Publication time: 2026-10-02T20:05:00.000Z",
@@ -679,8 +731,8 @@ describe("fn --csv", () => {
     const csv = serializeCliResult({ data: report.data, exportFreshness: report.data.freshness }, { ...DEFAULT_CLI_OPTIONS, format: "csv" }, {
       text: () => report.text, tables: report.tables,
     }).split("\n");
-    const identity = "symbol_or_series,currency_or_unit,interval,source,as_of";
-    const asOf = "SEC EDGAR,2026-10-08T14:30:00.000Z";
+    const identity = "symbol_or_series,currency_or_unit,interval,source,as_of,retrieved_at";
+    const asOf = `SEC EDGAR,2026-10-08T14:30:00.000Z,${report.data.freshness.retrievedAt}`;
     expect(csv.slice(0, 13)).toEqual([
       "# section: AAPL",
       `Date,Open,High,Low,Close,Volume,${identity}`,

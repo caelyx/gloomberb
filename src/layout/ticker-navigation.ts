@@ -6,7 +6,7 @@ import {
   type PaneInstanceConfig,
 } from "../types/config";
 import type { PaneDef } from "../types/plugin";
-import { findPaneLocation, isPaneInLayout } from "./pane-manager";
+import { isPaneInLayout } from "./pane-manager";
 import type { BrokerContractRef } from "../types/instrument";
 import { scopedBrokerContractIdentityKey } from "../utils/instrument-identity";
 
@@ -45,21 +45,6 @@ export function isTickerLinkPeer(
   return instance.paneId === TICKER_RESEARCH_PANE_ID || canFollowTickerSource(instance, panes);
 }
 
-/** True when `fromInstanceId`'s follow chain reaches `targetInstanceId`. */
-export function followBindingReaches(
-  layout: LayoutConfig,
-  fromInstanceId: string,
-  targetInstanceId: string,
-  seen = new Set<string>(),
-): boolean {
-  if (seen.has(fromInstanceId)) return false;
-  seen.add(fromInstanceId);
-  const instance = findPaneInstance(layout, fromInstanceId);
-  if (instance?.binding?.kind !== "follow") return false;
-  const next = instance.binding.sourceInstanceId;
-  return next === targetInstanceId || followBindingReaches(layout, next, targetInstanceId, seen);
-}
-
 /** The visible Ticker Research pane that follows `sourceInstanceId`, if any. */
 export function findTickerResearchFollower(
   layout: LayoutConfig,
@@ -75,17 +60,26 @@ export function findTickerResearchFollower(
 }
 
 /**
- * Enter opens the follower already bound to the source pane; Shift+Enter (`newPane`) and sources
- * without a follower fall back to opening a ticker pane.
+ * Enter focuses the follower already bound to the source pane. A source without one opens the
+ * ticker in a research pane, reusing a pinned one rather than stacking another: the one the app
+ * unlinked (`PaneUnlinkedFrom.auto`), else the only one the layout has. Shift+Enter (`newPane`)
+ * opens a new pane.
  */
 export function resolveTickerActivation(
   layout: LayoutConfig,
   sourcePaneId: string | null | undefined,
   options?: { newPane?: boolean },
-): { kind: "focus"; paneId: string } | { kind: "open" } {
+): { kind: "focus"; paneId: string } | { kind: "open"; reusePaneId?: string } {
   if (options?.newPane) return { kind: "open" };
   const follower = findTickerResearchFollower(layout, sourcePaneId);
-  return follower ? { kind: "focus", paneId: follower.instanceId } : { kind: "open" };
+  if (follower) return { kind: "focus", paneId: follower.instanceId };
+  const pinned = layout.instances.filter((instance) => (
+    instance.paneId === TICKER_RESEARCH_PANE_ID
+    && instance.binding?.kind === "fixed"
+    && isPaneInLayout(layout, instance.instanceId)
+  ));
+  const reuse = pinned.find((instance) => instance.unlinkedFrom?.auto) ?? (pinned.length === 1 ? pinned[0] : undefined);
+  return reuse ? { kind: "open", reusePaneId: reuse.instanceId } : { kind: "open" };
 }
 
 export function resolveTickerNavigationReplacementPane(
@@ -104,16 +98,14 @@ export function findFixedTickerPaneForSymbol(
   symbol: string,
   instrument?: BrokerContractRef | null,
 ): PaneInstanceConfig | null {
-  const matches = layout.instances.filter((instance) =>
+  return layout.instances.find((instance) =>
     instance.paneId === normalizePaneId(paneId)
     && instance.binding?.kind === "fixed"
     && instance.binding.symbol === symbol
     && (instance.binding.instrument === undefined ? "unspecified" : instance.binding.instrument === null ? "public" : scopedBrokerContractIdentityKey(instance.binding.instrument))
       === (instrument === undefined ? "unspecified" : instrument === null ? "public" : scopedBrokerContractIdentityKey(instrument))
     && isPaneInLayout(layout, instance.instanceId)
-  );
-  // One in this window's grid or floating over the same ticker in another window.
-  return matches.find((instance) => findPaneLocation(layout, instance.instanceId)?.window === "main") ?? matches[0] ?? null;
+  ) ?? null;
 }
 
 export function shouldFocusTickerNavigationTarget({

@@ -8,6 +8,10 @@ import { splitSymbolArgs, splitSymbolWords, symbolInputKey } from "../../../../c
 import { notASymbolError } from "../../../../cli/symbol-cells";
 import { readSymbolList, SymbolListError } from "../../../../cli/symbol-list";
 import { cliStyles } from "../../../../utils/cli-output";
+import { listProgressNotice } from "../../../../cli/list-progress";
+import { shellWord } from "../../../../utils/shell-word";
+import { logFailure } from "../../../../utils/log-failure";
+import { parsePublicTickerKey } from "../../../../utils/exchanges";
 import { dryRunNote } from "../../../../cli/helpers";
 import {
   addSymbol,
@@ -25,6 +29,9 @@ import {
   type Verb,
 } from "../../../../cli/symbol-rows";
 import { failPortfolioCommand } from "./shared";
+import type { DataProvider } from "../../../../types/data-provider";
+import { apiClient } from "../../../../api-client";
+import { listLookups, signedOutAllowances } from "../../../../tickers/batched-lookups";
 
 export { addSymbols };
 
@@ -46,14 +53,7 @@ export const SYMBOL_LIST_HELP = {
   ],
 };
 
-/**
- * One word of a command line as a shell reads it back: as written when it
- * holds nothing a shell treats specially (`NVDA`, `SAN:EPA`, `BRK.B`), else
- * in single quotes (`'Altria Group'`, `'$nvda'`, `'AT&T'`).
- */
-export function shellWord(word: string): string {
-  return /^[\p{L}\p{N}._:@%+,/][\p{L}\p{N}._:@%+,/=-]*$/u.test(word) ? word : `'${word.replaceAll("'", "'\\''")}'`;
-}
+export { shellWord };
 
 /**
  * A row's line, and under it the listing a company's name was read as, the
@@ -113,7 +113,8 @@ function unansweredLines(rows: readonly SymbolRow[], retry: ((keys: string) => s
  */
 function choiceOffers(choices: readonly SymbolRow[], retry: ((keys: string) => string) | undefined): { successors: string | null; matches: string | null } {
   const successors = [...new Set(choices.flatMap((row) => row.tradesAs ? [row.tradesAs] : []))];
-  const matches = [...new Set(choices.flatMap((row) => row.listing ? [row.listing] : []))];
+  // Only a match its venue names: a bare one (UBSH, a symbol that last traded in 2019) needs the same choice again.
+  const matches = [...new Set(choices.flatMap((row) => row.listing && parsePublicTickerKey(row.listing).exchange ? [row.listing] : []))];
   const command = (keys: string[]) => retry ? retry(keys.map(shellWord).join(" ")) : keys.join(" ");
   const one = choices.length === 1;
   return {
@@ -198,11 +199,13 @@ export function printSymbolRows(
 export async function addOneSymbol(
   ctx: CliCommandContext,
   market: MarketContext,
-  { symbol, exchange, collection, notes: inputNotes = [], retry, reject, add }: {
+  { symbol, exchange, collection, notes: inputNotes = [], retry, reject, add, member }: {
     symbol: string;
     exchange: string | undefined;
     notes?: readonly string[];
     collection: CollectionRef;
+    /** Whether a saved row is in the list added to (`addSymbol`). */
+    member?: (ticker: TickerRecord) => boolean;
     /** The add of one listing, for the choices a failure names. */
     retry: (key: string) => string;
     reject?: (input: string) => Error | null;
@@ -211,7 +214,7 @@ export async function addOneSymbol(
 ): Promise<void> {
   const { dataProvider, store } = market;
   const dryRun = ctx.cliOptions.dryRun;
-  const { row, error, lookup } = await addSymbol(symbol, { exchange, store, dataProvider, reject, retry, dryRun, add });
+  const { row, error, lookup } = await addSymbol(symbol, { exchange, store, dataProvider, reject, retry, dryRun, add, member });
   if (row.status === "needs_choice") {
     const message = row.message ?? symbol;
     const { successors, matches } = choiceOffers([row], retry);
@@ -235,12 +238,38 @@ export async function addOneSymbol(
   });
 }
 
+/**
+ * The data provider a list add reads through: reading its names and looking
+ * its symbols up share their answers, and signed out, its requests keep to
+ * the service's allowance, waiting for room rather than being refused. The
+ * CLI holds only the saved session's token, so the session is checked first:
+ * a verified account is not paced as a signed-out caller.
+ */
+export async function listAddLookups(dataProvider: DataProvider): Promise<DataProvider> {
+  const verified = await apiClient.ensureVerifiedSession()
+    .catch(logFailure("portfolio-list.bulk-symbols", "Checking the session before a list add failed", null));
+  return listLookups(dataProvider, { allowances: verified ? null : signedOutAllowances() });
+}
+
 /** A line on standard error while a long add waits to look symbols up again, so it never looks stuck. */
 export function retryNotice(ctx: CliCommandContext): (count: number, waitMs: number) => void {
   return (count, waitMs) => {
     if (ctx.cliOptions.quiet) return;
     console.error(cliStyles.muted(`Gloom Cloud refused some requests; looking ${count} symbol${count === 1 ? "" : "s"} up again in ${Math.round(waitMs / 1000)} s.`));
   };
+}
+
+/**
+ * Lines on standard error while an add of several symbols is slow to look
+ * them up: "Looking up 10 symbols." two seconds in when none is settled yet,
+ * else "Looked up 4 of 10 symbols.", which it says again every five seconds
+ * until all are (`listProgressNotice`).
+ */
+export function progressNotice(
+  ctx: Pick<CliCommandContext, "cliOptions">,
+  timing: { afterMs?: number; everyMs?: number } = {},
+): (looked: number, total: number) => void {
+  return listProgressNotice(ctx, (looked, total, told) => told || looked > 0 ? `Looked up ${looked} of ${total} symbols.` : `Looking up ${total} symbols.`, timing);
 }
 
 /**

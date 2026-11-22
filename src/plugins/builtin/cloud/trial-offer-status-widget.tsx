@@ -7,14 +7,14 @@
  *
  * The arm is asked for when the offer would show, in both arms, and that is
  * the exposure (`exposeWebExperiment`); the control shows nothing. The line
- * sits beside the signed-out Log in, where signed-in free accounts see
- * "delayed data · upgrade", and never covers the terminal. Like the other
+ * sits beside the signed-out Log in and the delayed mark, which then stands
+ * without its "delayed", and never covers the terminal. Like the other
  * status bar chips it takes no keyboard focus: its tooltip names UPGRADE, and
  * the Hide Pro Trial Offer command hides it. Hiding keeps it away for 14 days.
  * Where the status bar has no room for it, as on a phone, it never shows and
  * neither arm is counted.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { apiClient } from "../../../api-client";
 import { usePlanAccess } from "../../../api-client/plan-access";
 import { exposeWebExperiment } from "../../../api-client/research-activity";
@@ -88,6 +88,27 @@ interface TrialOfferStatusWidgetProps {
   delayMs?: number;
 }
 
+let offerShowing = false;
+const offerListeners = new Set<() => void>();
+
+function setOfferShowing(next: boolean): void {
+  if (offerShowing === next) return;
+  offerShowing = next;
+  for (const listener of offerListeners) listener();
+}
+
+function subscribeOfferShowing(listener: () => void): () => void {
+  offerListeners.add(listener);
+  return () => {
+    offerListeners.delete(listener);
+  };
+}
+
+/** Whether the offer line is in the status bar, so the upgrade chip beside it does not pitch Pro twice. */
+export function useTrialOfferShowing(): boolean {
+  return useSyncExternalStore(subscribeOfferShowing, () => offerShowing, () => offerShowing);
+}
+
 export function TrialOfferStatusWidget(props: TrialOfferStatusWidgetProps) {
   if (getCurrentPluginTarget() !== "web") return null;
   return <WebTrialOffer {...props} />;
@@ -140,7 +161,7 @@ function WebTrialOffer({ expose = exposeWebExperiment, delayMs = TRIAL_OFFER_DEL
   }, [delayMs, expose, fits, onScreen, signedOut, state]);
 
   const showing = state === "shown" && signedOut && !isTrialOfferSnoozed(dismissedAt) && copy !== null;
-  // The version chip and the desktop link give way to the line.
+  // The connection note gives way to the line.
   useStatusWidgetClaim("trial-offer", showing && copy ? copy.columns : 0);
   const hide = useCallback(() => {
     setDismissedAt(Date.now());
@@ -150,8 +171,10 @@ function WebTrialOffer({ expose = exposeWebExperiment, delayMs = TRIAL_OFFER_DEL
   useEffect(() => {
     if (!showing) return;
     hideShowingOffer = hide;
+    setOfferShowing(true);
     return () => {
       if (hideShowingOffer === hide) hideShowingOffer = null;
+      setOfferShowing(false);
     };
   }, [hide, showing]);
 

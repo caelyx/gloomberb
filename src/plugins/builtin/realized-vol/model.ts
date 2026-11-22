@@ -1,10 +1,12 @@
-import { barsPerYear, type BarsPerYear } from "../../../market-data/bars-per-year";
+import { barsPerYear, currencyPairInstrument, type BarsPerYear } from "../../../market-data/bars-per-year";
 import type { PricePoint } from "../../../types/financials";
 import {
   REALIZED_VOLATILITY_WINDOWS, realizedVolatilityCadenceIssue, realizedVolatilityResult, rollingRealizedVolatility, volatilityCone,
   type RealizedVolatilityEstimator, type RollingRealizedVolatilityPoint, type VolatilityConeStatistics,
 } from "../shared/volatility";
 import type { SurfaceExpiry, SurfaceSnapshot } from "../vol-surface/model";
+import { formingBarsState, isFormingBar } from "../shared/forming-bars";
+import { rollAdjustedHistory } from "../../../market-data/futures-roll-returns";
 
 export interface RealizedVolatilityModel {
   symbol: string;
@@ -13,19 +15,49 @@ export interface RealizedVolatilityModel {
   windows: number[];
   history: PricePoint[];
   series: RollingRealizedVolatilityPoint[];
-  /** The cone always includes all seven standard windows, independent of chart selection. */
+  /** The cone's rows: `coneWindows`, every standard window unless asked, independent of chart selection. */
   cone: VolatilityConeStatistics[];
   asOf: Date | null;
   /** What the volatility is annualised at, read from the series' own dates. */
   barsPerYear: BarsPerYear;
   warnings: string[];
+  /**
+   * The windows the history is too short for, longest last: a stock that
+   * listed in May has no 180- or 260-bar estimate yet, and nothing failed.
+   */
+  shortWindows: number[];
+  /**
+   * What a short history leaves out, said once: "History starts 2026-05-07: 121
+   * daily bars so far; the 180- and 260-bar windows need more". Null when the
+   * history covers the lookback and every window.
+   */
+  historyNote: string | null;
+  /**
+   * The newest session left out while it is not final, as BT leaves it out:
+   * "2026-10-30 is still forming (partial) and left out: the estimates run
+   * through 2026-10-29, the last complete session". Null when every bar is final.
+   */
+  formingNote: string | null;
+  /** A continuous future's estimates read within one contract at each roll: "rolls back-adjusted" (rollAdjustedHistory). Null for anything else. */
+  rollNote: string | null;
+}
+
+/** "the 180-bar window", "the 180- and 260-bar windows", "the 90-, 180- and 260-bar windows". */
+function windowsText(windows: readonly number[]): string {
+  if (windows.length === 1) return `the ${windows[0]}-bar window`;
+  const head = windows.slice(0, -1).map((window) => `${window}-`);
+  return `the ${head.join(", ")} and ${windows.at(-1)}-bar windows`;
 }
 
 export interface RealizedVolatilityProjectionOptions {
   symbol: string;
+  /** The listing's exchange: a CCY listing is a currency pair, annualised at 260 bars as USDJPY=X is. */
+  exchange?: string;
   estimator?: RealizedVolatilityEstimator;
   lookbackYears?: 1 | 2;
   windows?: readonly number[];
+  /** The cone's rows, and the windows a short history or a failed estimate is said for: every standard window when left out. */
+  coneWindows?: readonly number[];
 }
 
 function lookbackCutoff(date: Date, years: number): number {
@@ -42,9 +74,16 @@ export function projectRealizedVolatility(
 ): RealizedVolatilityModel {
   const estimator = options.estimator ?? "close-to-close";
   const lookbackYears = options.lookbackYears === 2 ? 2 : 1;
+  // A currency pair's year is every weekday, however much of its history is loaded.
+  const instrument = currencyPairInstrument(options.symbol, options.exchange);
   const windows = [...new Set(options.windows ?? REALIZED_VOLATILITY_WINDOWS)]
     .filter((window) => REALIZED_VOLATILITY_WINDOWS.some((standard) => standard === window));
+  const coneWindows = REALIZED_VOLATILITY_WINDOWS.filter((window) => !options.coneWindows || options.coneWindows.includes(window));
   const warnings: string[] = [];
+  // What follows from a history shorter than the windows and lookback asked for: notes, not failures.
+  let shortLookback = false;
+  let shortWarmup = false;
+  const shortWindows: number[] = [];
   const dates = new Map<number, PricePoint>();
   for (const point of points) {
     const date = new Date(point.date);
@@ -55,35 +94,48 @@ export function projectRealizedVolatility(
     }
     dates.set(date.getTime(), { ...point, date });
   }
-  const history = [...dates.entries()].sort(([a], [b]) => a - b).map(([, point]) => point);
+  const served = [...dates.entries()].sort(([a], [b]) => a - b).map(([, point]) => point);
+  // A session still trading moves every estimate it is in until it ends: left out, as BT leaves it out, and said.
+  const forming = served.filter(isFormingBar);
+  const history = forming.length ? served.filter((point) => !isFormingBar(point)) : served;
   const asOf = history.at(-1)?.date ?? null;
+  const day = (date: Date) => date.toISOString().slice(0, 10);
+  const formingNote = forming.length === 0 ? null
+    : `${forming.map((point) => day(point.date)).join(", ")} ${formingBarsState(forming)} and left out`
+      + `${asOf ? `: the estimates run through ${day(asOf)}, the last complete session` : ""}`;
   const cutoff = asOf ? lookbackCutoff(asOf, lookbackYears) : 0;
   const cadenceIssue = realizedVolatilityCadenceIssue(history);
   if (cadenceIssue) warnings.push(cadenceIssue);
+  // A continuous future's returns are each one contract's; the price drawn beside them stays as traded.
+  const returns = rollAdjustedHistory(history, options.symbol);
   const series = cadenceIssue
     ? history.map((point) => ({ date: point.date, values: Object.fromEntries(windows.map((window) => [window, null])) }))
-    : rollingRealizedVolatility(history, { windows, estimator });
-  const cone = volatilityCone(cadenceIssue ? [] : history, { estimator, lookbackYears });
+    : rollingRealizedVolatility(returns.points, { windows, estimator, instrument });
+  const cone = volatilityCone(cadenceIssue ? [] : returns.points, { windows: coneWindows, estimator, lookbackYears, instrument });
   const visible = history.filter((point) => point.date.getTime() > cutoff);
   const visibleSeries = series.filter((point) => point.date.getTime() > cutoff);
-  if (history.length > 0 && history[0]!.date.getTime() > cutoff) {
-    warnings.push(`History covers less than the requested ${lookbackYears}Y lookback`);
-  }
-  for (const window of history.length > 0 && !cadenceIssue ? REALIZED_VOLATILITY_WINDOWS : []) {
-    const result = realizedVolatilityResult(history, window, estimator);
-    if (result.reason === "insufficient-history") warnings.push(`HV${window} needs more daily history`);
+  if (history.length > 0 && history[0]!.date.getTime() > cutoff) shortLookback = true;
+  for (const window of history.length > 0 && !cadenceIssue ? coneWindows : []) {
+    const result = realizedVolatilityResult(returns.points, window, estimator, instrument);
+    if (result.reason === "insufficient-history") shortWindows.push(window);
     else if (result.reason) warnings.push(`HV${window} unavailable: ${result.reason.replaceAll("-", " ")}`);
   }
   const priorWarmup = history.filter((point) => point.date.getTime() <= cutoff).length;
   const requiredWarmup = estimator === "close-to-close" || estimator === "yang-zhang" ? 260 : 259;
   if (history.length > 0 && !cadenceIssue && priorWarmup < requiredWarmup) {
-    warnings.push("Long-window cone estimates do not cover the complete lookback");
+    shortWarmup = true;
   } else if (!cadenceIssue && cone.some((row) => row.sampleSize < visible.length)) {
     warnings.push("Unavailable historical estimates reduce volatility-cone sample coverage");
   }
+  const first = history[0]?.date.toISOString().slice(0, 10);
+  // Where the history starts, never read as the listing date: a source's first bar is not proof of when it listed.
+  const historyNote = !first || (!shortLookback && !shortWarmup && !shortWindows.length) ? null
+    : `History starts ${first}: ${history.length} daily bars so far; ${shortWindows.length
+      ? `${windowsText(shortWindows)} need${shortWindows.length === 1 ? "s" : ""} more`
+      : "the long windows' cone covers part of the lookback"}`;
   return { symbol: options.symbol.trim().toUpperCase(), estimator, lookbackYears, windows,
-    history: visible, series: visibleSeries, cone, asOf, barsPerYear: barsPerYear(history.map((point) => point.date)),
-    warnings: [...new Set(warnings)] };
+    history: visible, series: visibleSeries, cone, asOf, barsPerYear: barsPerYear(history.map((point) => point.date), instrument),
+    warnings: [...new Set(warnings)], shortWindows, historyNote, formingNote, rollNote: cadenceIssue ? null : returns.note };
 }
 
 interface CurrentAtmIvReference {
@@ -105,6 +157,11 @@ export interface CurrentAtmIvSnapshot {
   warnings: string[];
   /** The underlying has no option chain in the sources, so there is no IV to show and nothing failed. */
   noOptionChain?: boolean;
+}
+
+/** When an IV was observed, to the minute in UTC (`2026-10-27 20:14 UTC`), in the pane and the report alike. */
+export function atmIvObservedLabel(date: Date): string {
+  return `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
 }
 
 /** A LEAPS ATM IV is not comparable with a 10 to 260 session realized cone. */

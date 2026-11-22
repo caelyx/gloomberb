@@ -25,7 +25,7 @@
     {
       "id": "alt-data",
       "name": "Supply Chain & Alt Data",
-      "description": "Supply chains and exposure, government awards, hiring, apps and job postings, social mentions, research attention, GPU prices, and power queues.",
+      "description": "Supply chains and exposure, government awards, hiring, apps and job postings, social mentions, GPU prices, and power queues.",
       "tagline": "Supply chains, hiring, apps, GPUs and power.",
       "categories": [
         "research",
@@ -55,12 +55,6 @@
         "capabilities": [],
         "broker": false,
         "shortcuts": [
-          {
-            "code": "ATTN",
-            "name": "Research Attention",
-            "description": "Pro research attention: rankings, abnormal activity, sectors, countries and privacy-qualified hourly history.",
-            "access": "preview"
-          },
           {
             "code": "GPU",
             "name": "GPU Rental Prices",
@@ -117,7 +111,7 @@
           {
             "code": "BUZZ",
             "name": "Social Mentions",
-            "description": "Daily posts on X naming the ticker's cashtag, the day's top posts and their stance."
+            "description": "Daily posts on X naming the ticker's cashtag, the day's top posts and their stance; alone, the tickers whose posts jump above their own median."
           }
         ]
       },
@@ -153,7 +147,8 @@
           "docs",
           "help",
           "layout-marketplace",
-          "plugin-marketplace"
+          "plugin-marketplace",
+          "roadmap"
         ],
         "capabilities": [],
         "broker": false,
@@ -182,6 +177,11 @@
             "code": "DOCS",
             "name": "Docs",
             "description": "Read the docs and Academy lessons in the app: search them, or open a function's entry."
+          },
+          {
+            "code": "ROADMAP",
+            "name": "Roadmap",
+            "description": "What is being built, what is planned and what shipped. Pro members vote on what comes next."
           }
         ]
       },
@@ -342,12 +342,12 @@
           {
             "code": "CRD",
             "name": "Credit Spreads",
-            "description": "ICE BofA option-adjusted spreads from FRED: US investment grade and high yield by rating, and euro high yield."
+            "description": "ICE BofA option-adjusted spreads from FRED: US investment grade and high yield by rating, euro high yield, and emerging markets and Asia corporates."
           },
           {
             "code": "AUCT",
             "name": "Treasury Auctions",
-            "description": "Bill, note, bond, and TIPS auction results from Treasury Fiscal Data: rate, stop-out versus average, bid-to-cover, indirect, direct and dealer takedown, and size. Search by benchmark (10Y) or CUSIP."
+            "description": "Bill, note, bond and TIPS auction results since 1979, from Treasury Fiscal Data and TreasuryDirect: rate, stop-out versus median, bid-to-cover, bidder takedown and size; an after view ranks each auction against its tenor and shows the yield's moves after it. Search by benchmark (10Y) or CUSIP. Hong Kong's EF Bills, EF Notes and Government Bond tenders too."
           },
           {
             "code": "YAS",
@@ -362,7 +362,7 @@
           {
             "code": "DTS",
             "name": "Treasury Cash and Debt",
-            "description": "Treasury operating cash for the latest day, and debt held by the public for the last 20 business days."
+            "description": "Treasury operating cash for the latest day with the Treasury General Account's closing balance history, and debt held by the public for the last 20 business days."
           },
           {
             "code": "PDLR",
@@ -437,7 +437,7 @@
           {
             "code": "PERP",
             "name": "Perpetuals",
-            "description": "Perpetual funding, open interest and premiums by market and venue, with rankings, a venue comparison and Pro history.",
+            "description": "Perpetual funding, open interest and premiums by market and venue, with rankings, a venue comparison, liquidations, order book depth and Pro history.",
             "access": "preview"
           }
         ]
@@ -531,12 +531,12 @@
           {
             "code": "ERN",
             "name": "Earnings Calendar",
-            "description": "The market's report days with implied and past moves; with a ticker, its report history."
+            "description": "A company's report history with surprises and moves; several tickers, their next reports; none, the market board."
           },
           {
             "code": "EVTS",
             "name": "Earnings Days",
-            "description": "The market's report days with implied and past moves; a ticker picks its row."
+            "description": "The market board: report days by week or day, with implied and past moves; a ticker opens its report day and selects its row."
           },
           {
             "code": "CALLS",
@@ -678,7 +678,7 @@
           },
           {
             "code": "COT",
-            "name": "CFTC Positioning",
+            "name": "Trader Positioning",
             "description": "Weekly futures positioning, changes, historical percentiles and cross-market extremes."
           },
           {
@@ -750,7 +750,7 @@
           {
             "code": "MAP",
             "name": "World Map",
-            "description": "A world map with trading venues and their hours; ships, ports, energy and airports as layers."
+            "description": "A world map with trading venues and their hours; ships, ports, energy, airports and AI buildout facilities as layers."
           },
           {
             "code": "CHOKE",
@@ -770,7 +770,7 @@
           {
             "code": "FXC",
             "name": "FX Cross Rates",
-            "description": "Currency cross-rate matrix for major FX pairs."
+            "description": "Currency cross-rate matrix for major FX pairs, and an amount converted into each currency."
           },
           {
             "code": "RRG",
@@ -813,6 +813,7 @@
           "account-management",
           "askg",
           "buildout",
+          "buildout-company",
           "chat",
           "congress-trades",
           "team",
@@ -850,12 +851,12 @@
           {
             "code": "TBO",
             "name": "TheBuildout",
-            "description": "Open TheBuildout infrastructure intelligence.",
-            "targets": [
-              "cli",
-              "tui",
-              "desktop"
-            ]
+            "description": "Open TheBuildout infrastructure intelligence: themes, companies, sites and intel."
+          },
+          {
+            "code": "TBOC",
+            "name": "TheBuildout Company",
+            "description": "One company in TheBuildout: its power and hosting deals, suppliers and customers as a flow, its sites, hiring by site and the signals that name it."
           },
           {
             "code": "CG",
@@ -896,7 +897,7 @@
           {
             "code": "MEMB",
             "name": "Index and ETF members",
-            "description": "ETF holdings, member returns, daily contributions, breadth and index changes."
+            "description": "ETF holdings, member returns, daily contributions, breadth and index changes, and the ETFs holding a stock."
           }
         ]
       },
@@ -1070,8 +1071,8 @@
           },
           {
             "code": "CSP",
-            "name": "Cash-Secured Put Screen",
-            "description": "Cash-secured puts across a list, ranked by annualised yield at the bid, with % OTM, delta, IV rank, spread and an earnings flag."
+            "name": "Options Strategy Screen",
+            "description": "Cash-secured puts, covered calls, verticals, iron condors, straddles, strangles and calendars across a list, ranked, with max gain and loss, break-evens, probability of profit, IV rank, spread and an earnings flag."
           },
           {
             "code": "OSA",
@@ -1155,7 +1156,7 @@
           {
             "code": "INS",
             "name": "Insider",
-            "description": "Insider transactions for a ticker; alone, the companies whose insiders are buying or selling."
+            "description": "Insider transactions for a ticker; for several, their insiders; alone, the companies whose insiders are buying or selling."
           },
           {
             "code": "SI",
@@ -1220,7 +1221,7 @@
         "shortcuts": [
           {
             "code": "PF",
-            "name": "Collection Pane",
+            "name": "Portfolio",
             "description": "Holdings, weights and P&L of a portfolio or watchlist; set target weights to see drift and the trades that rebalance"
           },
           {
@@ -1354,7 +1355,7 @@
           {
             "code": "ECST",
             "name": "Economic Statistics",
-            "description": "Inflation, labour, growth, housing and rates against their own history."
+            "description": "US inflation, labour, growth, housing and rates against their own history."
           },
           {
             "code": "CPI",
@@ -1374,12 +1375,12 @@
           {
             "code": "BTMM",
             "name": "Money Markets",
-            "description": "Funding rates, Treasury bills and Federal Reserve liquidity with historical context."
+            "description": "Funding rates, Treasury bills and Federal Reserve liquidity, and Hong Kong's Exchange Fund Bill yields, with historical context."
           },
           {
             "code": "CBR",
             "name": "Central Bank Rates",
-            "description": "Policy rates of the G20, SNB, Norges Bank, Riksbank and RBNZ, last observed changes and dated historical context."
+            "description": "Policy rates of the G20, SNB, Norges Bank, Riksbank, RBNZ, Egypt and Nigeria, last observed changes and dated historical context."
           },
           {
             "code": "VIX",
@@ -1412,7 +1413,7 @@
     {
       "id": "research-search",
       "name": "Research Search",
-      "description": "Full-text search across earnings call transcripts, news wires, and SEC filings, with saved searches and keyword alerts.",
+      "description": "Full-text search across earnings call transcripts, news wires, and SEC filings, with saved searches; free with a Gloom account, alerts on new hits are Pro.",
       "tagline": "Search calls, wires and filings.",
       "categories": [
         "research",
@@ -1435,8 +1436,7 @@
           {
             "code": "SRCH",
             "name": "Research Search",
-            "description": "Full-text search across earnings call transcripts, news wires, and SEC filings, with saved searches and keyword alerts.",
-            "access": "pro"
+            "description": "Full-text search across earnings call transcripts, news wires, and SEC filings, with saved searches; free with a Gloom account, alerts on new hits are Pro."
           }
         ]
       },
@@ -1493,7 +1493,7 @@
           {
             "code": "FLOW",
             "name": "Options Flow",
-            "description": "Unusual options activity: sweeps, blocks, and large premium prints.",
+            "description": "Unusual options activity: sweeps, blocks, large premium prints, and the net premium tide.",
             "access": "pro"
           },
           {
@@ -1608,7 +1608,7 @@
           {
             "code": "CMP",
             "name": "Comparison Chart",
-            "description": "Compare price returns over shared observation dates for two or more tickers. A leveraged or inverse fund gets its daily objective drawn from its index fund (3× daily QQQ beside TQQQ) and its decay against it."
+            "description": "Compare price returns over shared observation dates for two or more tickers, or total returns with distributions reinvested. A leveraged or inverse fund gets its daily objective drawn from its index fund (3× daily QQQ beside TQQQ) and its decay against it."
           },
           {
             "code": "GF",

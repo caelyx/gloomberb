@@ -3,7 +3,7 @@ import { act, useMemo, useState } from "react";
 import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
 import { MarketDataCoordinator, setSharedMarketDataCoordinator } from "../../../market-data/coordinator";
 import { createTestDataProvider } from "../../../test-support/data-provider";
-import type { MarketDataRequestContext, QuoteBatchResult, QuoteSubscriptionTarget } from "../../../types/data-provider";
+import type { MarketDataRequestContext, QuoteBatchOptions, QuoteBatchResult, QuoteSubscriptionTarget } from "../../../types/data-provider";
 import type { Quote } from "../../../types/financials";
 import { Text } from "../../../ui";
 import { PluginRenderProvider, type PluginRuntimeAccess } from "../../runtime";
@@ -256,6 +256,151 @@ describe("useQuoteBoard cache first", () => {
   });
 });
 
+describe("useQuoteBoard follow-ups", () => {
+  test("a batch's priced rows paint as it answers; each symbol it leaves fills only its own row, or shows the batch's dated price as stale", async () => {
+    const dated = { ...quote("C", 7), lastUpdated: 1_699_990_000_000, stale: true };
+    const datedD = { ...quote("D", 9), lastUpdated: 1_699_990_000_000, stale: true };
+    const asked: Array<[string, MarketDataRequestContext | undefined]> = [];
+    const getQuote = (symbol: string, _exchange?: string, context?: MarketDataRequestContext): Promise<Quote> => {
+      asked.push([symbol, context]);
+      // B's and D's own reads never answer; C's fails.
+      return symbol === "B" || symbol === "D" ? new Promise<Quote>(() => {}) : Promise.reject(new Error("UPSTREAM_ERROR"));
+    };
+    // Like the router: without deferred follow-ups it answers only once it has asked for B and C alone.
+    const provider = {
+      getQuote,
+      getQuotesBatch: async (targets: QuoteSubscriptionTarget[], options?: QuoteBatchOptions): Promise<QuoteBatchResult[]> => {
+        if (options?.cacheOnly) return targets.map((target) => ({ target, quote: null }));
+        const answer = (target: QuoteSubscriptionTarget): QuoteBatchResult => target.symbol === "A"
+          ? { target, quote: quote("A", 2) }
+          : { target, quote: target.symbol === "C" ? dated : target.symbol === "D" ? datedD : null, followUp: "default" };
+        if (options?.deferFollowUps) return targets.map(answer);
+        return Promise.all(targets.map(async (target) => {
+          const result = answer(target);
+          if (!result.followUp) return result;
+          try { return { target, quote: await getQuote(target.symbol) }; }
+          catch { return { target, quote: result.quote }; }
+        }));
+      },
+    };
+    const symbols = ["A", "B", "C", "D"];
+    let board: BoardQuoteMap = new Map();
+    function FollowUpProbe() {
+      board = useQuoteBoard(symbols, { cacheFirst: true, refreshTimeoutMs: 40, liveStreaming: false }).quotes;
+      return <Text>{`${board.size}`}</Text>;
+    }
+    const runtime = { getMarketData: () => provider } as unknown as PluginRuntimeAccess;
+    await tui.render(<PluginRenderProvider runtime={runtime} pluginId="test"><FollowUpProbe /></PluginRenderProvider>, { width: 40, height: 6 });
+    await settle();
+
+    expect(board.get("A")).toMatchObject({ quote: { price: 2 }, loading: false, stale: false });
+    expect(board.get("B")).toMatchObject({ quote: null, loading: true });
+    expect(board.get("C")).toMatchObject({ quote: { price: 7 }, loading: false, stale: true, error: null });
+    // A dated price shows while its own read is out, so what reads the row's contract (FUT's returns) starts on it.
+    expect(board.get("D")).toMatchObject({ quote: { price: 9 }, loading: true, stale: true });
+    expect(asked.map(([symbol, context]) => [symbol, context?.cacheMode])).toEqual([["B", "default"], ["C", "default"], ["D", "default"]]);
+
+    await settle(80);
+    expect(board.get("A")).toMatchObject({ quote: { price: 2 }, stale: false });
+    expect(board.get("B")).toMatchObject({ quote: null, loading: false, error: "Quote refresh timed out" });
+    expect(board.get("D")).toMatchObject({ quote: { price: 9 }, loading: false, stale: true, error: null });
+    expect(quoteBoardStatus(board)).toMatchObject({ loading: 0, stale: 2, unavailable: 1 });
+  });
+});
+
+describe("useQuoteBoard background top-ups", () => {
+  test("a row that has a quote is never marked loading or stale while its symbol is asked for alone", async () => {
+    // The poll's batch has only a dated price for each symbol and asks for it alone, a read that never answers here.
+    let calls = 0;
+    const provider = {
+      getQuotesBatch: async (targets: QuoteSubscriptionTarget[]): Promise<QuoteBatchResult[]> => {
+        calls += 1;
+        return targets.map((target) => calls === 1 ? { target, quote: quote(target.symbol, 100) }
+          : { target, quote: { ...quote(target.symbol, 90), lastUpdated: 1_699_990_000_000, stale: true }, followUp: "refresh" });
+      },
+      getQuote: () => new Promise<Quote>(() => {}),
+    };
+    await mount(provider, POLL_MS);
+    expect(quotes.get("^GSPC")).toMatchObject({ quote: { price: 100 }, loading: false, stale: false });
+
+    await settle(POLL_MS * 2);
+    expect(calls).toBeGreaterThan(1);
+    expect(quotes.get("^GSPC")).toMatchObject({ quote: { price: 100 }, loading: false, stale: false });
+    expect(quoteBoardStatus(quotes)).toMatchObject({ loading: 0, stale: 0 });
+  });
+});
+
+describe("useQuoteBoard late answers", () => {
+  /** A cache-first board whose batch and single reads answer when the test says. */
+  async function mountPending(symbols: string[]) {
+    const batches: Array<(rows: QuoteBatchResult[]) => void> = [];
+    const singles = new Map<string, (quote: Quote) => void>();
+    const provider = {
+      getQuotesBatch: (targets: QuoteSubscriptionTarget[], options?: QuoteBatchOptions) => options?.cacheOnly
+        ? Promise.resolve(targets.map((target) => ({ target, quote: null })))
+        : new Promise<QuoteBatchResult[]>((resolve) => batches.push(resolve)),
+      getQuote: (symbol: string) => new Promise<Quote>((resolve) => singles.set(symbol, resolve)),
+    };
+    let board: BoardQuoteMap = new Map();
+    let reload: () => void = () => {};
+    function LateProbe() {
+      const result = useQuoteBoard(symbols, { cacheFirst: true, refreshTimeoutMs: 40, liveStreaming: false });
+      board = result.quotes;
+      reload = result.refresh;
+      return <Text>{`${board.size}`}</Text>;
+    }
+    const runtime = { getMarketData: () => provider } as unknown as PluginRuntimeAccess;
+    await tui.render(<PluginRenderProvider runtime={runtime} pluginId="test"><LateProbe /></PluginRenderProvider>, { width: 40, height: 6 });
+    await settle();
+    return { batches, singles, board: () => board, reload: () => reload() };
+  }
+
+  test("a batch that answers after the timeout paints over the timeout error", async () => {
+    const { batches, board } = await mountPending(["A", "B"]);
+    await settle(80);
+    expect(board().get("A")).toMatchObject({ quote: null, loading: false, error: "Quote refresh timed out" });
+
+    await act(async () => batches[0]!([
+      { target: { symbol: "A", exchange: "" }, quote: quote("A", 5) },
+      { target: { symbol: "B", exchange: "" }, quote: quote("B", 6) },
+    ]));
+    await settle();
+    expect(board().get("A")).toMatchObject({ quote: { price: 5 }, loading: false, error: null, stale: false });
+    expect(board().get("B")).toMatchObject({ quote: { price: 6 }, loading: false, error: null, stale: false });
+    expect(quoteBoardStatus(board())).toMatchObject({ loading: 0, stale: 0, unavailable: 0 });
+  });
+
+  test("a late answer from a load a newer one superseded is dropped", async () => {
+    const { batches, board, reload } = await mountPending(["A", "B"]);
+    await settle(80);
+
+    await act(async () => reload());
+    await settle();
+    expect(batches).toHaveLength(2);
+    await act(async () => batches[0]!([
+      { target: { symbol: "A", exchange: "" }, quote: quote("A", 5) },
+      { target: { symbol: "B", exchange: "" }, quote: quote("B", 6) },
+    ]));
+    await settle();
+    expect(board().get("A")).toMatchObject({ quote: null, loading: true });
+
+    await act(async () => batches[1]!([{ target: { symbol: "A", exchange: "" }, quote: quote("A", 7) }, { target: { symbol: "B", exchange: "" }, quote: quote("B", 8) }]));
+    await settle();
+    expect(board().get("A")?.quote?.price).toBe(7);
+  });
+
+  test("a symbol read alone that answers after the timeout paints", async () => {
+    const { batches, singles, board } = await mountPending(["A"]);
+    await act(async () => batches[0]!([{ target: { symbol: "A", exchange: "" }, quote: null, followUp: "default" }]));
+    await settle(80);
+    expect(board().get("A")).toMatchObject({ quote: null, loading: false, error: "Quote refresh timed out" });
+
+    await act(async () => singles.get("A")!(quote("A", 9)));
+    await settle();
+    expect(board().get("A")).toMatchObject({ quote: { price: 9 }, error: null, stale: false });
+  });
+});
+
 describe("useQuoteBoard target changes", () => {
   test("drops removed quotes and errors while retaining overlapping quotes across pending requests", async () => {
     const pending: Array<(rows: QuoteBatchResult[]) => void> = [];
@@ -358,6 +503,59 @@ describe("useQuoteBoard streaming", () => {
     expect(polls.every((call) => call.forceRefresh === true && call.symbols.join() === "^FTSE")).toBe(true);
     // A late snapshot never replaces the newer streamed quote.
     expect(quotes.get("^GSPC")?.quote?.price).toBe(101);
+    coordinator.destroy();
+  });
+
+  // A dropped stream read "17 stale" on a board of closed markets whose refresh had just come back.
+  test("a dropped stream leaves closed markets current and asks again for the open ones at once; a failed refresh stays stale", async () => {
+    let emit: ((target: QuoteSubscriptionTarget, quote: Quote) => void) | null = null;
+    let streamed: QuoteSubscriptionTarget[] = [];
+    const coordinator = new MarketDataCoordinator(createTestDataProvider({
+      subscribeQuotes: (targets, onQuote) => {
+        streamed = targets;
+        emit = onQuote;
+        return () => {};
+      },
+    }));
+    setSharedMarketDataCoordinator(coordinator);
+    let failing = false;
+    // ^GSPC's source says its session is open; London's calendar says ^FTSE's has not opened.
+    const states: Record<string, Quote["marketState"]> = { "^GSPC": "REGULAR", "^FTSE": "CLOSED" };
+    const { provider, calls } = batchProvider(() => failing ? new Error("Service unavailable") : SYMBOLS.map((symbol) => ({
+      target: { symbol, exchange: "" },
+      quote: { ...quote(symbol, 100), marketState: states[symbol] },
+    })));
+    const random = Math.random;
+    Math.random = () => 0;
+    // Wed 11 Nov 2026 07:16 UTC, London not yet open; the clock keeps running.
+    const realNow = Date.now;
+    const offset = Date.parse("2026-11-11T07:16:00Z") - realNow();
+    Date.now = () => realNow() + offset;
+    try {
+      await mount(provider, 60_000);
+      await settle(2);
+      // The feed's snapshot on subscribe is the same print the board loaded, a moment after it.
+      await act(async () => {
+        for (const target of streamed) emit!(target, { ...quote(target.symbol, 100), marketState: states[target.symbol], delivery: "stream" });
+      });
+      await settle(5);
+
+      await act(async () => coordinator.setQuoteStreamDown(Date.now()));
+      // The store tells the board on a zero timer, and the board asks on another.
+      for (let wait = 0; wait < 40 && calls.length < 2; wait += 1) await settle(5);
+      await settle(5);
+      // Only the open market is asked for again; the closed one had nothing to bring.
+      expect(calls.slice(1).map((call) => call.symbols.join())).toEqual(["^GSPC"]);
+      expect(quoteBoardStatus(quotes).stale).toBe(0);
+
+      failing = true;
+      await act(async () => refreshBoard());
+      await settle(5);
+      expect(quotes.get("^GSPC")?.stale).toBe(true);
+    } finally {
+      Math.random = random;
+      Date.now = realNow;
+    }
     coordinator.destroy();
   });
 });

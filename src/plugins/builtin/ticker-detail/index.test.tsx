@@ -40,6 +40,7 @@ import { PaneContent } from "../../../components/layout/pane/content";
 import { LATE_CHANGE_WAIT_MS } from "../../../tickers/listing-fate";
 import { instrumentFromTicker } from "../../../market-data/request-types";
 import { usePaneTickerIdentity } from "../../../state/hooks/pane-ticker";
+import { apiClient, setCloudApiFetchTransport } from "../../../api-client";
 
 const TEST_PANE_ID = "ticker-research:test";
 
@@ -60,7 +61,7 @@ const DetailPane = tickerDetailModule.panes![0]!.component as (props: {
   height: number;
 }) => ReactElement;
 
-function FinancialsTabHarness({ width }: { width: number }) {
+function FinancialsTabHarness({ width, financials: given }: { width: number; financials?: TickerFinancials }) {
   const config = createDefaultConfig("/tmp/gloomberb-test");
   config.layout.instances = config.layout.instances.map((instance) => (
     instance.instanceId === "ticker-detail:main"
@@ -70,7 +71,7 @@ function FinancialsTabHarness({ width }: { width: number }) {
 
   const state = createInitialState(config);
   const ticker = createTestTicker("2337", "Mock Co");
-  const financials: TickerFinancials = {
+  const financials: TickerFinancials = given ?? {
     annualStatements: [
       { date: "2021-12-31" },
       { date: "2022-12-31", totalRevenue: 43.49e9, operatingRevenue: 43.49e9, costOfRevenue: 20e9, grossProfit: 23.49e9, operatingIncome: 9.37e9, eps: 4.68, totalAssets: 64e9, currentAssets: 18e9, cashAndCashEquivalents: 3e9 },
@@ -272,7 +273,16 @@ function lineBackgroundKeys(line: { spans: Array<{ text: string; bg: { toInts():
   return new Set(keys);
 }
 
+/** A verified account on `plan`, its session answered offline. */
+function signInAs(plan: "free" | "pro") {
+  apiClient.setSessionToken("ticker-research-plan-test");
+  setCloudApiFetchTransport(async () => Response.json({ error: "offline" }, { status: 404 }));
+  apiClient.restoreCachedUser({ id: `${plan}-account`, name: plan, emailVerified: true, plan });
+}
+
 afterEach(() => {
+  apiClient.setSessionToken(null);
+  setCloudApiFetchTransport(null);
   tickerDetailModule.dispose?.();
   harnessDispatch = null;
   financialsHarnessState = null;
@@ -324,6 +334,36 @@ describe("ResolvedFinancialsTab", () => {
     await flushFrame();
 
     expect(tui.frame()).toContain("Cost of Revenue");
+  });
+
+  test("a period stays as wide when a group closes over the line that holds its widest value", async () => {
+    const statement = (date: string, revenue: number, cost: number) => ({
+      date, totalRevenue: revenue, operatingRevenue: revenue, costOfRevenue: cost, grossProfit: revenue * 0.4,
+    });
+    const financials: TickerFinancials = {
+      annualStatements: [
+        statement("2022-12-31", 43.49e9, -987.65e9),
+        statement("2023-12-31", 27.62e9, -876.54e9),
+        statement("2024-12-31", 25.88e9, -765.43e9),
+      ],
+      quarterlyStatements: [],
+      priceHistory: [],
+    };
+    await tui.render(<FinancialsTabHarness width={100} financials={financials} />, { width: 100, height: 20 });
+    await flushFrame();
+    await flushFrame();
+    const header = () => tui.frame().split("\n").find((line) => line.includes("FY2024"))!;
+    const open = header();
+    expect(tui.frame()).toContain("Cost of Revenue");
+
+    // The first line, Revenue, is selected: Enter closes it over Cost of Revenue.
+    await act(async () => {
+      tui.setup().mockInput.pressEnter();
+      await tui.setup().renderOnce();
+    });
+    await flushFrame();
+    expect(tui.frame()).not.toContain("Cost of Revenue");
+    expect(header()).toBe(open);
   });
 
   test("uses one hover background across financial group rows", async () => {
@@ -451,7 +491,8 @@ describe("TickerResearchPane", () => {
     await flushFrame();
 
     await settleTickerTabCommit();
-    expect(detailHarnessState?.paneState[TEST_PANE_ID]?.activeTabId).toBe("chart");
+    // Financials is a group after Chart; the next group is Options.
+    expect(detailHarnessState?.paneState[TEST_PANE_ID]?.activeTabId).toBe("options");
 
     await act(async () => {
       tui.setup().mockInput.pressArrow("left");
@@ -461,24 +502,6 @@ describe("TickerResearchPane", () => {
 
     await settleTickerTabCommit();
     expect(detailHarnessState?.paneState[TEST_PANE_ID]?.activeTabId).toBe("financials");
-  });
-
-  test("shows SEC for US equities", async () => {
-    setSharedRegistryForTests(makeRegistry());
-    setOptionsProvider(createProvider(false));
-
-    await tui.render(
-      <DetailHarness
-        config={createDetailConfig("AAPL")}
-        ticker={createTestTicker("AAPL")}
-        financials={null}
-      />,
-      { width: 90, height: 24 },
-    );
-
-    await flushFrame();
-    const frame = tui.frame();
-    expect(frame).toContain("SEC");
   });
 
   test("hides plugin tabs when their owner plugin is disabled", async () => {
@@ -503,7 +526,7 @@ describe("TickerResearchPane", () => {
 
     await flushFrame();
     const frame = tui.frame();
-    expect(frame).not.toContain("SEC");
+    expect(frame).not.toContain("Filings");
   });
 
   test("refreshes plugin tabs when registration completes after the pane mounted", async () => {
@@ -573,7 +596,7 @@ describe("TickerResearchPane", () => {
     expect(frame).toContain("height:17");
   });
 
-  test("keeps quote prices native while converting market cap and position totals to base currency", async () => {
+  test("keeps quote prices and the market cap native while converting position totals to base currency", async () => {
     setSharedRegistryForTests(makeRegistry());
     setOptionsProvider(createProvider(false));
 
@@ -626,8 +649,10 @@ describe("TickerResearchPane", () => {
     await flushFrame();
 
     // The EUR rate arrives from the market data coordinator a frame later.
-    const frame = await tui.waitForFrameToContain("2.20B USD");
+    const frame = await tui.waitForFrameToContain("$1,375.00");
     expect(frame).toContain("€125");
+    // In EUR, as the EV and the statements are; too narrow here for its USD figure after it.
+    expect(frame).toContain("Market Cap        2.00B EUR");
     expect(frame).toContain("Account");
     expect(frame).toContain("Qty");
     expect(frame).toContain("Avg");
@@ -672,6 +697,95 @@ describe("TickerResearchPane", () => {
     const frame = tui.frame();
     expect(frame).toContain("active:ibkr-trade");
     expect(frame).not.toContain("Trade");
+  });
+
+  // Following a cursor onto a symbol with no saved ticker leaves the pane empty
+  // for a moment, and the tabs that need no ticker are then the only ones
+  // visible. The first of them is not a tab anyone opened, so it must not stay
+  // mounted (and fetch) once the ticker arrives.
+  test("mounts only the tab on screen when a ticker arrives after an empty pane", async () => {
+    const mounted: string[] = [];
+    const probe = (id: string): TickerResearchTabDef["component"] => () => {
+      useEffect(() => {
+        mounted.push(id);
+      }, []);
+      return <text>{`${id} body`}</text>;
+    };
+    setSharedRegistryForTests({
+      tickerResearchTabs: new Map<string, TickerResearchTabDef>([
+        ["overview", { id: "overview", name: "Overview", order: 10, component: probe("overview"), isVisible: ({ ticker }) => !!ticker }],
+        ["revenue", { id: "revenue", name: "Revenue", order: 25, component: probe("revenue"), isVisible: () => true }],
+      ]),
+    } as unknown as PluginRegistry);
+    setOptionsProvider(createProvider(false));
+
+    await tui.render(
+      <DetailHarness
+        config={createDetailConfig("AAPL")}
+        ticker={createTestTicker("MSFT")}
+        financials={null}
+      />,
+      { width: 90, height: 24 },
+    );
+    await flushFrame();
+    expect(tui.frame()).toContain("No ticker selected.");
+
+    await act(async () => {
+      harnessDispatch!({ type: "UPDATE_TICKER", ticker: createTestTicker("AAPL") });
+      await Promise.resolve();
+    });
+    await flushFrame();
+
+    expect(tui.frame()).toContain("overview body");
+    expect(mounted).toEqual(["overview"]);
+  });
+
+  // A free account that left a pane on a tab only Pro opens is not met by
+  // that tab's wall when the workspace comes back: the pane opens on Overview,
+  // keeps the tab saved, and shows it (wall and all) once the tab is picked.
+  test("a tab only Pro opens, restored without Pro, shows Overview until it is picked, and with Pro shows itself", async () => {
+    const mounted: string[] = [];
+    const probe = (id: string): TickerResearchTabDef["component"] => () => {
+      useEffect(() => {
+        mounted.push(id);
+      }, []);
+      return <text>{`${id} body`}</text>;
+    };
+    const registry = {
+      tickerResearchTabs: new Map<string, TickerResearchTabDef>([
+        ["overview", { id: "overview", name: "Overview", order: 10, component: probe("overview") }],
+        ["earnings-calls", { id: "earnings-calls", name: "Calls", order: 34, component: probe("earnings-calls"), proOnly: true }],
+      ]),
+    } as unknown as PluginRegistry;
+    setSharedRegistryForTests(registry);
+    setOptionsProvider(createProvider(false));
+    signInAs("free");
+    const restored = (
+      <DetailHarness config={createDetailConfig("AAPL")} ticker={createTestTicker("AAPL")} financials={null} activeTabId="earnings-calls" />
+    );
+
+    await tui.render(restored, { width: 90, height: 24 });
+    await flushFrame();
+    expect(tui.frame()).toContain("overview body");
+    expect(mounted).toEqual(["overview"]);
+    expect(detailHarnessState?.paneState[TEST_PANE_ID]?.activeTabId).toBe("earnings-calls");
+
+    // The group's one view is the tab the pane saved: picking it changes no value.
+    await act(async () => {
+      tui.setup().mockInput.pressArrow("right");
+      await tui.setup().renderOnce();
+    });
+    await settleTickerTabCommit();
+    expect(tui.frame()).toContain("earnings-calls body");
+    expect(mounted).toEqual(["overview", "earnings-calls"]);
+
+    tui.destroy();
+    mounted.length = 0;
+    signInAs("pro");
+    await tui.render(restored, { width: 90, height: 24 });
+    await flushFrame();
+    expect(tui.frame()).toContain("earnings-calls body");
+    expect(mounted).toEqual(["earnings-calls"]);
   });
 
   test("opens the Chart tab from a click on the overview price chart", async () => {

@@ -10,40 +10,45 @@ import {
 } from "../../utils/cli-output";
 import type { DataProvider } from "../../types/data-provider";
 import type { Quote } from "../../types/financials";
+import { parseListingWithdrawal, withdrawalLabel } from "../../market-data/quotes/delisting";
 import { quotedListingName } from "../../tickers/listing-name";
 import type { TickerRecord } from "../../types/ticker";
 import {
   candidateExchange,
   LISTING_SEARCH_LIMIT,
   listingDistance,
+  primaryCompanyLine,
   searchTickerCandidates,
   type TickerSearchCandidate,
 } from "../../tickers/search";
 import { initMarketData, withMarketData } from "../context";
-import { listingChangeLine, loadListingFate } from "../../tickers/listing-fate";
-import { formatMarketPriceWithCurrency, quoteFormatOptions } from "../../market-data/market/format";
+import { listingChangeLine, loadListingFate, loadNoQuoteEnding, noLongerListedNote, noQuoteLastTradeNote, tradingListing, type NoQuoteEnding } from "../../tickers/listing-fate";
+import { formatMarketPriceWithCurrency, quoteFormatOptions, withCurrencyMinorDigits } from "../../market-data/market/format";
 import { formerIssuerLine, startTickerChangeLookup, type TickerChangeLookup } from "../../tickers/ticker-changes";
-import { fail, failRetryable } from "../errors";
+import { fail, failRetryable, failWithError, isCliFailure, unreachableError } from "../errors";
 import { isProviderBusy, SEARCH_BUSY_CODE, SEARCH_BUSY_MESSAGE } from "../../sources/provider-errors";
 import { isNetworkFailure } from "../../utils/network-failure";
 import type { MarketContext } from "../types";
 import type { CliCommandContext, GloomPlugin } from "../../types/plugin";
 import { indexRootTryLine } from "../index-roots";
 import { indexRootFor } from "../../tickers/index-roots";
-import { readBrokerIndexCode } from "../listing-arg";
+import { isTitleCaseWord, readBrokerIndexCode } from "../listing-arg";
 import { knownGapMessage, commandPointer } from "../known-gaps";
 import { instrumentTypeLabel } from "../../tickers/instrument-kind";
-import { canonicalExchange, isUsListingExchange } from "../../utils/exchanges";
-import { companyNameExtraWords, groupByCompany, sameCompany } from "../../tickers/company-name";
-import { namedByService } from "../../tickers/company-name-listing";
+import { canonicalExchange, isKnownExchangeCode, isUsListingExchange } from "../../utils/exchanges";
+import { addedCompanyWords, companyLines, companyNameExtraWords, groupByCompany, namedByService, sameCompany, sameCompanyName } from "../../tickers/company-name";
+import { isDebtLine } from "../../tickers/company-name-listing";
+import { isLowQualityTickerName } from "../../tickers/search/result";
 import { findCatalogSeries, renderSeriesMatches, type SeriesMatch } from "../series-search";
 import { centralBankAskedAbout, centralBankCiting, type CentralBank } from "../../utils/central-banks";
 import { createPaneCatalog } from "../pane-functions/discovery";
 import { buildPaneCatalogEntries, filterPaneCatalogEntries, selectPaneCatalogMatches } from "../pane-functions/catalog";
 import { normalizeSearchText } from "../../tickers/search/ranking";
 import { hasNonLatinLetters } from "../../utils/typed-text";
+import { isKanjiOnlyName, japaneseNameReadAs, readExactJapaneseName, readJapaneseName, type JapaneseNameListing } from "../../tickers/search/japanese-names";
 
 interface SearchCommandDependencies {
+  limit?: number;
   initMarketData?: () => Promise<MarketContext>;
   fail?: (message: string, details?: string) => never;
   printResult?: CliCommandContext["printResult"];
@@ -124,7 +129,7 @@ export async function searchCandidatesForCli({
       localLimit,
       // Every company's listing of a symbol several use (CAR's ASX line is past the first ten), cut after ordering.
       totalLimit: Math.max(totalLimit, LISTING_SEARCH_LIMIT),
-      searchContext: { limit: LISTING_SEARCH_LIMIT },
+      searchContext: { limit: Math.max(totalLimit, LISTING_SEARCH_LIMIT), perpetuals: "always" },
     });
     const symbol = trimmedQuery.toUpperCase();
     // A bare symbol search lists asks for the quote `quote SYM` reads, once, for its venue and its name:
@@ -133,8 +138,12 @@ export async function searchCandidatesForCli({
     const quote = BARE_SYMBOL.test(symbol) && candidates.some((candidate) => candidate.symbol.toUpperCase() === symbol)
       ? await (quoted ?? loadSearchedQuote(symbol, savedExchange, dataProvider))
       : null;
-    return withQuotedNames(symbol, withHomeListingPrimary(trimmedQuery, withPrimaryListingFirst(symbol, candidates, quote)), quote)
-      .slice(0, totalLimit);
+    // A word written as a name (`Aeon`) whose company search leads with keeps it first, as `quote Aeon` reads it.
+    const named = leadsWithNamedCompany(trimmedQuery, candidates, quote);
+    const ordered = withLiveCompanyPrimary(symbol,
+      withQuotedNames(symbol, withUsLineOfPrimary(withHomeListingPrimary(trimmedQuery, withPrimaryListingFirst(symbol, candidates, named ? null : quote))), quote),
+      quote);
+    return cutKeepingCompanies(withOtherCompaniesApart(ordered, named ? trimmedQuery : null), totalLimit, symbol);
   } catch (error) {
     // Not "No matches found": a script or a reader would take that for a name nothing lists.
     if (isProviderBusy(error)) failRetryable(SEARCH_BUSY_MESSAGE, SEARCH_BUSY_CODE);
@@ -143,6 +152,22 @@ export async function searchCandidatesForCli({
     logFailure("cli.commands-search", "Search ticker candidates failed")(error);
     return [];
   }
+}
+
+/** Each listing a name in Japanese was read as, searched for by its key, in that order and once each. */
+async function japaneseNameCandidates(
+  listings: readonly JapaneseNameListing[],
+  tickers: TickerRecord[],
+  dataProvider: DataProvider,
+): Promise<TickerSearchCandidate[]> {
+  const found = await Promise.all(listings.map(({ key }) => searchCandidatesForCli({ query: key, tickers, dataProvider, totalLimit: 1, localLimit: 1 })));
+  const seen = new Set<string>();
+  return found.flat().filter((candidate) => {
+    const key = `${candidate.symbol}:${candidate.result?.exchange ?? candidate.ticker?.metadata.exchange ?? ""}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /** A symbol search does not list whose quote stopped long ago: TWTR, last traded 2022-10-27. */
@@ -179,9 +204,25 @@ async function searchFate(
   quote: Quote | null,
   dataProvider: DataProvider,
   changes: TickerChangeLookup,
+  /** The symbol's last bars when it has no quote (loadNoQuoteEnding), read beside the search. */
+  noQuoteEnding: Promise<NoQuoteEnding | null> = Promise.resolve(null),
 ): Promise<SearchFate> {
   const fate = await loadListingFate({ symbol }, dataProvider, { quote, changes });
   const unlisted = !candidates.some((candidate) => candidate.symbol.toUpperCase() === symbol);
+  // No quote at all (a retired ETN): a listed row the service marks ended says when, and one search no longer lists is
+  // listed with its last day and close, from its US line's last bars, when the service's record says it ended. Bars
+  // alone that stopped over a month ago say only that it has not traded since.
+  if (!quote) {
+    const ended = candidates.find((candidate) => candidate.symbol.toUpperCase() === symbol && candidate.result?.delisting)?.result?.delisting;
+    if (ended) return { stopped: null, notes: [`${noLongerListedNote(symbol, ended.lastTradeDate)}.`] };
+    const ending = unlisted ? await noQuoteEnding : null;
+    if (ending && !ending.recorded) return { stopped: null, notes: [`${noQuoteLastTradeNote(symbol, ending)}.`] };
+    if (ending) {
+      const note = noLongerListedNote(symbol, ending.date);
+      return { stopped: { symbol, name: fate.change?.issuer || null, lastTraded: ending.date,
+        lastPrice: ending.lastClose == null ? "—" : formatMarketPriceWithCurrency(ending.lastClose, "USD", withCurrencyMinorDigits({}, "USD")), note }, notes: [] };
+    }
+  }
   const stopped = unlisted && quote && fate.endedOn && fate.note
     ? {
       symbol,
@@ -217,14 +258,60 @@ function formerNameNote(candidate: TickerSearchCandidate): string | null {
   return `${candidate.label} is ${resolveSearchName(candidate)}, formerly ${formerName.trim()}`;
 }
 
-/** The merged companies' and renamed companies' lines, once each, unless the symbol's own line already says it. */
+/**
+ * A row its exchange withdrew: "0011:HKEX (Hang Seng Bank Limited): Delisted
+ * Jan 27, 2026 (Privatised by …)", as `quote 0011:HKEX` says it.
+ */
+function withdrawnNote(candidate: TickerSearchCandidate): string | null {
+  const withdrawal = parseListingWithdrawal(candidate.result?.withdrawal);
+  return withdrawal ? `${quotableSearchSymbol(candidate)} (${resolveSearchName(candidate)}): ${withdrawalLabel(withdrawal)}` : null;
+}
+
+/** The merged, renamed and withdrawn companies' lines, once each, unless the symbol's own line already says it. */
 function formerIssuerNotes(candidates: readonly TickerSearchCandidate[], fate: SearchFate): string[] {
-  const notes = new Set(candidates.flatMap((candidate) => formerIssuerNote(candidate) ?? formerNameNote(candidate) ?? []));
+  const notes = new Set(candidates.flatMap((candidate) => formerIssuerNote(candidate) ?? formerNameNote(candidate) ?? withdrawnNote(candidate) ?? []));
   return [...notes].filter((note) => !fate.notes.some((line) => line.split(" ")[0] === note.split(" ")[0]));
 }
 
 /** A query that is a bare symbol (CAR, BRK.B), not a name or a phrase. */
 const BARE_SYMBOL = /^[A-Z0-9][A-Z0-9.\-]{0,11}$/;
+
+/**
+ * Whether two lines are one company's: by the data service's company ids when
+ * both carry one (DHL Group AG on Xetra and Deutsche Post AG in Vienna), else
+ * by their names, or by a name one's company is known by besides its own.
+ */
+function sameSearchCompany(left: TickerSearchCandidate, right: TickerSearchCandidate): boolean {
+  const ids = [left.result?.companyId, right.result?.companyId];
+  if (ids[0] && ids[1]) return ids[0] === ids[1];
+  if (sameCompany(resolveSearchName(left), resolveSearchName(right))) return true;
+  // A line with no id named as the other's company is known besides (a former name the service sends on its rows).
+  const knownAs = (known: TickerSearchCandidate, line: TickerSearchCandidate) => !!known.result?.companyId
+    && [...known.nameAliases ?? [], known.result.formerName].some((name) => sameCompanyName(name, resolveSearchName(line)));
+  return knownAs(left, right) || knownAs(right, left);
+}
+
+/**
+ * The companies whose lines `candidates` are, each in search order: lines
+ * with one company id together, then each line without one with the company
+ * of a line it is named like (Deutsche Post AG in Hanover with DHL Group's
+ * Vienna line of that name), else a company of its own. A line named nothing
+ * is no company's.
+ */
+function searchCompanies(candidates: readonly TickerSearchCandidate[]): TickerSearchCandidate[][] {
+  const groups: TickerSearchCandidate[][] = [];
+  const place = (candidate: TickerSearchCandidate) => {
+    const group = groups.find((members) => members.some((member) => sameSearchCompany(member, candidate)));
+    if (group) group.push(candidate);
+    else groups.push([candidate]);
+  };
+  const identified = candidates.filter((candidate) => candidate.result?.companyId);
+  identified.forEach(place);
+  groupByCompany(candidates.filter((candidate) => !identified.includes(candidate)), resolveSearchName).flat().forEach(place);
+  const order = (candidate: TickerSearchCandidate) => candidates.indexOf(candidate);
+  return groups.map((group) => group.sort((left, right) => order(left) - order(right)))
+    .sort((left, right) => order(left[0]!) - order(right[0]!));
+}
 
 /**
  * For a bare symbol several companies list (CAR: Avis, Carrefour, CAR Group),
@@ -243,10 +330,16 @@ function withPrimaryListingFirst(
   const exact = candidates.filter((candidate) => candidate.symbol.toUpperCase() === symbol);
   if (exact.some((candidate) => candidate.kind === "ticker" || candidate.saved)) return candidates;
   const listed = exact.filter((candidate) => candidate.kind === "search" && (candidate.instrumentClass === "equity" || candidate.instrumentClass === "other"));
-  const companies = groupByCompany(listed, resolveSearchName);
-  if (companies.length < 2) return candidates;
-  const quoted = quotedCandidate(listed, quote);
-  if (!quoted) return candidates;
+  const companies = searchCompanies(listed);
+  if (companies.length < 2) return withHomeLineFirst(candidates, listed);
+  const read = quotedCandidate(listed, quote);
+  if (!read) return candidates;
+  // A debt or preferred line never leads where another company's common share has its home line under the symbol, as
+  // the bare symbol reads: DTG is Daimler Truck on Xetra, not DTE Energy's debentures in New York.
+  // An equity line alone: a fund, whatever its name, is no debt line (TIP, the iShares TIPS Bond ETF).
+  const debt = (candidate: TickerSearchCandidate) => candidate.instrumentClass === "equity"
+    && isDebtLine(candidate.result?.type ?? "", candidate.result?.name);
+  const quoted = debt(read) ? listed.find((candidate) => candidate.result?.homeListing === true && !debt(candidate)) ?? read : read;
   // That company leads with its home line where it lists one under the symbol too (TD on TSX before NYSE).
   const primary = companies.find((group) => group.includes(quoted))?.find((candidate) => candidate.result?.homeListing === true) ?? quoted;
   const firsts = companies.filter((group) => !group.includes(primary)).map((group) => group[0]!);
@@ -258,6 +351,54 @@ function withPrimaryListingFirst(
       : listed.includes(candidate) || candidate.category === "Primary Listing" ? { ...candidate, category: "Other Listings" as const }
       : candidate
   ));
+}
+
+/**
+ * A symbol whose own line stopped trading (DBS, the silver fund delisted in
+ * 2023) leads with the company the service marks by it that still trades
+ * (DBS Group Holdings' home line, D05 on SGX), as `quote DBS` asks after it;
+ * the stopped line is another match. A saved row is the user's choice and
+ * stays.
+ */
+function withLiveCompanyPrimary(symbol: string, candidates: TickerSearchCandidate[], quote: Quote | null, now = Date.now()): TickerSearchCandidate[] {
+  const primary = candidates.find((candidate) => candidate.category === "Primary Listing");
+  if (!primary || primary.saved || primary.kind !== "search" || primary.symbol.toUpperCase() !== symbol) return candidates;
+  if (!primary.delisted && (!quote || tradingListing(quote, now))) return candidates;
+  const marked = (candidate: TickerSearchCandidate) => candidate !== primary && candidate.kind === "search" && !candidate.delisted
+    && candidate.symbol.toUpperCase() !== symbol && !!candidate.searchAliases?.some((alias) => alias.toUpperCase() === symbol);
+  const live = candidates.find((candidate) => marked(candidate) && candidate.homeListing === true) ?? candidates.find(marked);
+  if (!live) return candidates;
+  const rest = candidates.filter((candidate) => candidate !== live && candidate !== primary);
+  const at = Math.min(candidates.indexOf(primary), rest.length);
+  return [...rest.slice(0, at), { ...live, category: "Primary Listing" as const }, ...rest.slice(at), { ...primary, category: "Other Matches" as const }];
+}
+
+/**
+ * One company's lines of a symbol lead with the one the service marks as its
+ * home, never a thin secondary line search ranked first: DHL is DHL Group's
+ * Xetra line, not the Vienna one.
+ */
+function withHomeLineFirst(candidates: TickerSearchCandidate[], listed: readonly TickerSearchCandidate[]): TickerSearchCandidate[] {
+  const home = listed.find((candidate) => candidate.result?.homeListing === true);
+  const lead = candidates.find((candidate) => candidate.category === "Primary Listing");
+  if (!home || !lead || home === lead || !listed.includes(lead)) return candidates;
+  const rest = candidates.filter((candidate) => candidate !== home);
+  const at = rest.indexOf(lead);
+  return [...rest.slice(0, at), { ...home, category: "Primary Listing" as const }, { ...lead, category: "Other Listings" as const }, ...rest.slice(at + 1)];
+}
+
+/**
+ * Whether a word written as a company's name (`Aeon`) leads search with the
+ * home line of the company named that word (Aeon Co., Ltd.'s 8267 on JPX)
+ * while the symbol's quote prices a company named more (AEON Biopharma):
+ * the name's company stays primary, as `quote Aeon` reads the word
+ * (`titleCaseCompanyName`), and the ticker's company is another match.
+ */
+function leadsWithNamedCompany(query: string, candidates: readonly TickerSearchCandidate[], quote: Quote | null): boolean {
+  if (!quote || !isTitleCaseWord(query) || companyNameExtraWords(query, quote.name) === 0) return false;
+  const lead = candidates.find((candidate) => candidate.category === "Primary Listing");
+  return !!lead && lead.kind === "search" && lead.result?.homeListing === true
+    && lead.symbol.toUpperCase() !== query.toUpperCase() && companyNameExtraWords(query, resolveSearchName(lead)) === 0;
 }
 
 /**
@@ -283,20 +424,39 @@ function withHomeListingPrimary(query: string, candidates: TickerSearchCandidate
     || primary.symbol.toUpperCase() === query.toUpperCase()) return candidates;
   const company = resolveSearchName(primary);
   const marked = !!primary.result && namedByService(query, primary.result);
-  const lines = candidates.filter((candidate) => candidate.kind === "search" && candidate.category !== "Funds & Derivatives"
-    && (candidate.instrumentClass === "equity" || candidate.instrumentClass === "other") && sameCompany(resolveSearchName(candidate), company)
-    && (!marked || companyNameExtraWords(resolveSearchName(candidate), company) != null));
-  const score = (candidate: TickerSearchCandidate) => candidate.result?.popularity ?? candidate.popularity ?? null;
-  const [home] = [...lines].sort((a, b) => listingDistance(a) - listingDistance(b) || (score(b) ?? -1) - (score(a) ?? -1) || candidates.indexOf(a) - candidates.indexOf(b));
-  if (!home || home === primary) return candidates;
-  const closer = listingDistance(home) < listingDistance(primary);
-  const [homeScore, primaryScore] = [score(home), score(primary)];
-  const moreSearched = !marked && listingDistance(home) === listingDistance(primary) && homeScore != null
-    && (primaryScore == null || homeScore >= primaryScore * 2);
-  if (!closer && !moreSearched) return candidates;
+  // Never a line of another business its name is in (`companyLines`): Siemens Energy AG is not Siemens AG's.
+  const lines = companyLines(primary, candidates.filter((candidate) => candidate === primary || (candidate.kind === "search"
+    && candidate.category !== "Funds & Derivatives" && (candidate.instrumentClass === "equity" || candidate.instrumentClass === "other"))),
+  (candidate) => ({
+    name: resolveSearchName(candidate), exchange: candidateExchange(candidate),
+    receipt: listingDistance(candidate) === 2, home: candidate.result?.homeListing === true,
+  })).filter((candidate) => candidate === primary || !marked || companyNameExtraWords(resolveSearchName(candidate), company) != null);
+  const home = primaryCompanyLine(primary, lines, (candidate) => ({
+    distance: listingDistance(candidate), score: candidate.result?.popularity ?? candidate.popularity ?? null,
+  }), { named: marked });
+  if (home === primary) return candidates;
   const rest = candidates.filter((candidate) => candidate !== home);
   const at = rest.indexOf(primary);
   return [...rest.slice(0, at), { ...home, category: "Primary Listing" as const }, { ...primary, category: "Other Listings" as const }, ...rest.slice(at + 1)];
+}
+
+/**
+ * A company whose primary listing is abroad lists the US line of the same
+ * symbol right after it: the line `quote SHEL` reads (a bare symbol is its US
+ * listing), which a name search ("shell") would otherwise rank below the
+ * company's lines on other venues and cut. Any other list keeps its order.
+ */
+function withUsLineOfPrimary(candidates: TickerSearchCandidate[]): TickerSearchCandidate[] {
+  const primary = candidates.find((candidate) => candidate.category === "Primary Listing");
+  if (!primary || primary.kind !== "search" || isUsListingExchange(candidateExchange(primary))) return candidates;
+  const company = resolveSearchName(primary);
+  const us = candidates.find((candidate) => candidate !== primary && candidate.kind === "search" && !candidate.contractKey
+    && candidate.category !== "Funds & Derivatives"
+    && isUsListingExchange(candidateExchange(candidate)) && sameCompanyName(resolveSearchName(candidate), company));
+  if (!us) return candidates;
+  const rest = candidates.filter((candidate) => candidate !== us);
+  const at = rest.indexOf(primary) + 1;
+  return [...rest.slice(0, at), { ...us, category: "Other Listings" as const }, ...rest.slice(at)];
 }
 
 /** The candidate on the venue the quote prices; the US exchanges share one symbol, so a quote on any of them is its one US line. */
@@ -318,7 +478,7 @@ function withQuotedNames(symbol: string, candidates: TickerSearchCandidate[], qu
   const onVenue = quotedCandidate(exact, quote);
   const name = onVenue ? quotedListingName(candidateExchange(onVenue), quote) : null;
   if (!onVenue || !name) return candidates;
-  const company = groupByCompany(exact, resolveSearchName).find((group) => group.includes(onVenue)) ?? [onVenue];
+  const company = searchCompanies(exact).find((group) => group.includes(onVenue)) ?? [onVenue];
   return candidates.map((candidate) => {
     if (!company.includes(candidate) || resolveSearchName(candidate) === name) return candidate;
     const [, ...rest] = candidate.detail.split(" | ");
@@ -326,9 +486,98 @@ function withQuotedNames(symbol: string, candidates: TickerSearchCandidate[], qu
   });
 }
 
+/** A symbol without a venue's suffix or code: DK for DK.BA or DK:BYMA. */
+const baseSymbol = (symbol: string) => symbol.toUpperCase().replace(/[:.][A-Z]{1,4}$/, "");
+
+/**
+ * Other Listings are the primary listing's company's own lines alone: by its
+ * name, a name it had (Cassava Sciences for Filana's FLNA), or, for a line
+ * search names no company for, its symbol on another venue. Another company's
+ * line, or a nameless line under another symbol (DKC1O on BYMA under
+ * `search DK`), is an Other Match, listed after them. For a word read as the
+ * company named it (`leadsWithNamedCompany`), a company named more words
+ * (AEON Biopharma beside Aeon Co., Ltd.) is another company.
+ */
+function withOtherCompaniesApart(candidates: TickerSearchCandidate[], namedWord: string | null = null): TickerSearchCandidate[] {
+  // A line search names no company for: no name, or only its symbol (DKC1O).
+  const nameless = (candidate: TickerSearchCandidate) =>
+    isLowQualityTickerName(candidate.result ? candidate.result.name ?? "" : resolveSearchName(candidate), candidate.symbol);
+  // A saved listing that leads stands where the primary listing would: its company's lines are told apart by it.
+  const lead = candidates[0];
+  const primary = candidates.find((candidate) => candidate.category === "Primary Listing")
+    ?? (lead?.category === "Saved" && lead.instrumentClass === "equity" ? lead : undefined);
+  // A primary line search names no company for gives nothing to tell its company's lines by.
+  if (!primary || nameless(primary)) return candidates;
+  // The company ids decide where the primary and a line both carry one; the names of the primary's identified lines
+  // (Deutsche Post AG, its Vienna line) are its names for a line without one.
+  const id = primary.result?.companyId;
+  const sameId = (candidate: TickerSearchCandidate) => !!id && candidate.result?.companyId === id;
+  const names = [resolveSearchName(primary), primary.result?.formerName, ...primary.nameAliases ?? [],
+    ...candidates.filter(sameId).map(resolveSearchName)];
+  // A name with more words that another business goes by is not the primary's (`companyLines`): Mitsubishi UFJ
+  // Financial Group, which lists in Tokyo beside Mitsubishi Corporation, is not one of its lines.
+  const lines = new Set(companyLines(primary, candidates.filter((candidate) => candidate === primary || (candidate.kind === "search"
+    && candidate.category !== "Funds & Derivatives" && (candidate.instrumentClass === "equity" || candidate.instrumentClass === "other"))),
+  (candidate) => ({
+    name: resolveSearchName(candidate), exchange: candidateExchange(candidate),
+    receipt: listingDistance(candidate) === 2, home: candidate.result?.homeListing === true,
+  })));
+  const primaryName = resolveSearchName(primary);
+  const elsewhere = candidates.filter((candidate) => candidate !== primary && !lines.has(candidate)
+    && candidate.kind === "search" && sameCompany(resolveSearchName(candidate), primaryName));
+  // Its other lines however a venue spells them: "MITSUBISHI HEAVY IND." goes with Mitsubishi Heavy Industries Ltd.
+  const otherLeads = new Set(elsewhere.map((candidate) => addedCompanyWords(resolveSearchName(candidate), primaryName)[0]).filter(Boolean));
+  const anotherBusiness = (candidate: TickerSearchCandidate) => elsewhere.includes(candidate)
+    || otherLeads.has(addedCompanyWords(resolveSearchName(candidate), primaryName)[0] ?? "");
+  const ownLine = (candidate: TickerSearchCandidate) => id && candidate.result?.companyId ? sameId(candidate)
+    : nameless(candidate)
+    ? baseSymbol(candidate.symbol) === baseSymbol(primary.symbol)
+    : names.some((company) => sameCompany(resolveSearchName(candidate), company))
+      && !anotherBusiness(candidate)
+      && (!namedWord || companyNameExtraWords(namedWord, resolveSearchName(candidate)) === 0);
+  const others = candidates.filter((candidate) => candidate.category === "Other Listings" && !ownLine(candidate));
+  if (others.length === 0) return candidates;
+  const kept = candidates.filter((candidate) => !others.includes(candidate));
+  const at = kept.findLastIndex((candidate) => candidate === primary || candidate.category === "Other Listings") + 1;
+  const apart = others.map((candidate) => ({ ...candidate, category: "Other Matches" as const }));
+  return [...kept.slice(0, at), ...apart, ...kept.slice(at)];
+}
+
+/**
+ * The first `limit` rows, with each other company's first line of the symbol
+ * kept in place of the primary company's last venues: `search DTG` lists
+ * Daimler Truck's lines and still DTE Energy's debenture. Only a line of
+ * another company (`searchCompanies`, by id where both carry one) takes a
+ * venue's place: never one of the primary company's own lines named as it
+ * was (Deutsche Post AG for DHL Group).
+ */
+function cutKeepingCompanies(candidates: TickerSearchCandidate[], limit: number, symbol: string): TickerSearchCandidate[] {
+  const head = candidates.slice(0, limit);
+  if (candidates.length <= limit || !BARE_SYMBOL.test(symbol)) return head;
+  // Each company of the symbol shown above the cut, its own lines and its lines named as it was among them.
+  const companies = searchCompanies(candidates.filter((candidate) => candidate.symbol.toUpperCase() === symbol));
+  const shown = new Set(head.flatMap((candidate) => companies.filter((group) => group.includes(candidate))));
+  const missing = companies.filter((group) => !shown.has(group))
+    .flatMap((group) => group.find((candidate) => candidate.category === "Other Matches") ?? []);
+  const venues = head.filter((candidate) => candidate.category === "Other Listings");
+  // The primary company keeps at least one other venue.
+  const room = Math.min(missing.length, Math.max(0, venues.length - 1));
+  if (room === 0) return head;
+  const dropped = new Set(venues.slice(-room));
+  const kept = head.filter((candidate) => !dropped.has(candidate));
+  const at = kept.findLastIndex((candidate) => candidate.category === "Other Listings" || candidate.category === "Other Matches"
+    || candidate.category === "Primary Listing") + 1;
+  return [...kept.slice(0, at), ...missing.slice(0, room), ...kept.slice(at)];
+}
+
 /** "Saved", or the broker a row came from; never the data service's internal id. */
 function searchSourceLabel(candidate: TickerSearchCandidate): string {
-  return candidate.kind === "ticker" ? "Saved" : candidate.result?.brokerLabel || "";
+  return isSavedCandidate(candidate) ? "Saved" : candidate.result?.brokerLabel || "";
+}
+
+/** A saved ticker's row, or search's row of a listing that is saved: what the Saved section lists. */
+function isSavedCandidate(candidate: TickerSearchCandidate): boolean {
+  return candidate.kind === "ticker" || candidate.saved;
 }
 
 function resolveSearchName(candidate: TickerSearchCandidate): string {
@@ -339,7 +588,7 @@ function resolveSearchName(candidate: TickerSearchCandidate): string {
 function searchType(candidate: TickerSearchCandidate): string | undefined {
   return instrumentTypeLabel(candidate.result?.type
     || candidate.result?.brokerContract?.secType
-    || candidate.ticker?.metadata.assetCategory, resolveSearchName(candidate));
+    || candidate.ticker?.metadata.assetCategory, resolveSearchName(candidate), { symbol: candidate.symbol });
 }
 
 /** What `--json` lists for a symbol search no longer lists: its category says so, and it keeps its last date and price. */
@@ -360,10 +609,19 @@ function renderStoppedListing(stopped: StoppedListing): string {
   )].join("\n");
 }
 
+/**
+ * A line as `quote` takes it. A code of digits names listings on several Asian venues (9042 is a JPX stock and an
+ * HKEX fund, and `quote 9042` asks which), so it carries its venue: 9042:HKEX. Any other symbol is printed as listed.
+ */
+export function quotableSearchSymbol(candidate: Pick<TickerSearchCandidate, "label" | "result" | "ticker" | "right">): string {
+  const exchange = candidateExchange(candidate as TickerSearchCandidate);
+  return /^\d+$/.test(candidate.label) && isKnownExchangeCode(exchange) && !isUsListingExchange(exchange) ? `${candidate.label}:${exchange}` : candidate.label;
+}
+
 function searchCandidateRows(candidates: TickerSearchCandidate[]) {
   return candidates.map((candidate) => ({
     category: candidate.category,
-    symbol: candidate.label,
+    symbol: quotableSearchSymbol(candidate),
     name: resolveSearchName(candidate),
     exchange: candidate.result?.exchange
       || candidate.result?.primaryExchange
@@ -376,7 +634,10 @@ function searchCandidateRows(candidates: TickerSearchCandidate[]) {
       || "",
     source: searchSourceLabel(candidate),
     providerId: candidate.result?.providerId ?? "",
-    saved: candidate.kind === "ticker",
+    saved: isSavedCandidate(candidate),
+    // The company the data service identifies the line as one of: lines with one id are one company, whatever each venue names it.
+    ...typeof candidate.result?.companyId === "string" && candidate.result.companyId
+      ? { companyId: candidate.result.companyId } : {},
     // The company that merged into this one, whose old name the query is.
     ...candidate.result?.formerIssuer ? { formerIssuer: candidate.result.formerIssuer } : {},
     // The name a renamed company had, which the query is.
@@ -417,9 +678,25 @@ function catalogHint(query: string): string {
 /** What a search for a name in another script (任天堂) that found nothing says: listings are named in Latin letters. */
 const OTHER_SCRIPT_NO_MATCH = "No matches. Try the ticker or the English name.";
 
+/** Words that say a query names a fund, which a fund's own name can hold anywhere ("Nippon India ETF Nifty IT"). */
+const FUND_WORDS = new Set(["ETF", "ETFS", "ETN", "ETNS", "FUND", "FUNDS", "UCITS", "TRUST", "INDEX"]);
+
+/**
+ * For a fund's name of three words or more that found nothing: try fewer, the
+ * first half of the others with the fund's word, as a fund can word its name
+ * in another order. Null for any other query.
+ */
+function fundSearchHint(query: string): string | null {
+  const words = query.replace(/"/g, "").trim().split(/\s+/).filter(Boolean);
+  const fund = words.filter((word) => FUND_WORDS.has(word.toUpperCase()));
+  const rest = words.filter((word) => !FUND_WORDS.has(word.toUpperCase()));
+  if (words.length < 3 || fund.length === 0 || rest.length < 2) return null;
+  return `A fund's name can put its words in another order. Try fewer words: gloom search "${[...rest.slice(0, Math.ceil(rest.length / 2)), ...fund].join(" ")}"`;
+}
+
 /** The line an empty search ends with: where else to look, or for a name in another script, what to type instead. */
 function emptySearchHint(query: string): string {
-  return hasNonLatinLetters(query) ? OTHER_SCRIPT_NO_MATCH : catalogHint(query);
+  return hasNonLatinLetters(query) ? OTHER_SCRIPT_NO_MATCH : fundSearchHint(query) ?? catalogHint(query);
 }
 
 /**
@@ -478,19 +755,20 @@ export function buildSearchReport({
   /** What the query was searched as: "Read VIX.X as ^VIX (Cboe Volatility Index)." */
   readAs?: string;
 }): string {
+  // Every note is prose: it wraps to a narrow --width.
   const lines = [renderSection(`Search: ${query}`)];
-  if (readAs) lines.push("", readAs);
+  if (readAs) lines.push("", wrapToTerminal(readAs));
   const notes = [...fate.notes, ...formerIssuerNotes(candidates, fate)];
-  if (notes.length > 0) lines.push("", ...notes);
+  if (notes.length > 0) lines.push("", ...notes.map((note) => wrapToTerminal(note)));
   const gap = knownGapMessage(query);
   const indexNote = gap ? null : indexRootNote(query, candidates);
-  if (indexNote) lines.push("", indexNote);
-  if (gap) lines.push("", gap);
+  if (indexNote) lines.push("", wrapToTerminal(indexNote));
+  if (gap) lines.push("", wrapToTerminal(gap));
   const bank = searchedCentralBank(query);
   if (bank) lines.push("", wrapToTerminal(centralBankLine(bank)));
   const setting = commandPointer(query);
-  if (setting) lines.push("", setting);
-  const charted = renderSeriesMatches(query, series, SEARCH_SERIES_LIMIT, cliTerminalWidth() ?? 100, "catalog");
+  if (setting) lines.push("", wrapToTerminal(setting));
+  const charted = renderSeriesMatches(query, series, SEARCH_SERIES_LIMIT, cliTerminalWidth() ?? 100);
   // A query that names the data ("carbon", "day-ahead") lists its series first; words that happen to
   // be in a series name ("apple") list them after the tickers.
   const seriesFirst = series.some((match) => match.exact);
@@ -503,9 +781,9 @@ export function buildSearchReport({
     if (functions.length > 0) lines.push("", renderFunctionMatches(functions));
     else if (!gap && !bank && !setting && !charted) {
       return [...lines, ...hasNonLatinLetters(query) ? [cliStyles.muted(OTHER_SCRIPT_NO_MATCH)]
-        : [cliStyles.muted("No matches found."), cliStyles.muted(catalogHint(query))]].join("\n");
+        : [cliStyles.muted("No matches found."), cliStyles.muted(wrapToTerminal(emptySearchHint(query)))]].join("\n");
     }
-    if (pointToCatalog) lines.push("", cliStyles.muted(catalogHint(query)));
+    if (pointToCatalog) lines.push("", cliStyles.muted(wrapToTerminal(catalogHint(query))));
     return lines.join("\n");
   }
 
@@ -525,7 +803,7 @@ export function buildSearchReport({
         ...(showSource ? [{ header: "Source" }] : []),
       ],
       categoryRows.map((candidate) => [
-        candidate.label,
+        quotableSearchSymbol(candidate),
         resolveSearchName(candidate),
         candidate.result?.exchange
           || candidate.result?.primaryExchange
@@ -538,10 +816,38 @@ export function buildSearchReport({
     ));
   }
   if (charted && !seriesFirst) lines.push("", charted);
-  if (pointToCatalog) lines.push("", cliStyles.muted(catalogHint(query)));
+  if (pointToCatalog) lines.push("", cliStyles.muted(wrapToTerminal(catalogHint(query))));
 
   return lines.join("\n");
 }
+
+/**
+ * What a search says from its own text, whatever the ticker lookup does: the
+ * data no source carries and its proxies ("baltic dry"), the central bank the
+ * query names, the setting or report it names.
+ */
+function localSearchNotes(query: string): string[] {
+  const bank = searchedCentralBank(query);
+  return [knownGapMessage(query), bank ? centralBankLine(bank) : null, commandPointer(query)].filter((note): note is string => !!note);
+}
+
+/**
+ * A ticker lookup that was busy or never reached the data service fails only
+ * the ticker part of a search: the notes from local text print first (text) or
+ * ride in the failure's details (JSON), then the failure says that no tickers
+ * were looked up. A search with no such note fails as before.
+ */
+function failTickerLookup(error: unknown, query: string, printNotes: boolean): never {
+  const notes = localSearchNotes(query);
+  const busy = isCliFailure(error) && error.code === SEARCH_BUSY_CODE;
+  if (notes.length === 0 || !(busy || isNetworkFailure(error))) throw error;
+  if (printNotes) console.log([renderSection(`Search: ${query}`), "", ...notes.map((note) => wrapToTerminal(note))].join("\n"));
+  const failure = busy ? { code: SEARCH_BUSY_CODE, message: TICKER_SEARCH_BUSY_MESSAGE, retryable: true } : unreachableError();
+  return failWithError(printNotes ? failure : { ...failure, details: [failure.details, ...notes].filter(Boolean).join("\n") });
+}
+
+/** The busy line after a search's own notes printed: only the ticker lookup is missing. */
+const TICKER_SEARCH_BUSY_MESSAGE = "Ticker search is busy, try again in a moment.";
 
 /** The functions a search lists when it found no ticker, unless a known gap or a central bank already says where to look. */
 function searchedFunctions(
@@ -588,25 +894,41 @@ export async function search(query: string, dependencies: SearchCommandDependenc
     const savedExchange = tickers.find((ticker) => ticker.metadata.ticker.toUpperCase() === symbol)?.metadata.exchange ?? "";
     const quote = bare ? loadSearchedQuote(symbol, savedExchange, dataProvider) : null;
     const changes = bare ? startTickerChangeLookup(dataProvider, symbol) : null;
-    const candidates = await searchCandidatesForCli({
-      query: index?.symbol ?? trimmedQuery,
-      tickers,
-      dataProvider,
-      ...quote ? { quote } : {},
-    });
-    const fate = quote && changes ? await searchFate(symbol, candidates, await quote, dataProvider, changes) : NO_SEARCH_FATE;
+    // With no quote, its US line's last bars, to list a retired symbol (STPP) with its last day.
+    const ending = quote?.then((quoted) => quoted ? null : loadNoQuoteEnding({ symbol }, dataProvider));
+    // A name typed in Japanese (トヨタ, ドル円) searches for the listings it names, which are named in Latin letters.
+    const japanese = index ? null : await readJapaneseName(trimmedQuery);
+    const searched = japanese
+      ? await japaneseNameCandidates(japanese.listings, tickers, dataProvider).catch((error: unknown) => failTickerLookup(error, trimmedQuery, !dependencies.printResult))
+      : await searchCandidatesForCli({
+        query: index?.symbol ?? trimmedQuery,
+        tickers,
+        dataProvider,
+        totalLimit: dependencies.limit,
+        ...quote ? { quote } : {},
+      }).catch((error: unknown) => failTickerLookup(error, trimmedQuery, !dependencies.printResult));
+    // A name in kanji alone is the service's to read first (中電 is CLP in Hong Kong); a Tokyo company's whole name it
+    // finds nothing for (中電工) is read from the Tokyo list.
+    const exact = searched.length === 0 && !japanese && !index && isKanjiOnlyName(trimmedQuery) ? await readExactJapaneseName(trimmedQuery) : null;
+    const candidates = exact
+      ? await japaneseNameCandidates(exact.listings, tickers, dataProvider).catch((error: unknown) => failTickerLookup(error, trimmedQuery, !dependencies.printResult))
+      : searched;
+    const reading = japanese ?? exact;
+    const readAs = index?.readAs ?? (reading ? japaneseNameReadAs(trimmedQuery, reading) : undefined);
+    const fate = quote && changes ? await searchFate(symbol, candidates, await quote, dataProvider, changes, ending) : NO_SEARCH_FATE;
 
     const series = findCatalogSeries(dependencies.plugins ?? [], trimmedQuery, "names");
     const bank = searchedCentralBank(trimmedQuery);
     // A query that names no ticker may name what a function does.
     const functions = await searchedFunctions(trimmedQuery, candidates, fate, dependencies.plugins, context);
+    if (!candidates.length && !fate.stopped && !series.length && !functions.length && !bank && !commandPointer(trimmedQuery)) process.exitCode = 1;
     if (dependencies.printResult) {
       const warnings = searchNotes(trimmedQuery, candidates, functions, fate);
       dependencies.printResult({
         data: [...fate.stopped ? [stoppedListingRow(fate.stopped)] : [], ...searchCandidateRows(candidates)],
         metadata: { query: trimmedQuery, ...(index ? { searched: index.symbol } : {}), ...(series.length ? { series } : {}), ...(functions.length ? { functions } : {}),
           ...(bank ? { centralBank: { id: bank.id, name: bank.name, place: bank.place, function: "CBR" } } : {}) },
-        warnings: index?.readAs || warnings.length ? [...index?.readAs ? [index.readAs] : [], ...warnings] : undefined,
+        warnings: readAs || warnings.length ? [...readAs ? [readAs] : [], ...warnings] : undefined,
       }, {
         columns: [
           { key: "category", header: "Category" },
@@ -627,7 +949,7 @@ export async function search(query: string, dependencies: SearchCommandDependenc
       series,
       functions,
       fate,
-      readAs: index?.readAs,
+      readAs,
     }));
   });
 }

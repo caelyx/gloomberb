@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Box } from "../../../ui";
-import { DataTableView, usePaneFooter, usePaneNoticeFooter, usePaneTabs, type DataTableCell, type DataTableKeyEvent, type DataTableVisibleRange } from "../../../components";
+import { DataTableView, usePaneFooter, usePaneTabs, type DataTableCell, type DataTableKeyEvent, type DataTableVisibleRange } from "../../../components";
 import { handleRefreshKey, loadingErrorFooterInfo } from "../../../components/data-table/table-pane";
 import type { PaneProps } from "../../../types/plugin";
 import type { PluginModule } from "../plugin-module";
-import { usePaneInstance, usePaneSettingValue } from "../../../state/app/context";
+import { useAppSelector, usePaneInstance, usePaneSettingValue } from "../../../state/app/context";
 import { colors, priceColor } from "../../../theme/colors";
-import { formatCurrency, formatPercentRaw } from "../../../utils/format";
+import { MISSING_VALUE, formatCurrency, formatPercentRaw } from "../../../utils/format";
 import { useAssetData, useDebouncedPluginPaneState, usePluginPaneState, usePluginTickerActions } from "../../runtime";
 import { useLiveQuoteEntries } from "../../../state/hooks/quote-streaming";
 import { buildQuoteKey, resolveEntryData } from "../../../market-data/selectors";
@@ -16,6 +16,7 @@ import type { ExtendedSession } from "../../../market-data/market/status";
 import { useAutoRefresh, useUpdatedAgo } from "../../../react/auto-refresh";
 import { useLiveStreamingSetting } from "../../../state/hooks/live-streaming";
 import { isStreamCarryingQuote, useVisibleBoardSymbols } from "../shared/use-quote-board";
+import { useQuoteDelayFooter } from "../shared/cloud-upgrade";
 import { SectorMoveBar } from "./move-bar";
 import {
   SECTOR_COLLECTIONS,
@@ -45,7 +46,7 @@ import {
   type SectorRowsByCollection,
   type SectorSortPreference,
 } from "./sector-model";
-import { loadSectorRows } from "./client";
+import { loadSectorRows, type SectorHistories } from "./client";
 import { sectorsHeadless } from "./headless";
 import { membersCache, themesCache } from "../themes/client";
 import { themesHeadless } from "../themes/headless";
@@ -59,7 +60,9 @@ const NO_SAVED_ETFS: string[] = [];
  * Prices, the day move and the returns stream; the year of history behind the
  * returns only reloads on the app's research cadence. While the feed is not
  * carrying a fund, the last load failed, or a fund printed in a session the
- * board has not rolled to, the snapshot reloads quietly at this pace.
+ * board has not rolled to, the quotes reload quietly at this pace, read
+ * against the history already loaded: outside regular hours that is all an
+ * open board asks for.
  */
 const SECTOR_FALLBACK_REFRESH_MS = 60_000;
 
@@ -149,6 +152,9 @@ function EtfBoard({ collectionId, focused, width, height, rootBefore }: EtfBoard
   );
 
   const fetchGenRef = useRef(0);
+  const researchIntervalMinutes = useAppSelector((state) => state.config.refreshIntervalMinutes);
+  /** The history the last full load read, for the funds it was read for, which quote refreshes reuse. */
+  const historiesRef = useRef<{ funds: string; loadedAt: number; histories: SectorHistories } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const rows = useMemo(
@@ -222,6 +228,14 @@ function EtfBoard({ collectionId, focused, width, height, rootBefore }: EtfBoard
     const gen = fetchGenRef.current;
     const collectionId = activeCollection.id;
     const sectorDefs = activeItems;
+    // A background refresh reads its quotes against the history already loaded
+    // for these funds, until that history is one research interval old.
+    const funds = sectorDefs.map((item) => item.etf).join(",");
+    const stored = historiesRef.current;
+    // The app's own research cadence (app-runtime): a minute at least, and an unreadable setting reloads.
+    const researchMs = Math.max(1, researchIntervalMinutes) * 60_000;
+    const reuse = background && stored?.funds === funds && Date.now() - stored.loadedAt < researchMs;
+    const histories: SectorHistories = reuse ? stored!.histories : new Map();
     const updateRows = (updater: (rows: SectorRow[]) => SectorRow[]) => {
       setRowsByCollection((prev) => updateRowsForCollection(prev, collectionId, sectorDefs, updater));
     };
@@ -237,8 +251,9 @@ function EtfBoard({ collectionId, focused, width, height, rootBefore }: EtfBoard
 
     if (!background) updateRows((rows) => rows.map((row) => ({ ...row, loading: true })));
 
-    loadSectorRows(sectorDefs, dataProvider).then((outcomes) => {
+    loadSectorRows(sectorDefs, dataProvider, { histories }).then((outcomes) => {
       if (fetchGenRef.current !== gen) return;
+      if (!reuse) historiesRef.current = { funds, loadedAt: Date.now(), histories };
       const loadedByEtf = new Map(outcomes.map((outcome) => [outcome.etf, outcome.row]));
       updateRows((rows) => applySectorReload(rows, loadedByEtf, background));
 
@@ -252,7 +267,7 @@ function EtfBoard({ collectionId, focused, width, height, rootBefore }: EtfBoard
       setLoadError("Sector data unavailable");
       if (!background) updateRows(clearLoading);
     });
-  }, [activeCollection.id, activeItems, dataProvider, setLastRefreshByCollection, setRowsByCollection]);
+  }, [activeCollection.id, activeItems, dataProvider, researchIntervalMinutes, setLastRefreshByCollection, setRowsByCollection]);
   const fetchAll = useCallback(() => load(false), [load]);
   const refreshInBackground = useCallback(() => load(true), [load]);
 
@@ -289,18 +304,18 @@ function EtfBoard({ collectionId, focused, width, height, rootBefore }: EtfBoard
       case "name":
         return { text: row.name, color: colors.text };
       case "etf":
-        return { text: row.etf, color: colors.textDim };
+        return { text: row.etf, color: !row.loading && sectorRowIssues(row).length > 0 ? colors.warning : colors.textDim };
       case "price":
         if (row.loading && row.price === null) {
           return { text: "…", color: colors.textDim };
         }
         return {
-          text: row.price !== null ? formatCurrency(row.price, row.currency) : "—",
+          text: row.price !== null ? formatCurrency(row.price, row.currency) : MISSING_VALUE,
           color: row.price !== null ? colors.text : colors.textDim,
         };
       case "changePercent":
         return {
-          text: row.changePercent !== null ? formatPercentRaw(shownPercent(row.changePercent)) : "—",
+          text: row.changePercent !== null ? formatPercentRaw(shownPercent(row.changePercent)) : MISSING_VALUE,
           color: row.changePercent !== null ? priceColor(shownPercent(row.changePercent)) : colors.textDim,
         };
       case "preMarket":
@@ -308,23 +323,23 @@ function EtfBoard({ collectionId, focused, width, height, rootBefore }: EtfBoard
         // The extended print's move from the close in LAST.
         const move = row.extendedSession === (column.id === "preMarket" ? "PRE" : "POST") ? row.extendedChangePercent ?? null : null;
         return {
-          text: move !== null ? formatPercentRaw(shownPercent(move)) : "—",
+          text: move !== null ? formatPercentRaw(shownPercent(move)) : MISSING_VALUE,
           value: move,
           color: move !== null ? priceColor(shownPercent(move)) : colors.textDim,
         };
       }
       case "return1M":
         return {
-          text: row.loading && row.return1M === null ? "…" : row.return1M !== null ? formatPercentRaw(shownPercent(row.return1M)) : "—",
+          text: row.loading && row.return1M === null ? "…" : row.return1M !== null ? formatPercentRaw(shownPercent(row.return1M)) : MISSING_VALUE,
           color: row.return1M !== null ? priceColor(shownPercent(row.return1M)) : colors.textDim,
         };
       case "return1Y":
         return {
-          text: row.loading && row.return1Y === null ? "…" : row.return1Y !== null ? formatPercentRaw(shownPercent(row.return1Y)) : "—",
+          text: row.loading && row.return1Y === null ? "…" : row.return1Y !== null ? formatPercentRaw(shownPercent(row.return1Y)) : MISSING_VALUE,
           color: row.return1Y !== null ? priceColor(shownPercent(row.return1Y)) : colors.textDim,
         };
       case "bar": {
-        const signed = row.changePercent !== null ? formatPercentRaw(shownPercent(row.changePercent)) : "—";
+        const signed = row.changePercent !== null ? formatPercentRaw(shownPercent(row.changePercent)) : MISSING_VALUE;
         return {
           text: signed,
           content: <Box flexDirection="row" width={column.width} overflow="hidden" aria-label={signed}>
@@ -337,24 +352,25 @@ function EtfBoard({ collectionId, focused, width, height, rootBefore }: EtfBoard
 
   const updatedAgo = useUpdatedAgo(lastRefreshMs);
   const returnAsOfDate = rows.map((row) => row.returnAsOfDate).filter((date): date is string => !!date).sort().at(-1);
-  // Rows with a value the source could not supply are a limitation of the
-  // table on screen; they sit behind the footer's warning indicator, one line
-  // per ETF, rather than as a count beside the status.
-  const rowIssueNotices = rows
-    .filter((row) => !row.loading && sectorRowIssues(row).length > 0)
-    .map((row) => `${row.etf}: ${sectorRowIssues(row).join(" · ")}`);
-  usePaneNoticeFooter({ registrationId: "sectors:row-issues", notices: rowIssueNotices, focused });
+  // A row with a value the source could not supply says so on that row: its
+  // ETF in the warning colour, and the reason under the table while it is
+  // selected (`rowNote`). The footer is for the whole board.
 
+  // Signed out or free, the ETFs' quotes are delayed ones.
+  const quoteDelay = useQuoteDelayFooter(rows.map((row) => (row.loading ? null : { dataSource: row.quoteDataSource })), "sectors-delay");
   usePaneFooter("sectors", () => {
     const info = loadingErrorFooterInfo(loading, loadError);
     if (returnAsOfDate) info.push({ id: "return-as-of", parts: [{ text: `returns as of ${returnAsOfDate}`, tone: "muted" }] });
     if (updatedAgo) info.push({ id: "updated", parts: [{ text: `checked ${updatedAgo}`, tone: "muted" }] });
     // Keep the leading current failure readable when the pane is narrow; separate
     // flex children would each shrink it to a few characters beside routine status.
-    return { info: info.length > 0 ? [{ id: "status", parts: info.flatMap((segment, index) => [
-      ...(index > 0 ? [{ text: "·", tone: "muted" as const }] : []), ...segment.parts,
-    ]) }] : [] };
-  }, [loadError, loading, returnAsOfDate, updatedAgo]);
+    return { info: [
+      ...(info.length > 0 ? [{ id: "status", parts: info.flatMap((segment, index) => [
+        ...(index > 0 ? [{ text: "·", tone: "muted" as const }] : []), ...segment.parts,
+      ]) }] : []),
+      ...(quoteDelay ? [quoteDelay] : []),
+    ] };
+  }, [loadError, loading, quoteDelay, returnAsOfDate, updatedAgo]);
 
   return (
     <DataTableView<SectorRow, SectorColumn>
@@ -386,6 +402,7 @@ function EtfBoard({ collectionId, focused, width, height, rootBefore }: EtfBoard
       onHeaderClick={handleHeaderClick}
       getItemKey={(row) => row.etf}
       renderCell={renderCell}
+      rowNote={(row) => !row.loading && sectorRowIssues(row).length > 0 ? `${row.etf}: ${sectorRowIssues(row).join("; ")}.` : null}
       selectedTextOverridesCellColor
       emptyStateTitle={loadError ?? "No sectors selected."}
     />
@@ -442,7 +459,7 @@ export const sectorsModule: PluginModule = {
       paneId: "sectors",
       label: "Thematic Baskets",
       description: "Curated themes with equal-weight returns, breadth and member leaders and laggards.",
-      keywords: ["themes", "thematic", "baskets", "AI compute", "datacenters", "electrification", "power grid", "nuclear", "uranium", "defense", "aerospace", "cybersecurity", "robotics", "automation", "critical minerals", "crypto", "bitcoin", "solar", "clean energy", "gold", "silver", "homebuilders", "memory", "chip equipment", "cloud software"],
+      keywords: ["themes", "thematic", "baskets", "AI compute", "datacenters", "electrification", "power grid", "nuclear", "uranium", "defense", "aerospace", "cybersecurity", "robotics", "automation", "critical minerals", "crypto", "bitcoin", "bitcoin miners", "miners", "bitcoin mining", "solar", "clean energy", "gold", "silver", "homebuilders", "memory", "chip equipment", "cloud software"],
       shortcut: { prefix: "THEM", argKind: "text", argPlaceholder: "theme", argOptional: true },
       headless: themesHeadless,
       // The theme param opens the Themes tab, and the named theme's members.

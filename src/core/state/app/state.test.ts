@@ -2,8 +2,15 @@ import { describe, expect, test } from "bun:test";
 import { appReducer, createInitialState, resolveCollectionForPane, resolveTickerForPane, type AppState } from "./state";
 import { cloneLayout, createBlankLayout, createDefaultConfig, createPaneInstance, findPaneInstance } from "../../../types/config";
 import { RECENT_COMMANDS_LIMIT } from "./layout";
+import { isPaneChoice, pluginChoiceKey, shownPaneChoice } from "./pane-choices";
 import type { AppSessionSnapshot } from "../session-persistence";
-import { removePane } from "../../../layout/pane-manager";
+import { addPaneFloating, layoutWindowCounts, removePane } from "../../../layout/pane-manager";
+import { normalizeConfigForSave, normalizeLoadedConfig } from "../../../data/config/store/normalize";
+import { describeArrangement } from "../../../layout-marketplace/model";
+import type { AppConfig } from "../../../types/config";
+
+/** A config as the app reads it back from disk: written as JSON, then parsed and normalized. */
+const loadedConfig = (config: AppConfig): AppConfig => normalizeLoadedConfig(JSON.parse(JSON.stringify(config)), config.dataDir).config;
 import { buildBrokerPortfolioId } from "../../../utils/broker-instances";
 import { createTestFinancials } from "../../../test-support/data-provider";
 
@@ -58,6 +65,33 @@ describe("resolveTickerForPane", () => {
       kind: "fixed",
       symbol: "AAPL",
     });
+  });
+
+  test("a follower whose source is in another desktop window keeps its link, and its last ticker when that source closes", () => {
+    const config = createDefaultConfig("/tmp/gloomberb-test");
+    const layout = removePane(config.layout, "portfolio-list:main");
+    const follower = findPaneInstance(config.layout, "ticker-detail:main")!;
+    const snapshot = (linkedTickers?: Record<string, string>) => ({
+      config: { ...config, layout: { ...layout, instances: layout.instances.map((entry) => (entry.instanceId === follower.instanceId ? follower : entry)) } },
+      paneState: {},
+      focusedPaneId: null,
+      statusBarVisible: true,
+      ...(linkedTickers ? { linkedTickers } : {}),
+    });
+
+    const linked = appReducer(createInitialState(config), {
+      type: "HYDRATE_DESKTOP_SNAPSHOT",
+      snapshot: snapshot({ "portfolio-list:main": "AAPL" }),
+    });
+    expect(findPaneInstance(linked.config.layout, follower.instanceId)?.binding).toEqual(follower.binding);
+    expect(resolveTickerForPane(linked, follower.instanceId)).toBe("AAPL");
+    // A layout edit in this window does not cut it either.
+    const edited = appReducer(linked, { type: "UPDATE_LAYOUT", layout: linked.config.layout });
+    expect(findPaneInstance(edited.config.layout, follower.instanceId)?.binding).toEqual(follower.binding);
+
+    const closed = appReducer(linked, { type: "HYDRATE_DESKTOP_SNAPSHOT", snapshot: snapshot() });
+    expect(findPaneInstance(closed.config.layout, follower.instanceId)?.binding).toEqual({ kind: "fixed", symbol: "AAPL" });
+    expect(closed.linkedTickers).toBeUndefined();
   });
 
   test("uses fixed ticker bindings for pinned panes", () => {
@@ -288,20 +322,58 @@ describe("broker account cache", () => {
 });
 
 describe("pane state updates", () => {
-  test("returns the existing state object when a pane patch is a no-op", () => {
+  test("a no-op pane patch leaves pane state and config alone, and once its key is chosen returns the state object", () => {
     const initial = createInitialState(createDefaultConfig("/tmp/gloomberb-test"));
     initial.paneState["portfolio-list:main"] = {
       collectionId: "main",
       cursorSymbol: "AAPL",
     };
+    const patch = { type: "UPDATE_PANE_STATE", paneId: "portfolio-list:main", patch: { cursorSymbol: "AAPL" } } as const;
 
-    const next = appReducer(initial, {
-      type: "UPDATE_PANE_STATE",
-      paneId: "portfolio-list:main",
-      patch: { cursorSymbol: "AAPL" },
-    });
+    const marked = appReducer(initial, patch);
+    expect(marked.paneState).toBe(initial.paneState);
+    expect(marked.config).toBe(initial.config);
+    expect(appReducer(marked, patch)).toBe(marked);
+  });
 
-    expect(next).toBe(initial);
+  test("a value written in this session is chosen, by any write and even unchanged; one restored with a desk is not", () => {
+    const config = createDefaultConfig("/tmp/gloomberb-test");
+    const home = config.activeLayoutIndex;
+    const away = home === 0 ? 1 : 0;
+    config.layouts[home] = { ...config.layouts[home]!, paneState: { "ticker-detail:main": { activeTabId: "earnings-calls" } } };
+    config.layouts[away] = { name: "Away", layout: cloneLayout(config.layouts[home]!.layout), paneState: { "ticker-detail:main": { activeTabId: "risk-factors" } } };
+    let state = createInitialState(config);
+    expect(state.paneState["ticker-detail:main"]?.activeTabId).toBe("earnings-calls");
+    expect(isPaneChoice(state, "ticker-detail:main", "activeTabId")).toBe(false);
+
+    // A command or link asking for the tab the pane already saved.
+    state = appReducer(state, { type: "UPDATE_PANE_STATE", paneId: "ticker-detail:main", patch: { activeTabId: "earnings-calls" } });
+    expect(isPaneChoice(state, "ticker-detail:main", "activeTabId")).toBe(true);
+    expect(isPaneChoice(state, "ticker-detail:main", "cursorSymbol")).toBe(false);
+
+    state = appReducer(state, { type: "UPDATE_PLUGIN_PANE_STATE", paneId: "market-movers:main", pluginId: "market-movers", key: "activeTab", value: "gaps" });
+    expect(isPaneChoice(state, "market-movers:main", pluginChoiceKey("market-movers", "activeTab"))).toBe(true);
+    state = appReducer(state, { type: "CHOOSE_PANE_STATE", paneId: "jobs:main", key: "view" });
+    expect(isPaneChoice(state, "jobs:main", "view")).toBe(true);
+
+    // A desk opens as saved, its panes' choices from an earlier session, even
+    // a pane that shares an id with one chosen on the other desk.
+    expect(JSON.stringify(state.config)).not.toContain("paneChoices");
+    state = appReducer(state, { type: "SWITCH_LAYOUT", index: away });
+    expect(state.paneState["ticker-detail:main"]?.activeTabId).toBe("risk-factors");
+    expect(isPaneChoice(state, "ticker-detail:main", "activeTabId")).toBe(false);
+    state = appReducer(state, { type: "SWITCH_LAYOUT", index: home });
+    expect(state.paneState["ticker-detail:main"]?.activeTabId).toBe("earnings-calls");
+    expect(isPaneChoice(state, "ticker-detail:main", "activeTabId")).toBe(false);
+  });
+
+  test("a value only Pro opens shows the free fallback when restored without Pro, and itself once chosen or with Pro", () => {
+    const proOnly = (tab: string) => tab === "earnings-calls";
+    const shown = (value: string, chosen: boolean, hasProAccess: boolean) => shownPaneChoice(value, { chosen, hasProAccess, proOnly, fallback: "overview" });
+    expect(shown("earnings-calls", false, false)).toBe("overview");
+    expect(shown("earnings-calls", true, false)).toBe("earnings-calls");
+    expect(shown("earnings-calls", false, true)).toBe("earnings-calls");
+    expect(shown("chart", false, false)).toBe("chart");
   });
 
   test("keeps pane runtime state scoped to each saved layout", () => {
@@ -689,6 +761,32 @@ describe("layout history", () => {
 });
 
 describe("saved layouts", () => {
+  test("the Layouts window is never saved into a layout, and LAY and `gloom layout` count the same windows", () => {
+    // LAY, New, "Metals Macro", quit, relaunch, Alt+1: Default reopened with the Layouts window on top,
+    // and `gloom layout` said 7 panes, 3 floating where LAY listed "4 docked · 2 floating".
+    const initial = createInitialState(createDefaultConfig("/tmp/gloomberb-transient-layout-test"));
+    const lay = createPaneInstance("layout-marketplace");
+    const withLay = addPaneFloating(initial.config.layout, lay, 160, 48);
+    let state = appReducer(initial, { type: "UPDATE_LAYOUT", layout: withLay });
+    state = appReducer(state, { type: "FOCUS_PANE", paneId: lay.instanceId });
+    // Open, it is on screen and saved nowhere.
+    expect(state.config.layout.floating.some((entry) => entry.instanceId === lay.instanceId)).toBe(true);
+    expect(state.config.layouts[0]!.layout.instances.some((instance) => instance.paneId === "layout-marketplace")).toBe(false);
+    expect(state.config.layouts[0]!.focusedPaneId).toBeNull();
+    state = appReducer(state, { type: "NEW_LAYOUT", name: "Metals Macro" });
+    // The config written at quit, read back at relaunch: Default reopens as it was before LAY.
+    const relaunched = createInitialState(loadedConfig(normalizeConfigForSave(state.config)));
+    const back = appReducer(relaunched, { type: "SWITCH_LAYOUT", index: 0 });
+    expect(back.config.layout.instances.map((instance) => instance.paneId)).toEqual(initial.config.layout.instances.map((instance) => instance.paneId));
+    // A layout saved with it before this fix is read without it.
+    const stale = { ...state.config, layouts: state.config.layouts.map((entry, index) => index === 0 ? { ...entry, layout: withLay } : entry) };
+    expect(loadedConfig(normalizeConfigForSave(stale)).layouts[0]!.layout.instances.some((instance) => instance.paneId === "layout-marketplace")).toBe(false);
+    // One count for both: the Layouts window is not one of a layout's windows.
+    const counts = layoutWindowCounts(withLay);
+    expect(describeArrangement(withLay)).toBe(`${counts.docked} docked${counts.floating ? ` · ${counts.floating} floating` : ""}`);
+    expect(counts).toEqual(layoutWindowCounts(initial.config.layout));
+  });
+
   test("reorders saved layouts without changing the active workspace", () => {
     const config = createDefaultConfig("/tmp/gloomberb-layout-reorder-test");
     const baseLayout = cloneLayout(config.layout);

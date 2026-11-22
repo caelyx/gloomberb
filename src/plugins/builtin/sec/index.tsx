@@ -5,27 +5,32 @@ import { useResolvedEntryValue, useSecFilingDocuments, useSecFilingsQuery, useTi
 import { getSharedMarketDataCoordinator } from "../../../market-data/coordinator";
 import { useShortcut } from "../../../react/input";
 import { isPlainKey } from "../../../utils/keyboard";
+import { logFailure } from "../../../utils/log-failure";
 import { instrumentFromTicker } from "../../../market-data/request-types";
-import { useDebouncedPluginPaneState, usePluginPaneState } from "../../runtime";
+import { useDebouncedPluginPaneState, usePluginAppActions, usePluginPaneState } from "../../runtime";
 import { usePaneSettingValue } from "../../../state/app/context";
 import { Box, Text, useUiCapabilities, type ScrollBoxRenderable } from "../../../ui";
 import { FILL_REST } from "../../../components/ui/fill";
 import { t, tf } from "../../../i18n";
-import { EmptyState, ExternalLinkText, FeedDataTableStackView, PaneLinkMenu, QueryBar, Spinner, TickerBadgeList, usePaneNoticeFooter, useTableLoadMore, type FeedDataTableItem, type PaneHint, type QueryBarFilter } from "../../../components";
+import { EmptyState, ExternalLinkText, FeedDataTableStackView, PaneLinkMenu, QueryBar, Spinner, TickerBadgeList, usePaneNoticeFooter, useTableLoadMore, type FeedDataTableItem, type FeedDataTableTimeColumn, type PaneHint, type QueryBarFilter } from "../../../components";
+import { useCompanyDataFooter } from "../../../components/layout/pane/status-footer";
 import { displayWidth } from "../../../utils/format";
+import { formatFilingDate } from "../../../utils/datetime-format";
 import type { DetailFact } from "../../../components/reader/detail-reader";
 import type { ThemeColors } from "../../../theme/colors";
 import { useThemeColors } from "../../../theme/theme-context";
 import { useOpenDescription } from "../shared/open-description";
 import { toneColor } from "../shared/research-cells";
-import { mayBeUsEquityOrFundTicker, mayBeUsEquityTicker, secFilingItemCodes, US_FUND_FACTS_ONLY } from "../../../utils/sec";
+import { parsePublicTickerKey, publicTickerKey } from "../../../utils/exchanges";
+import { fundFactsAbroadKey, hasFundFactsAbroad, mayBeFundViewTicker, mayBeSecEquityListing, mayBeUsEquityOrFundTicker, mayBeUsEquityTicker, noSecReportsNotice, nonUsSecListingVenue, secFilingItemCodes, US_FUND_FACTS_ONLY } from "../../../utils/sec";
 import { fundAbroadProfile, venueAbroad, type FundAbroadProfile } from "./fund-abroad";
-import { listingAnnouncementsPage } from "../../../utils/exchange-announcements";
-import { pricingSupplementTest } from "../../../utils/sec-filings";
+import { listingAnnouncementsPage, type ExchangeAnnouncementsPage } from "../../../utils/exchange-announcements";
+import { form4TradeText, isOtherIssuerForm4, pricingSupplementTest } from "../../../utils/sec-filings";
+import { formatInsiderName } from "../insider/display";
+import { filingStorySource, useFilingStories, type FilingStory } from "../insider/filing-stories";
 import { parseForm4Xml } from "../insider/insider-data";
 import { createTickerSurfacePaneTemplate } from "../shared/ticker-surface";
 import {
-  formatFilingMetaDate,
   buildInsiderTransactionDetailBody,
   renderFilingNotice,
 } from "./filing-display";
@@ -62,20 +67,22 @@ import {
   secIssuerLabel,
   secReportedAcceptance,
 } from "./model";
-import { rowSummary, rowSummaryTarget } from "./row-summaries";
+import { ownerNames, rowSummary, rowSummaryTarget } from "./row-summaries";
 import { usePaneTickerIdentity } from "../../../state/hooks/pane-ticker";
 import { createSecFilingSearchProvider, resetSecFilingFocusRequests, useSecFilingFocusRequest } from "./command-bar-search";
 
 export { secHeadless } from "./headless";
 
 const SEC_FILING_PAGE_SIZE = 50;
+/** Each row is dated by the day EDGAR filed it, as every filing list reads. */
+const FILED_COLUMN: FeedDataTableTimeColumn = { label: "Filed", width: 12, format: formatFilingDate };
 const NO_FILINGS: SecFilingItem[] = [];
 const OWNERSHIP_FORMS = new Set(["3", "4", "5"]);
 /** At most this many rows on screen have their insider forms and fund flow notices read for their row text. */
 const OWNERSHIP_ROWS_READ = 40;
 
 function formatFiledAt(filing: SecFilingItem): string {
-  return formatFilingMetaDate(filing.filingDate);
+  return formatFilingDate(filing.filingDate);
 }
 
 function buildDetailBody(filing: SecFilingItem): string {
@@ -149,7 +156,7 @@ function buildForm4Detail(content: string | null, filing: SecFilingItem): string
   if (!tx) return buildDetailBody(filing);
 
   const lines: string[] = [];
-  lines.push(`Insider: ${tx.reportedName}`);
+  lines.push(`Insider: ${formatInsiderName(tx.reportedName)}`);
   if (tx.title) lines.push(`Title: ${tx.title}`);
   for (const [index, transaction] of transactions.entries()) {
     if (transactions.length > 1) lines.push("", `Transaction ${index + 1}`);
@@ -170,7 +177,11 @@ function toFeedItems(
   loadingDocuments: boolean,
   documentsError: string | null,
   contentErrors: Map<string, string>,
+  /** The stories that report the open filing, a Form 4, each a fact that opens it. */
+  openStories: { accession: string; stories: readonly FilingStory[]; open: (story: FilingStory) => void } | null = null,
 ): FeedDataTableItem[] {
+  // A Form 144 names its seller freely; the insider forms read beside it say which way round.
+  const knownOwners = filings.flatMap((filing) => ownerNames(filing.form, contentCache.get(filing.accessionNumber)));
   return filings.map((filing) => {
     const displayTitle = getFilingDisplayTitle(filing);
     const acceptedAt = secReportedAcceptance(filing);
@@ -185,7 +196,7 @@ function toFeedItems(
     // An insider form read once says who traded and how, a fund's 24F-2NT its
     // year's flows; the row says it too.
     const summaryTarget = rowSummaryTarget(filing);
-    const readSummary = summaryTarget ? rowSummary(filing.form, contentCache.get(summaryTarget.accessionNumber)) : null;
+    const readSummary = summaryTarget ? rowSummary(filing.form, contentCache.get(summaryTarget.accessionNumber), knownOwners) : null;
     const form4Detail = isOwnership && hasFetchedContent
       ? buildForm4Detail(fetchedContent ?? null, filing)
       : null;
@@ -210,23 +221,32 @@ function toFeedItems(
     const enrichedTitle = formDesc
       ? `${displayTitle} — ${formDesc}`
       : displayTitle;
-    const summary = readSummary?.title ?? getFilingColumnText(filing);
+    // A Form 4 the company filed as an owner of another company's shares names that company only in its trade.
+    const summary = (isOtherIssuerForm4(filing) ? form4TradeText(filing) : null) ?? readSummary?.title ?? getFilingColumnText(filing);
+    const direction = readSummary?.direction ?? (filing.form4?.side === "buy" || filing.form4?.side === "sell" ? filing.form4.side : null);
     const items = secFilingItemCodes(filing.items);
     const facts: DetailFact[] = [
       { label: "Issuer", value: filing.companyName || "Name unavailable" },
       ...(issuerTicker ? [{ label: "Ticker", value: issuerTicker.symbol, link: { label: `Open ${issuerTicker.symbol}`, onOpen: issuerTicker.open } }] : []),
       { label: "CIK", value: filing.cik },
-      { label: "Form", value: formDesc ? `${filing.form} · ${formDesc}` : filing.form, color: toneColor(filingTone(filing, readSummary?.direction), colors) },
+      { label: "Form", value: formDesc ? `${filing.form} · ${formDesc}` : filing.form, color: toneColor(filingTone(filing, direction), colors) },
       { label: "Filed", value: formatFiledAt(filing) },
       ...(acceptedAt ? [{ label: "SEC-reported acceptance", value: acceptedAt }] : []),
       ...(items ? [{ label: "Items", value: items }] : []),
       { label: "Accession", value: filing.accessionNumber },
+      ...(openStories?.accession === filing.accessionNumber
+        ? openStories.stories.map((story) => ({
+          label: "Story",
+          value: `${story.headline} (${filingStorySource(story)})`,
+          link: { label: `Open story: ${story.headline}`, onOpen: () => openStories.open(story) },
+        }))
+        : []),
     ];
 
     return {
       id: filing.accessionNumber,
       eyebrow: filing.form,
-      eyebrowColor: toneColor(filingTone(filing, readSummary?.direction), colors),
+      eyebrowColor: toneColor(filingTone(filing, direction), colors),
       // A ticker shared by several filers names the filer on each row.
       title: showIssuer && filing.companyName ? `${filing.companyName}: ${summary}` : summary,
       timestamp: filing.filingDate,
@@ -272,21 +292,34 @@ function SecView({ width, height, focused, paneType }: { width: number; height: 
   // A filing chosen in the command bar opens here once the pane is on its
   // ticker. The fund filings view (ETF) lists other forms, so it leaves it.
   useSecFilingFocusRequest(forms ? null : ticker?.metadata.ticker, setOpenItemId);
-  // A form list is the fund filings view (ETF), which US-listed funds open too.
-  const eligibleTicker = forms ? mayBeUsEquityOrFundTicker(ticker) : mayBeUsEquityTicker(ticker);
+  // A form list is the fund filings view (ETF), which US-listed funds open too. An equity listed abroad is looked up by
+  // its company, which files with the SEC (Sanofi) or files nothing, as `filings` reads it.
+  const eligibleTicker = forms ? mayBeUsEquityOrFundTicker(ticker) : mayBeSecEquityListing(ticker);
+  const equityAbroad = !forms && eligibleTicker && ticker ? nonUsSecListingVenue(ticker.metadata.ticker, ticker.metadata.exchange) : null;
   // A fund listed abroad (3042.HK) gets what `ticker` says of it and its issuer's page, as `fn ETF` does.
-  const abroadVenue = forms && !eligibleTicker && ticker ? venueAbroad(ticker.metadata.ticker) : null;
+  // By its key or suffix (3042:HKEX, 3042.HK), else the venue its metadata names (3042 on HKEX).
+  const abroadVenue = forms && !eligibleTicker && ticker
+    ? venueAbroad(ticker.metadata.ticker) ?? venueAbroad(publicTickerKey(ticker.metadata.ticker, ticker.metadata.exchange))
+    : null;
   const abroadFinancials = useTickerFinancials(abroadVenue ? ticker?.metadata.ticker : null, abroadVenue ? ticker : null);
   const abroad = abroadVenue ? fundAbroadProfile(abroadFinancials) : null;
   const abroadPage = abroad?.page ?? null;
   // An equity listed abroad links the page its exchange publishes its announcements on (ASX's for NST.AX).
-  const announcements = !forms && !eligibleTicker && ticker
+  const announcements = !forms && (!eligibleTicker || equityAbroad) && ticker
     ? listingAnnouncementsPage(ticker.metadata.ticker, ticker.metadata.exchange)
     : null;
   // The fund view (ETF) leads with the fund's facts, which load apart from its filings, so a filings wall or failure leaves them on screen.
-  const fundFacts = useFundFacts(forms && eligibleTicker ? ticker?.metadata.ticker : null);
+  // A fund in Hong Kong asks too: its spot bitcoin and ether ETFs have their issuers' figures.
+  const factsAbroad = hasFundFactsAbroad(abroadVenue);
+  // Asked for by its listing's key, so a bare 3046 on HKEX is Hong Kong's, not a US ticker.
+  const factsKey = !ticker || !forms ? null
+    : eligibleTicker ? ticker.metadata.ticker
+    : factsAbroad ? fundFactsAbroadKey(ticker.metadata.ticker, ticker.metadata.exchange)
+    : null;
+  const fundFacts = useFundFacts(factsKey);
   const facts = fundFacts.data?.payload ?? null;
-  const factsUrl = facts?.covered ? facts.nav?.url ?? facts.expenseRatio?.url ?? facts.netAssets?.url ?? null : null;
+  // A note's terms link the pricing supplement they were read from.
+  const factsUrl = facts?.covered ? facts.nav?.url ?? facts.expenseRatio?.url ?? facts.netAssets?.url ?? null : facts?.note?.filing.url ?? null;
   const instrument = instrumentFromTicker(ticker, ticker?.metadata.ticker ?? null);
   const filingsEntry = useSecFilingsQuery(
     instrument && eligibleTicker
@@ -360,6 +393,15 @@ function SecView({ width, height, focused, paneType }: { width: number; height: 
   const openFiling = openItemId
     ? filings.find((filing) => filing.accessionNumber === openItemId) ?? null
     : null;
+  // An open Form 4 names the stories that report it, each opening in a pane: back from the filing to the news.
+  const openInsiderAccession = openFiling && /^4(?:\/A)?$/i.test(openFiling.form.trim()) ? openFiling.accessionNumber : null;
+  const openFilingStories = useFilingStories(openInsiderAccession);
+  const { createPaneFromTemplate } = usePluginAppActions();
+  const storyLinks = useMemo(() => (openInsiderAccession && openFilingStories.length > 0 ? {
+    accession: openInsiderAccession,
+    stories: openFilingStories,
+    open: (story: FilingStory) => createPaneFromTemplate("news-story-pane", { arg: story.id, values: { title: story.headline } }),
+  } : null), [createPaneFromTemplate, openFilingStories, openInsiderAccession]);
   const documentsEntry = useSecFilingDocuments(openFiling ?? null);
   const openDocuments = useResolvedEntryValue(documentsEntry) ?? [];
   const documentsError = documentsEntry?.error && documentsEntry.error.reasonCode !== "NO_DATA" ? documentsEntry.error.message : null;
@@ -412,15 +454,18 @@ function SecView({ width, height, focused, paneType }: { width: number; height: 
     const filing = visibleFilings.find((candidate) => candidate.accessionNumber === item.id);
     if (!coordinator || !filing) return;
     if (coordinator.getSecDocumentsEntry(filing.accessionNumber).phase !== "idle") return;
-    void coordinator.loadSecFilingDocuments(filing).catch(() => {});
+    void coordinator.loadSecFilingDocuments(filing).catch(() => { /* Intentional ignore: the coordinator keeps a failed warm-up's error, which the filing shows when opened. */ });
   }, [visibleFilings]);
 
   const refresh = useCallback(() => {
     const coordinator = getSharedMarketDataCoordinator();
     if (!coordinator || !instrument || !eligibleTicker) return;
-    void coordinator.loadSecFilings({ instrument, count: SEC_FILING_FETCH_LIMIT }, { forceRefresh: true });
+    // A failed request shows as the list's or the filing's error; anything else is logged.
+    coordinator.loadSecFilings({ instrument, count: SEC_FILING_FETCH_LIMIT }, { forceRefresh: true })
+      .catch(logFailure("sec.pane", "Refreshing filings failed"));
     if (openFiling && (documentsError || openDocuments.length === 0)) {
-      void coordinator.loadSecFilingDocuments(openFiling, { forceRefresh: true });
+      coordinator.loadSecFilingDocuments(openFiling, { forceRefresh: true })
+        .catch(logFailure("sec.pane", "Refreshing filing documents failed"));
     }
     void retryContent();
   }, [instrument, eligibleTicker, openFiling, documentsError, openDocuments.length, retryContent]);
@@ -428,7 +473,7 @@ function SecView({ width, height, focused, paneType }: { width: number; height: 
   useShortcut((event) => {
     if (!isPlainKey(event, "r")) return;
     refresh();
-    if (forms && eligibleTicker) void reloadFacts();
+    if (forms && eligibleTicker) reloadFacts();
   }, { enabled: focused, scope: "sec" });
   // Signing in must retry the request the wall was shown for.
   const sessionKeyRef = useRef(cloudSession.requestKey);
@@ -456,9 +501,11 @@ function SecView({ width, height, focused, paneType }: { width: number; height: 
   usePaneStatusLinkFooter({
     registrationId: "sec",
     focused,
-    url: openFiling ? openFiling.filingUrl : factsUrl ?? abroadPage ?? announcements?.url,
-    source: openFiling ? openFiling.form : facts?.covered ? listNames(fundFactPublishers(facts)) : announcements?.name ?? null,
-    label: openFiling ? "filing" : factsUrl ? "source" : abroadPage ? "issuer page" : announcements ? "announcements" : "filing",
+    // A current report links its press release, where its figures are, when its index names one.
+    url: openFiling ? openFiling.pressReleaseUrl ?? openFiling.filingUrl : factsUrl ?? abroadPage ?? announcements?.url,
+    source: openFiling ? openFiling.form : facts?.covered ? listNames(fundFactPublishers(facts)) : facts?.note ? facts.note.filing.form : announcements?.name ?? null,
+    label: openFiling ? openFiling.pressReleaseUrl ? "press release" : "filing"
+      : factsUrl ? "source" : abroadPage ? "issuer page" : announcements ? "announcements" : "filing",
     // Rows read in the background for their insiders do not hold up the pane.
     loading: loading || loadingDocuments || (!!loadingKey && viewedTargets.some((target) => target.accessionNumber === loadingKey)),
     error: authWall ? null : error ?? detailError,
@@ -466,6 +513,8 @@ function SecView({ width, height, focused, paneType }: { width: number; height: 
     showOpenHint: !!(openFiling ? openFiling.filingUrl : factsUrl ?? abroadPage ?? announcements),
   });
 
+  // A foreign line's filings are its company's, read from the home line.
+  useCompanyDataFooter(issuerFilings[0]?.companyFrom, !openFiling);
   usePaneNoticeFooter({
     registrationId: "sec:form-filter",
     notices: filterHistoryCapped
@@ -519,8 +568,23 @@ function SecView({ width, height, focused, paneType }: { width: number; height: 
   if (!ticker) {
     return <EmptyState title="No ticker selected." message="Select a ticker to view SEC filings." />;
   }
-  if (abroadVenue) return <FundAbroadNotice profile={abroad} />;
+  if (abroadVenue) {
+    // Its issuer's figures when the server has them (3046.HK), the issuer link otherwise; a first read is one muted line.
+    if (factsAbroad && (facts?.covered || (fundFacts.loading && !facts))) {
+      return (
+        <Box flexDirection="column" width={width} overflow="hidden" {...(nativePaneChrome ? FILL_REST : { height })}>
+          <FundFactsSummary symbol={ticker.metadata.ticker} width={width} facts={facts} loading={fundFacts.loading} error={null} />
+        </Box>
+      );
+    }
+    return <FundAbroadNotice profile={abroad} />;
+  }
   if (!eligibleTicker) {
+    // An equity listed abroad says where its announcements are, as `fn SEC` does; the footer opens the page.
+    if (!forms && announcements) {
+      const company = ticker.metadata.name?.trim() || ticker.metadata.ticker;
+      return renderFilingNotice(`SEC filings are shown for US listings. ${company} publishes its announcements on ${announcements.name}.`);
+    }
     return renderFilingNotice(forms ? "Fund filings are only shown for US-listed funds and equities." : "SEC filings are only shown for US equities.");
   }
   const factsSummary = forms
@@ -540,13 +604,21 @@ function SecView({ width, height, focused, paneType }: { width: number; height: 
   if (loading && filings.length === 0) return withFacts(<Spinner label="Loading SEC filings..." />);
   // The fund view keeps its facts and query bar over an empty or failed filings list, which says why in the table.
   if (!forms && error && formFilings.length === 0) return <EmptyState title="SEC filings unavailable." message={error} />;
-  if (!forms && formFilings.length === 0) return renderFilingNotice(`No recent SEC filings for ${ticker.metadata.ticker}.`);
+  if (!forms && formFilings.length === 0) {
+    // A company from abroad that files nothing with the SEC says so and links its exchange's announcements, as `filings` does.
+    if (equityAbroad) {
+      const listing = { symbol: parsePublicTickerKey(ticker.metadata.ticker).symbol, exchange: equityAbroad, name: ticker.metadata.name ?? null };
+      return <NoSecReportsNotice notice={noSecReportsNotice(listing)} announcements={announcements} />;
+    }
+    return renderFilingNotice(`No recent SEC filings for ${ticker.metadata.ticker}.`);
+  }
   const symbol = ticker.metadata.ticker;
   const fundEmptyTitle = error ? t("SEC filings unavailable.") : tf("No fund filings for {symbol}.", { symbol });
   // A trust (IBIT, GLD) files 10-Ks and 10-Qs, not fund forms.
   const fundEmptyHint = error ?? (issuerFilings.length > 0 ? tf("Its other filings: SEC {symbol}.", { symbol }) : undefined);
-  if (forms && facts?.covered && formFilings.length === 0 && !error) {
-    // A trust with facts (IBIT, GLD) files 10-Ks, not fund forms: the facts are the view, and one line says where its filings are.
+  if (forms && (facts?.covered || facts?.note) && formFilings.length === 0 && !error) {
+    // A trust with facts (IBIT, GLD) files 10-Ks, not fund forms, and a note's issuer (VXX's bank) none:
+    // the facts are the view, and one line says where its filings are.
     return (
       <Box flexDirection="column" width={width} overflow="hidden" {...fillRest}>
         {queryBar}
@@ -573,6 +645,7 @@ function SecView({ width, height, focused, paneType }: { width: number; height: 
         loadingDocuments,
         documentsError,
         contentErrors,
+        storyLinks,
       )}
       selectedIdx={selectedIdx}
       onSelect={setSelectedIdx}
@@ -582,6 +655,7 @@ function SecView({ width, height, focused, paneType }: { width: number; height: 
       rootBefore={factsSummary ? <Box flexDirection="column" flexShrink={0}>{queryBar}{factsSummary}</Box> : queryBar}
       sourceLabel="Form"
       titleLabel="Filing"
+      timeColumn={FILED_COLUMN}
       emptyStateTitle={forms && formFilings.length === 0 ? fundEmptyTitle
         : supplementCount > 0 && !showSupplements ? "Only pricing supplements."
         : formGroup === ALL_FORMS ? "No SEC filings." : "No filings of these forms."}
@@ -601,6 +675,7 @@ export const secModule: PluginModule = {
       icon: "S",
       component: SecView,
       defaultPosition: "right",
+      shareItem: { ticker: true },
       tickerFollower: true,
       defaultMode: "floating",
       defaultFloatingSize: { width: 100, height: 32 },
@@ -618,7 +693,7 @@ export const secModule: PluginModule = {
         keywords: ["sec", "filings", "10-k", "10-q", "8-k"],
         shortcut: "SEC",
         shortcutAliases: ["CF"],
-        canCreate: (_context, options) => !options?.ticker || mayBeUsEquityTicker(options.ticker),
+        canCreate: (_context, options) => !options?.ticker || mayBeSecEquityListing(options.ticker),
       }),
       headless: secHeadless,
     },
@@ -629,10 +704,10 @@ export const secModule: PluginModule = {
         label: "Fund Facts",
         description: "A US-listed fund's fee, NAV, premium or discount, net assets, sponsor, inception and index, a leveraged or inverse fund's daily objective, then the fund's own SEC filings: prospectus updates, shareholder reports, N-CEN and N-PORT.",
         keywords: ["etf", "fund", "expense ratio", "fee", "nav", "premium", "discount", "aum", "net assets", "n-1a", "485bpos", "497", "n-csr", "n-cen", "n-port", "prospectus",
-          "leveraged", "inverse", "daily objective", "daily-reset", "decay"],
+          "leveraged", "inverse", "daily objective", "daily-reset", "decay", "bond fund", "duration", "dv01", "hedge ratio", "steepener"],
         shortcut: "ETF",
         viewKey: "etf",
-        canCreate: (_context, options) => !options?.ticker || mayBeUsEquityOrFundTicker(options.ticker),
+        canCreate: (_context, options) => !options?.ticker || mayBeFundViewTicker(options.ticker),
         settings: () => ({ forms: ETF_FORMS_SETTING }),
       }),
       headless: fundHeadless,
@@ -648,6 +723,7 @@ export const secModule: PluginModule = {
       order: 45,
       component: SecView,
       instruments: ["equity"],
+      // The research tab stays the US listings'; SEC on a listing abroad opens the pane (canCreate).
       isVisible: ({ ticker }) => mayBeUsEquityTicker(ticker),
     });
   },
@@ -666,6 +742,22 @@ function LabelledLink({ label, url, text }: { label: string; url: string; text: 
       <ExternalLinkText url={url} label={text} />
     </Box>
   );
+}
+
+/**
+ * SEC for a company listed abroad that files nothing with the SEC (8058:JPX):
+ * what `filings` prints, and the page its exchange publishes its announcements
+ * on as a link the pane menu lists too. The footer's `o` opens it.
+ */
+function NoSecReportsNotice({ notice, announcements }: { notice: string; announcements: ExchangeAnnouncementsPage | null }) {
+  const links = announcements
+    ? (
+      <PaneLinkMenu>
+        <LabelledLink label={announcements.name} url={announcements.url} text={new URL(announcements.url).hostname.replace(/^www\./, "")} />
+      </PaneLinkMenu>
+    )
+    : undefined;
+  return <EmptyState title={notice} actions={links} />;
 }
 
 /**

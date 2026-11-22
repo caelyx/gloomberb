@@ -1,17 +1,21 @@
 import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
-import { act } from "react";
+import { act, useReducer } from "react";
 import { apiClient } from "../../../api-client";
+import { ApiRequestError } from "../../../api-client/errors";
 import type { FuturesContractTermsPayload } from "../../../api-client/futures-curve";
 import { createOpenTuiTestHarness, type TestKeyEvent } from "../../../renderers/opentui/test-utils";
-import { createInitialState } from "../../../state/app/context";
-import { createDefaultConfig } from "../../../types/config";
+import { appReducer, createInitialState, type AppState } from "../../../state/app/context";
+import { createDefaultConfig, findPaneInstance } from "../../../types/config";
 import type { QuoteBatchResult } from "../../../types/data-provider";
 import type { PinTickerOptions } from "../../../types/plugin";
 import type { PluginRuntimeAccess } from "../../runtime";
 import { futuresModule } from "./index";
-import { TestPaneFrame, TestPaneProvider } from "../../../test-support/pane";
+import { TestPaneFrame, TestPaneProvider, createTestPaneConfig } from "../../../test-support/pane";
 import type { Quote } from "../../../types/financials";
 import { resetFuturesBoardTerms } from "./use-board-terms";
+import { resetFrontContractReturns } from "./use-front-returns";
+import { createRemoteUiRegistry, RemoteUiRegistryProvider } from "../../../remote/semantic-tree";
+import { renderedReportFailure } from "../../../cli/pane-functions/report-notices";
 
 const FuturesPane = futuresModule.panes![0]!.component as (props: {
   paneId: string;
@@ -38,7 +42,8 @@ let termsSpy: { mockRestore(): void } | null = null;
 beforeEach(() => {
   termsSpy = spyOn(apiClient, "getCloudFuturesContract").mockImplementation(async (symbol: string) => {
     const terms = contractTerms[symbol];
-    if (!terms) throw new Error("Not a futures symbol with known contract terms");
+    // As the server answers a root it has no terms for.
+    if (!terms) throw new ApiRequestError("Not a futures symbol with known contract terms", 404);
     return terms;
   });
 });
@@ -48,6 +53,7 @@ afterEach(() => {
   pinned.length = 0;
   termsSpy?.mockRestore();
   resetFuturesBoardTerms();
+  resetFrontContractReturns();
 });
 
 function makeRuntime(quoteError?: string, quoteOverrides: Partial<Quote> = {}): PluginRuntimeAccess {
@@ -211,6 +217,49 @@ describe("FuturesPane", () => {
     expect(searching).toContain("▾ Equity Index");
   });
 
+  test("in the Commodities & Energy workspace the Curve tab follows a search and a picked row, and an unsearched board leaves it", async () => {
+    // `FUT cocoa` opened the workspace's Curve tab on ES.
+    const id = "commodities:test";
+    let latest: AppState | null = null;
+    function Workspace({ query, root }: { query?: string; root: string }) {
+      const config = createTestPaneConfig("/tmp/gloomberb-futures-pane-test", {
+        instanceId: id, paneId: "commodities-energy", binding: { kind: "none" }, settings: { root }, ...(query ? { params: { query } } : {}),
+      });
+      const [state, dispatch] = useReducer(appReducer, createInitialState(config));
+      latest = state;
+      return (
+        <TestPaneProvider state={state} dispatch={dispatch} paneId={id} runtime={makeRuntime()} pluginId="market-overview">
+          <FuturesPane paneId={id} paneType="commodities-energy" focused width={80} height={24} />
+        </TestPaneProvider>
+      );
+    }
+    const curveRoot = () => findPaneInstance(latest!.config.layout, id)?.settings?.root;
+    const rest = () => act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await tui.setup().renderOnce();
+    });
+
+    // A search: the row it leaves at the top, then the row picked.
+    await tui.render(<Workspace query="softs" root="ES" />, { width: 80, height: 24 });
+    await renderSettled();
+    await rest();
+    expect(curveRoot()).toBe("KC");
+    await emitKeypress({ name: "down", sequence: "\u001B[B" });
+    await rest();
+    expect(curveRoot()).toBe("SB");
+
+    // `CTM CC` then Markets: the first row an unsearched board selects by itself moves nothing.
+    await tui.render(<Workspace root="CC" />, { width: 80, height: 24 });
+    await renderSettled();
+    await rest();
+    expect(tui.frame()).toContain("E-Mini S&P 500");
+    expect(curveRoot()).toBe("CC");
+    // Picking a row does.
+    await emitKeypress({ name: "down", sequence: "\u001B[B" });
+    await rest();
+    expect(curveRoot()).not.toBe("CC");
+  });
+
   test("opens the selected contract in ticker research", async () => {
     await tui.render(<Harness />, { width: 80, height: 24 });
     await renderSettled();
@@ -251,12 +300,14 @@ describe("FuturesPane", () => {
     const ttf = tui.frame().split("\n").find((line) => line.includes("Dutch TTF Gas"));
     expect(ttf).toContain("EUR / MWh");
     expect(ttf).not.toContain("rolled");
-    // A narrow board keeps the month the quote prices and the unit, and drops the note it has no room for.
-    await tui.render(<Harness height={64} />, { width: 80, height: 64 });
+    // A narrow board keeps the month the quote prices and its move, and drops the note it has no room for. At 80
+    // columns the figures beside the name give it their blank, and the note's start shows.
+    await tui.render(<Harness width={56} height={64} />, { width: 56, height: 64 });
     await renderSettled();
     const narrow = tui.frame().split("\n").find((line) => line.includes("WTI Crude Oil"));
     expect(narrow).toContain("WTI Crude Oil Dec 2026");
-    expect(narrow).toContain("USD / barrel");
+    expect(narrow).not.toContain("rolled");
+    expect(narrow).toContain("+1.00%");
   });
 
   test("over the weekend every row reads closed, not the open its Friday tick stamped", async () => {
@@ -297,5 +348,30 @@ describe("FuturesPane", () => {
     const filtered = tui.frame();
     expect(filtered).toContain("Gold");
     expect(filtered).not.toContain("E-Mini S&P 500");
+  });
+
+  /** `fn FUT urea` printed every tab and header cell, then the board's "No matching contracts. Clear search." */
+  test("a search no contract matches fails the report with what to type instead; natgas finds natural gas", async () => {
+    const search = async (query: string) => {
+      const registry = createRemoteUiRegistry();
+      await tui.render(<RemoteUiRegistryProvider registry={registry}><Harness /></RemoteUiRegistryProvider>, { width: 80, height: 24 });
+      await renderSettled();
+      await emitKeypress({ name: "/", sequence: "/" });
+      await renderSettled();
+      for (const character of query) await emitKeypress({ name: character, sequence: character });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        await tui.setup().renderOnce();
+      });
+      await renderSettled();
+      return { frame: tui.frame(), failure: renderedReportFailure(registry.snapshot()) };
+    };
+    expect((await search("urea")).failure).toEqual({
+      message: 'No futures contract matches "urea".',
+      details: "Try a code such as NG, CL or GC, or a name such as natural gas or gold: gloom fn FUT NG. Other boards: gloom fn FUT --tab inventories, positioning or crops.",
+    });
+    const natgas = await search("natgas");
+    expect(natgas.failure).toBeNull();
+    expect(natgas.frame).toContain("Natural Gas");
   });
 });

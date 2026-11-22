@@ -2,9 +2,11 @@ import type {
   HeadlessPaneArgumentDef,
   HeadlessPaneDefinition,
   HeadlessPaneOptionDef,
+  HeadlessPaneReference,
   PaneDef,
   PaneTemplateDef,
 } from "../../types/plugin";
+import { spreadsheetOptionHint } from "../spreadsheet-hint";
 
 export type PaneFunctionReadiness = "ready" | "partial" | "live-dom" | "unsupported";
 type PaneFunctionScreenshotReadiness = PaneFunctionReadiness;
@@ -20,12 +22,16 @@ export interface PaneFunctionCapability {
   aliases: string[];
   /** Words that are no code but ask for this function's data: `fn` and `catalog` answer them with it. */
   suggestFor?: string[];
+  /** Words that open the function on one argument (`VX`: CTM VIX), or with options set (`PDUFA`: CATL --type pdufa). */
+  opens?: ReadonlyArray<{ words: readonly string[]; argument: string; options?: Readonly<Record<string, string>> }>;
   intents: string[];
   outputKind: string;
   reportReadiness: PaneFunctionReadiness;
   screenshotReadiness: PaneFunctionScreenshotReadiness;
   dataRequirements: string[];
   limitations: string[];
+  /** Lists the catalog prints under the options (EQS's sector and industry names). */
+  reference?: HeadlessPaneReference[];
   options: PaneFunctionOptionDef[];
   /** A rendered view that refuses any option it does not declare (PaneDef.reportOptionsOnly), as a headless report does. */
   strictOptions?: boolean;
@@ -45,6 +51,7 @@ const NON_DATA_PANE_IDS = new Set([
   "local-agent-workspace",
   "macro-tv",
   "plugin-marketplace",
+  "roadmap",
   "world-venue-map",
 ]);
 
@@ -288,6 +295,14 @@ function normalizeOptionValue(
   return rawValue;
 }
 
+/** A function's argument and options as they were typed (`^HSI,^TNX --range 1Y`), for a pointer to name the command. */
+function typedFunctionArgs(argument: string | null | undefined, options: Record<string, string | true>): string[] {
+  return [
+    ...argument?.trim() ? [argument.trim()] : [],
+    ...Object.entries(options).flatMap(([key, value]) => value === true ? [optionFlag(key)] : [optionFlag(key), value]),
+  ];
+}
+
 export function normalizeCapabilityOptions(
   capability: PaneFunctionCapability,
   options: Record<string, string | true>,
@@ -321,7 +336,9 @@ export function normalizeCapabilityOptions(
       }
       const supported = capability.options.map(({ key }) => optionFlag(key)).join(", ");
       throw new Error(
-        `${settings.code ?? capability.id} does not support ${optionFlag(rawKey)}.${supported ? ` Supported options: ${supported}.` : " It has no options."}`,
+        [`${settings.code ?? capability.id} does not support ${optionFlag(rawKey)}.${supported ? ` Supported options: ${supported}.` : " It has no options."}`,
+          spreadsheetOptionHint(optionFlag(rawKey), `fn ${settings.code ?? capability.id}`, typedFunctionArgs(settings.argument, options))]
+          .filter(Boolean).join(" "),
       );
     }
     normalized[option.key] = normalizeOptionValue(option, rawValue, settings.argument);

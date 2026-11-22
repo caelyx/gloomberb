@@ -1,14 +1,23 @@
+import { isYieldIndexSymbol } from "../../tickers/index-roots";
 import { classifyInstrumentType, kindFromListingSyntax } from "../../tickers/instrument-kind";
 import { isPerpetualExchange } from "../../tickers/perpetual-listing";
 import type { Quote } from "../../types/financials";
 import { canonicalExchange } from "../../utils/exchanges";
 import { isFiniteNumber } from "../../utils/guards";
 import { formatUtcDayTime } from "../../utils/utc-time";
+import { fxPrintTradingDay } from "../../utils/fx-market-hours";
 import { zonedDateKey } from "../../utils/zoned-date-time";
-import { futuresChangeBasis, futuresSettleText, isFuturesInstrument } from "../futures-contract";
+import { futuresChangeBasis, futuresQuoteMonth, futuresSettleText, isFuturesInstrument } from "../futures-contract";
 import { quoteTradingDay } from "../quotes/day-range";
-import { hasPublishedSessionCalendar, previousPublishedSession } from "./freshness";
-import { getActiveQuoteDisplay, getRegularSessionDisplay, regularSessionDisplayDate } from "./status";
+import { splitRatioText } from "../quotes/session-split";
+import { hasPublishedSessionCalendar, isVenueTradingDay, latestRegularSessionOpen, previousPublishedSession, sessionCalendarTimeZone } from "./freshness";
+import {
+  EXTENDED_SESSION_MARKS,
+  getActiveQuoteDisplay,
+  getRegularSessionDisplay,
+  regularSessionDisplayDate,
+  type ExtendedSession,
+} from "./status";
 
 const DAY_MS = 86_400_000;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -25,15 +34,20 @@ export type QuoteChangeBasis =
   | { kind: "utc day" }
   | { kind: "24h" };
 
-/** A move from a dated session's close, settlement or last trade. */
+/** A move from a dated session's close or settlement. */
 interface DatedChangeBasis {
-  kind: "close" | "settle" | "last trade";
+  kind: "close" | "settle";
   /** The exchange-local date of the session the move is measured from. */
   date: string;
   /** The venue, when its calendar dated the close. */
   venue?: string;
   /** Days of the venue's trading week it was closed between that session and the move's (holidays). */
   closed?: readonly string[];
+  /**
+   * A split took effect in the move's session (Quote.sessionSplit): the close
+   * it is measured from is on the new share basis.
+   */
+  split?: { exDate: string; priceFactor: number };
 }
 
 export interface QuoteChangeBasisOptions {
@@ -82,16 +96,85 @@ const INDEX_CALENDAR_VENUES: Readonly<Record<string, string>> = {
   "CHICAGO OPTIONS": "CBOE",
 };
 
-/** The venue whose published calendar dates the quote's sessions. */
-function calendarVenue(quote: Quote): string {
+/** The venue whose published calendar dates the quote's sessions, and whose zone dates its daily bars. */
+export function calendarVenue(quote: Quote): string {
   const venue = quoteVenue(quote);
-  const index = classifyInstrumentType(quote.instrumentType) === "index" || kindFromListingSyntax(quote.symbol) === "index";
-  return (index && INDEX_CALENDAR_VENUES[venue]) || venue;
+  return (isIndexQuote(quote) && INDEX_CALENDAR_VENUES[venue]) || venue;
 }
 
 function isCurrencyPair(quote: Quote): boolean {
   return classifyInstrumentType(quote.instrumentType) === "currency"
     || kindFromListingSyntax(quote.symbol, quote.listingExchangeName || quote.exchangeName) === "currency";
+}
+
+/**
+ * The trading day a quote describes (quoteTradingDay); for a currency pair,
+ * whose venue has no clock, the FX trading day of its print, which turns at
+ * 17:00 New York, so every pair on a board is dated alike. Null for a pair's
+ * print made while FX is shut, which belongs to no trading day. An index
+ * whose quote names no session is dated by its home venue (indexPrintSession).
+ */
+function tradingDayOf(quote: Quote): string | null {
+  const day = quoteTradingDay(quote);
+  if (day || !Number.isFinite(quote.lastUpdated) || quote.lastUpdated <= 0) return day;
+  if (isIndexQuote(quote)) return indexPrintSession(quote);
+  return isCurrencyPair(quote) ? fxPrintTradingDay(quote.lastUpdated) : null;
+}
+
+function isIndexQuote(quote: Quote): boolean {
+  return classifyInstrumentType(quote.instrumentType) === "index" || kindFromListingSyntax(quote.symbol) === "index";
+}
+
+/**
+ * One of Cboe's Treasury yield indices (^IRX, ^FVX, ^TNX, ^TYX): computed on
+ * the bond market's days, whose holidays (Veterans Day, Columbus Day) the
+ * equity calendar Cboe's venue follows does not have.
+ */
+function isCboeYieldIndex(quote: Quote): boolean {
+  return isIndexQuote(quote) && isYieldIndexSymbol(quote.symbol);
+}
+
+/**
+ * The session of the venue whose calendar an index follows (calendarVenue)
+ * that its last print sits in: the print's date in that venue's zone, when
+ * its published calendar has a session that day and the print came after it
+ * opened. The S&P 500's closing print at 16:37 New York on Fri 6 Nov 2026 is
+ * Friday's, so its move is from Thursday's close. A print before the day's
+ * open, or on a day the calendar has no session for, names none. An index
+ * on a venue with no published calendar, or on Cboe's, whose days are Cboe's
+ * own, is dated by its own sessions (`ownIndexSession`); a Cboe yield index,
+ * which skips the bond market's holidays, by none.
+ */
+function indexPrintSession(quote: Quote): string | null {
+  const venue = calendarVenue(quote);
+  // A Cboe index's days are Cboe's own: one with its own sessions (the Russell 2000, quoted under CHICAGO OPTIONS) is
+  // dated by them; a yield index, which skips the bond market's holidays, is not dated here.
+  if (venue === "CBOE") {
+    const zone = isCboeYieldIndex(quote) ? null : quote.indexSession?.timeZone;
+    const date = zone ? zonedDateKey(quote.lastUpdated, zone) : null;
+    return date ? ownIndexSession(quote, date) : null;
+  }
+  const zone = sessionCalendarTimeZone(venue) ?? quote.indexSession?.timeZone;
+  if (!zone) return null;
+  const date = zonedDateKey(quote.lastUpdated, zone);
+  if (!date) return null;
+  if (!hasPublishedSessionCalendar(venue, date)) return ownIndexSession(quote, date);
+  if (!isVenueTradingDay(venue, date)) return null;
+  const open = latestRegularSessionOpen(venue, quote.lastUpdated);
+  return open != null && zonedDateKey(open, zone) === date ? date : null;
+}
+
+/**
+ * For an index whose venue publishes no calendar (the Euro Stoxx 50 and the
+ * FTSE 100, quoted under their publishers' ZURICH and FTSE INDEX), the
+ * session of the index's own calendar (indexSession) its print sits in: one
+ * that opened on `date`, at or before the print. Null when none did.
+ */
+function ownIndexSession(quote: Quote, date: string): string | null {
+  const session = quote.indexSession;
+  if (!session?.timeZone) return null;
+  const windows = [...session.regular, ...(session.current ? [session.current] : [])];
+  return windows.some((window) => window.start <= quote.lastUpdated && zonedDateKey(window.start, session.timeZone) === date) ? date : null;
 }
 
 /** A coin on the spot crypto venue: its day is the UTC day. */
@@ -120,31 +203,40 @@ function previousIndexSession(quote: Quote, date: string): string | null {
  * calendar, with the closures in between (an index's, the venue whose days it
  * follows); otherwise for an index from its own sessions; for a currency pair
  * the weekday before; for any other listing the day its own daily closes date
- * its previous close to (`previousCloseDate`, PreviousCloseDates). Null
- * when nothing dates it.
+ * its previous close to (`previousCloseDate`, PreviousCloseDates). A thin
+ * listing's previous trade before the calendar's session is its own day, and
+ * one whose closes cannot name it is left undated. A Cboe yield index is
+ * dated by its own closes alone. Null when nothing dates it.
  */
 function previousSession(quote: Quote, sessionDate: string): DatedChangeBasis | null {
+  if (quote.previousCloseUndated) return null;
   const venue = calendarVenue(quote);
+  const dated = quote.previousCloseDate && ISO_DATE.test(quote.previousCloseDate) && quote.previousCloseDate < sessionDate
+    ? quote.previousCloseDate : null;
+  // A yield index's days are the bond market's: only its own daily closes date it, never its venue's equity calendar.
+  if (isCboeYieldIndex(quote)) return dated ? { kind: "close", date: dated } : null;
   const published = previousPublishedSession(venue, sessionDate);
+  // A listing that did not trade in the calendar's session moves from its previous trade, an earlier day.
+  if (published && dated && dated < published.date) return { kind: "close", date: dated, venue };
   if (published) return { kind: "close", date: published.date, venue, closed: published.closed };
   const index = previousIndexSession(quote, sessionDate);
   if (index) return { kind: "close", date: index };
   if (isCurrencyPair(quote)) return { kind: "close", date: weekdayBefore(sessionDate) };
-  const dated = quote.previousCloseDate;
-  if (dated && ISO_DATE.test(dated) && dated < sessionDate) return { kind: "close", date: dated };
-  return null;
+  return dated ? { kind: "close", date: dated } : null;
 }
 
 /**
  * Whether something other than the listing's own daily closes dates every
  * move of the quote: a future's terms, a coin's UTC day, a perpetual's 24
  * hours, a currency pair's weekday, or its venue's calendar for the year of
- * `now`. A few lookups, for a caller that runs on every tick before it asks
+ * `now`; never a Cboe yield index's, which its own closes date. A few
+ * lookups, for a caller that runs on every tick before it asks
  * quoteChangeBasis.
  */
 export function isChangeBasisDatedWithoutCloses(quote: Quote, now = Date.now()): boolean {
   if (isSpotCoin(quote) || isCurrencyPair(quote) || isFuturesInstrument(quote.symbol, quote.instrumentType)) return true;
   if (isPerpetualExchange(quote.listingExchangeName || quote.exchangeName)) return true;
+  if (isCboeYieldIndex(quote)) return false;
   return hasPublishedSessionCalendar(calendarVenue(quote), new Date(now).toISOString().slice(0, 10));
 }
 
@@ -154,7 +246,7 @@ export function isChangeBasisDatedWithoutCloses(quote: Quote, now = Date.now()):
  * nothing dates it.
  */
 export function changeBasisSessionDate(quote: Quote): string | null {
-  const date = regularSessionDisplayDate(quote) ?? quoteTradingDay(quote);
+  const date = regularSessionDisplayDate(quote) ?? tradingDayOf(quote);
   return date && ISO_DATE.test(date) ? date : null;
 }
 
@@ -179,13 +271,56 @@ export function quoteChangeBasis(
   if (!display || !isFiniteNumber(display.change)) return null;
   if (quote.changeBasis === "24h" || isPerpetualExchange(quote.listingExchangeName || quote.exchangeName)) return { kind: "24h" };
   if (isSpotCoin(quote)) return { kind: "utc day" };
-  const sessionDate = (session === "active" ? quote.changeSessionDate : regularSessionDisplayDate(quote)) ?? quoteTradingDay(quote);
+  const sessionDate = (session === "active" ? quote.changeSessionDate : regularSessionDisplayDate(quote)) ?? tradingDayOf(quote);
   if (isFuturesInstrument(quote.symbol, quote.instrumentType)) {
-    const basis = futuresChangeBasis(terms ?? { settlement: null }, { ...display, sessionDate }, quoteVenue(quote));
-    return basis ? { kind: basis.kind, date: basis.session } : { kind: "previous close" };
+    const basis = futuresChangeBasis(terms ?? { settlement: null }, futuresMove(quote, display, sessionDate), quoteVenue(quote));
+    // A move to measure again (futuresQuoteFromSettle does), or one nothing dates, names no session.
+    return basis && basis.from == null ? { kind: basis.kind, date: basis.session } : { kind: "previous close" };
   }
   if (!sessionDate || !ISO_DATE.test(sessionDate)) return { kind: "previous close" };
-  return previousSession(quote, sessionDate) ?? { kind: "previous close" };
+  const previous = previousSession(quote, sessionDate);
+  if (!previous) return { kind: "previous close" };
+  // The split of the move's own session is said beside it, on every surface.
+  const split = quote.sessionSplit;
+  return split?.exDate === sessionDate ? { ...previous, split: { exDate: split.exDate, priceFactor: split.priceFactor } } : previous;
+}
+
+/**
+ * A futures move as futuresChangeBasis reads it: the print's own time when
+ * the move shown is the latest print's (not a completed session's close), so
+ * a print after the Globex reopen dates it, and the month the quote prices.
+ */
+function futuresMove(quote: Quote, display: { price: number; change?: number | null }, sessionDate: string | null) {
+  const live = display.price === quote.price && Number.isFinite(quote.lastUpdated) && quote.lastUpdated > 0;
+  return { ...display, sessionDate, tradedAt: live ? quote.lastUpdated : null, month: futuresQuoteMonth(quote) };
+}
+
+const roundMove = (value: number) => Math.round(value * 1e10) / 1e10;
+
+/**
+ * A futures quote whose move is measured again from the settlement of the
+ * session before when the source measured it from something else, for the
+ * same contract (futuresChangeBasis): that settlement becomes its previous
+ * close, its session the date. Every surface that shows a futures move with
+ * its terms (quote, ticker, the Overview, FUT and the portfolio) reads it
+ * through this, so they never disagree. The move still covers one session;
+ * a reference the terms cannot pair with that session's settlement, around a
+ * roll or while they lag, is left as the source measured it. Any other quote
+ * is returned as it is, as is one whose headline is a completed session's
+ * close rather than its price.
+ */
+export function futuresQuoteFromSettle<Q extends Quote | null | undefined>(
+  quote: Q,
+  terms: QuoteChangeBasisOptions["terms"],
+): Q {
+  if (!quote || !terms || quote.delisting || quote.changeBasis === "none" || !isFuturesInstrument(quote.symbol, quote.instrumentType)) return quote;
+  const display = getRegularSessionDisplay(quote);
+  if (!display || display.price !== quote.price || display.change !== quote.change) return quote;
+  const sessionDate = regularSessionDisplayDate(quote) ?? tradingDayOf(quote);
+  const basis = futuresChangeBasis(terms, futuresMove(quote, display, sessionDate), quoteVenue(quote));
+  if (basis?.from == null || !(basis.from > 0)) return quote;
+  const change = roundMove(quote.price - basis.from);
+  return { ...quote, change, changePercent: (change / basis.from) * 100, previousClose: basis.from, previousCloseDate: basis.session };
 }
 
 /**
@@ -211,18 +346,47 @@ export function quoteSettleText(
 export function quotePreviousCloseDate(quote: Quote | null | undefined): string | null {
   if (!quote || !isFiniteNumber(quote.previousClose) || quote.changeBasis != null) return null;
   if (isPerpetualExchange(quote.listingExchangeName || quote.exchangeName)) return null;
-  const sessionDate = quote.changeSessionDate ?? quoteTradingDay(quote);
+  const sessionDate = quote.changeSessionDate ?? tradingDayOf(quote);
   if (!sessionDate || !ISO_DATE.test(sessionDate)) return null;
   if (isSpotCoin(quote)) return dayBefore(sessionDate);
   if (isFuturesInstrument(quote.symbol, quote.instrumentType)) {
-    return futuresChangeBasis({ settlement: null }, { price: quote.price, change: 0, sessionDate }, quoteVenue(quote))?.session ?? null;
+    return futuresChangeBasis({ settlement: null }, futuresMove(quote, { price: quote.price, change: 0 }, sessionDate), quoteVenue(quote))?.session ?? null;
   }
   return previousSession(quote, sessionDate)?.date ?? null;
+}
+
+/**
+ * Whether the quote's print is older than what its move is measured from, so
+ * the move, labelled as of now, is not one: a coin whose last print is
+ * before today's 00:00 UTC (TUSD-USD's 29 Oct print read on 3 Nov, "0.00%
+ * since 00:00 UTC"), or a move over 24 hours whose print is older than that.
+ * A move from a dated close is measured from the print's own session, so it
+ * never is.
+ */
+export function printPredatesChangeBasis(
+  quote: Pick<Quote, "lastUpdated"> | null | undefined,
+  basis: QuoteChangeBasis | null | undefined,
+  now = Date.now(),
+): boolean {
+  const printed = quote?.lastUpdated;
+  if (!basis || !isFiniteNumber(printed) || printed <= 0 || printed > now) return false;
+  if (basis.kind === "utc day") return printed < Math.floor(now / DAY_MS) * DAY_MS;
+  if (basis.kind === "24h") return printed < now - DAY_MS;
+  return false;
 }
 
 /** `Fri 16 Oct`, with the year when it is not `now`'s. */
 function sessionDay(date: string, now: number): string {
   return formatUtcDayTime({ time: Date.parse(`${date}T00:00:00Z`), dateOnly: true }, now);
+}
+
+/**
+ * The close a headline price is, by its session's day: "Tue 17 Nov close",
+ * worded as the close a move is from ("vs Mon 16 Nov close"), so a report that
+ * shows an after-hours print beside it dates the two apart (headlineCloseDate).
+ */
+export function closeDayLabel(date: string, now = Date.now()): string {
+  return `${sessionDay(date, now)} close`;
 }
 
 /**
@@ -244,15 +408,23 @@ export function changeBasisLabel(basis: QuoteChangeBasis, now = Date.now()): str
 }
 
 /**
- * The days a venue was closed since the close a move is measured from, when
- * there were any: "HKEX closed Mon 19 Oct, holiday"; three or more read as a
- * span, "TWSE closed Thu 12 Feb to Fri 20 Feb, holidays". Null otherwise.
+ * What a reader needs beside the close a move is measured from: a split in
+ * the move's session, "3-for-1 split Thu 5 Nov, close adjusted" (the close is
+ * on the new share basis), and the days a venue was closed since that close,
+ * "HKEX closed Mon 19 Oct, holiday"; three or more read as a span, "TWSE
+ * closed Thu 12 Feb to Fri 20 Feb, holidays". Null when there is neither.
  */
 export function changeBasisNote(basis: QuoteChangeBasis | null | undefined, now = Date.now()): string | null {
-  if (!basis || basis.kind !== "close" || !basis.venue || !basis.closed?.length) return null;
-  const days = basis.closed.map((date) => sessionDay(date, now));
-  const span = days.length === 1 ? days[0] : days.length === 2 ? `${days[0]} and ${days[1]}` : `${days[0]} to ${days.at(-1)}`;
-  return `${basis.venue} closed ${span}, ${days.length === 1 ? "holiday" : "holidays"}`;
+  if (!basis || basis.kind !== "close") return null;
+  const notes: string[] = [];
+  const ratio = basis.split ? splitRatioText(basis.split.priceFactor) : null;
+  if (basis.split && ratio) notes.push(`${ratio} split ${sessionDay(basis.split.exDate, now)}, close adjusted`);
+  if (basis.venue && basis.closed?.length) {
+    const days = basis.closed.map((date) => sessionDay(date, now));
+    const span = days.length === 1 ? days[0] : days.length === 2 ? `${days[0]} and ${days[1]}` : `${days[0]} to ${days.at(-1)}`;
+    notes.push(`${basis.venue} closed ${span}, ${days.length === 1 ? "holiday" : "holidays"}`);
+  }
+  return notes.length ? notes.join("; ") : null;
 }
 
 /** What several moves summed into one (a portfolio's day) are measured from, when they say. */
@@ -271,6 +443,35 @@ export function combinedChangeBasisLabel(bases: Iterable<QuoteChangeBasis | null
   return labels.size === 1 ? [...labels][0]! : MIXED_CHANGE_BASIS_LABEL;
 }
 
+/** An extended session as a day's move names its print in words, where there is room: "after hours vs Tue 10 Nov close". */
+/** An extended session in a sentence: "the move after hours vs Tue 10 Nov close", "Last price 158.78 after hours". */
+export const EXTENDED_PRINT_WORDS: Record<ExtendedSession, string> = { PRE: "pre-market", POST: "after hours", OVERNIGHT: "overnight" };
+
+/**
+ * The basis of a day's move summed over the prices a book is valued at, when
+ * some are pre-market, after-hours or overnight prints (its latest print): the
+ * session of those prints, then the close the moves are from, so the line says
+ * which print it compares with which close. `marks` gives the session as a row
+ * marks its price ("AH vs Tue 10 Nov close"), otherwise in words ("after hours
+ * vs Tue 10 Nov close"); prints from several sessions read EXT or "extended
+ * hours". Without an extended print, the close alone, as
+ * combinedChangeBasisLabel gives it; null without a basis.
+ */
+export function dayMoveBasisLabel(
+  bases: Iterable<QuoteChangeBasis | null | undefined>,
+  prints: Iterable<ExtendedSession | null | undefined>,
+  { marks = false, now = Date.now() }: { marks?: boolean; now?: number } = {},
+): string | null {
+  const basis = combinedChangeBasisLabel(bases, now);
+  const sessions = new Set<ExtendedSession>();
+  for (const print of prints) if (print) sessions.add(print);
+  if (!basis || sessions.size === 0) return basis;
+  const [session] = sessions;
+  const print = sessions.size > 1 ? (marks ? "EXT" : "extended hours")
+    : marks ? EXTENDED_SESSION_MARKS[session!] : EXTENDED_PRINT_WORDS[session!];
+  return `${print} ${basis}`;
+}
+
 /**
  * The basis as `--json` gives it beside a move: the kind, the dated session
  * (`date`), the venue's closures in between and the label and note a change
@@ -283,6 +484,7 @@ export function changeBasisJson(basis: QuoteChangeBasis | null, now = Date.now()
     kind: basis.kind,
     date: "date" in basis ? basis.date : null,
     ...("closed" in basis && basis.closed?.length ? { closed: [...basis.closed] } : {}),
+    ...("split" in basis && basis.split ? { split: { ...basis.split } } : {}),
     label: changeBasisLabel(basis, now),
     ...(note ? { note } : {}),
   };

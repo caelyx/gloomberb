@@ -1,12 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
+import { ApiRequestError } from "../../../api-client/errors";
 import type { FuturesContractTermsPayload } from "../../../api-client/futures-curve";
 import type { FuturesContract } from "../../../market-data/futures-board";
+import { createTtlCache } from "../../../data/ttl-cache";
 import { loadFuturesContractTerms } from "../../../market-data/futures-contract";
+import { logFailure } from "../../../utils/log-failure";
+import { coalescedBump } from "./coalesced-bump";
+import { apiClient } from "../../../api-client";
+import { boardReadGate } from "./board-reads";
 
 interface FuturesTermsState {
   /** The row's terms are still being asked for. */
   loading: boolean;
-  /** Null when the server has no terms for the symbol, or could not answer. */
+  /** Null while they are being asked for, when the server has none for the symbol, or when the read failed. */
   terms: FuturesContractTermsPayload | null;
 }
 
@@ -14,69 +20,84 @@ export type FuturesTermsMap = ReadonlyMap<string, FuturesTermsState>;
 
 /** The terms change with a roll, and a roll is decided once a day. */
 const TERMS_TTL_MS = 30 * 60_000;
-/** Forty-odd rows open at once; a few requests at a time keep the board's quotes first. */
-const TERMS_CONCURRENCY = 4;
+/**
+ * A read that failed is asked again after this: one blip leaves a row without
+ * its terms for a minute, not for the TTL, and a service that is down is asked
+ * once a minute, not once a tick.
+ */
+const TERMS_RETRY_MS = 60_000;
 
-interface CachedTerms {
-  at: number;
-  /** Null when the server has no terms for the symbol, or could not answer. */
-  terms: FuturesContractTermsPayload | null;
+/**
+ * Null when the server has no terms for the symbol, which is an answer and is
+ * kept like any other. A read that fails is not kept as one: it rejects, and
+ * the cache holds the rejection for `TERMS_RETRY_MS`.
+ */
+const termsCache = createTtlCache<FuturesContractTermsPayload | null>({ ttlMs: TERMS_TTL_MS, rejectionMs: TERMS_RETRY_MS });
+
+async function readTerms(symbol: string, batch: boolean): Promise<FuturesContractTermsPayload | null> {
+  try {
+    return await loadFuturesContractTerms(symbol, apiClient, { batch });
+  } catch (error) {
+    if (error instanceof ApiRequestError && error.status === 404) return null;
+    throw error;
+  }
 }
 
-const termsCache = new Map<string, CachedTerms>();
-const inFlight = new Map<string, Promise<void>>();
-
-function fresh(symbol: string, now: number): CachedTerms | undefined {
-  const cached = termsCache.get(symbol);
-  return cached && now - cached.at < TERMS_TTL_MS ? cached : undefined;
-}
-
-function loadTerms(symbol: string): Promise<void> {
-  const pending = inFlight.get(symbol);
-  if (pending) return pending;
-  const request = loadFuturesContractTerms(symbol)
-    .then((terms) => { termsCache.set(symbol, { at: Date.now(), terms }); })
-    .catch(() => { termsCache.set(symbol, { at: Date.now(), terms: null }); })
-    .finally(() => { inFlight.delete(symbol); });
-  inFlight.set(symbol, request);
-  return request;
+/** Whether the row has an answer; false when the read failed. `batch`: asked with every other row's, in batch requests. */
+function loadTerms(symbol: string, batch: boolean): Promise<boolean> {
+  return termsCache.load(symbol, () => readTerms(symbol, batch))
+    .then(() => true, logFailure("futures", "Read a futures row's contract terms failed", false));
 }
 
 /**
  * Each listed row's contract terms, as `quote` reads them: the unit its price
- * counts, the nearer month still trading once its continuous symbol has
- * rolled, and the day's most active month. Only the rows the board lists are asked for,
- * and a row whose terms have not arrived (or that has none) renders without them.
+ * counts and the nearer month still trading once its continuous symbol has
+ * rolled. Only the rows the board lists are asked for, and a row whose terms
+ * have not arrived (or that has none) renders without them.
  */
 export function useFuturesBoardTerms(contracts: readonly FuturesContract[], enabled: boolean): FuturesTermsMap {
   const symbolKey = contracts.map((contract) => contract.symbol).join(",");
   const [version, setVersion] = useState(0);
+  // Bumped once the retry delay has passed after a failed read, to ask again.
+  const [retry, setRetry] = useState(0);
 
   useEffect(() => {
     if (!enabled || !symbolKey) return;
-    const now = Date.now();
-    const queue = symbolKey.split(",").filter((symbol) => !fresh(symbol, now));
+    const queue = symbolKey.split(",").filter((symbol) => termsCache.peek(symbol) === undefined);
     if (queue.length === 0) return;
     let cancelled = false;
-    const worker = async () => {
-      for (let symbol = queue.shift(); symbol; symbol = queue.shift()) {
-        await loadTerms(symbol);
-        if (!cancelled) setVersion((current) => current + 1);
-      }
-    };
-    void Promise.all(Array.from({ length: Math.min(TERMS_CONCURRENCY, queue.length) }, worker));
+    let failed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    const landed = coalescedBump(() => {
+      if (!cancelled) setVersion((current) => current + 1);
+    });
+    // Twelve reads at a time, shared with the rows' histories (`boardRead`), or all at once while the client
+    // sends terms in batch requests; a board that moved on skips its turn.
+    const batch = apiClient.batchesReads("futures-terms");
+    const read = boardReadGate(batch);
+    void Promise.all(queue.map((symbol) => read(async () => {
+      if (cancelled) return;
+      if (!await loadTerms(symbol, batch)) failed = true;
+      landed.bump();
+    }))).then(() => {
+      landed.flush();
+      if (failed && !cancelled) retryTimer = setTimeout(() => setRetry((current) => current + 1), TERMS_RETRY_MS);
+    });
     return () => {
       cancelled = true;
-      queue.length = 0;
+      landed.cancel();
+      clearTimeout(retryTimer);
     };
-  }, [enabled, symbolKey]);
+  }, [enabled, symbolKey, retry]);
 
   return useMemo(() => {
     const result = new Map<string, FuturesTermsState>();
     if (!enabled) return result;
     for (const symbol of symbolKey ? symbolKey.split(",") : []) {
-      const cached = termsCache.get(symbol);
-      result.set(symbol, { loading: !cached, terms: cached?.terms ?? null });
+      // A row keeps the terms it had past their TTL until the next load lands, and
+      // one whose read failed draws without them rather than waiting on a retry.
+      const terms = termsCache.peek(symbol, { stale: true });
+      result.set(symbol, { loading: terms === undefined && !termsCache.failed(symbol), terms: terms ?? null });
     }
     return result;
     // `version` re-reads the cache as loads land.

@@ -10,9 +10,11 @@ import { createDefaultConfig } from "../../types/config";
 import { createTestCliContext, type PrintedCliResult } from "../../test-support/cli-context";
 import { createMovedSymbolsProvider, HFC_HOP, MOVED_SYMBOL_CHANGES as CHANGES } from "../../test-support/moved-symbols";
 import { captureConsole } from "../../test-support/console";
+import { createTestFinancials, createTestQuote } from "../../test-support/data-provider";
 import { DEFAULT_CLI_OPTIONS } from "../options";
 import { printCliError } from "../errors";
 import { marketDataCliCommands } from "./market";
+import { overviewCliCommands } from "./overview";
 import { ticker } from "./ticker";
 
 const history = marketDataCliCommands.find((command) => command.name === "history")!;
@@ -31,15 +33,16 @@ async function runHistory(args: string[], dataProvider = source()) {
 
 async function runTicker(symbol: string, dataProvider = source()) {
   let data: unknown = null;
+  let warnings: string[] = [];
   const error = await ticker(symbol, {
     initMarketData: async () => ({
       config, dataDir: "/tmp/gloom-moved-symbols-fixture", dataProvider,
       store: { loadTicker: async () => null, loadAllTickers: async () => [] }, persistence: { close: () => {} },
     }) as unknown as MarketContext,
     fail: (message) => { throw new Error(message); },
-    printResult: (result) => { data = result.data; },
+    printResult: (result) => { data = result.data; warnings = result.warnings ?? []; },
   }).then(() => null, (failure: unknown) => failure);
-  return { error, data };
+  return { error, data, warnings };
 }
 
 /** What `--json` prints for a failure: the same printer the CLI ends every failed command with. */
@@ -80,6 +83,53 @@ test("history and ticker of a symbol whose company moved serve nothing of their 
   }
 });
 
+test("a dated window, holders and filings of a moved symbol whose own request fails name its new symbol, never the source's dead end", async () => {
+  // FI's window before the listing that reused the symbol: the dated request fails, and the whole history starts in 2026.
+  const reused = source(undefined, {
+    getDetailedPriceHistoryWithMetadata: async () => { throw new Error("No data for HFC from 2022-03-10 to 2022-03-18."); },
+    getPriceHistoryWithMetadata: async () => ({ resolution: "1mo", points: [{ date: new Date("2026-07-01"), open: 1, high: 1, low: 1, close: 1, volume: 0 }] }),
+    getHolders: async () => { throw new Error("No holders on record for HFC."); },
+    getSecFilings: async () => { throw new Error("Unknown ticker HFC"); },
+  });
+  const window = await runHistory(["HFC", "--from", "2022-03-10", "--to", "2022-03-18", "--interval", "daily"], reused);
+  expect((window.error as Error).message).toBe("HFC became DINO on 2022-03-15: `gloom history DINO --from 2022-03-10 --to 2022-03-18 --interval daily`");
+  for (const [name, line] of [["holders", "`gloom holders DINO`"], ["13f", "`gloom 13f DINO`"], ["filings", "`gloom filings DINO`"]] as const) {
+    const command = marketDataCliCommands.find((entry) => entry.name === name)!;
+    const cli = createTestCliContext({ config, dataProvider: reused });
+    const error = await command.execute(["HFC"], cli.context).then(() => null, (failure: unknown) => failure);
+    expect((error as Error).message, name).toBe(`HFC became DINO on 2022-03-15: ${line}`);
+  }
+});
+
+test("a read of a symbol that trades costs no change lookup and no second quote; one whose line stopped still names the new symbol", async () => {
+  const counted = () => {
+    const counts = { quote: 0, changes: 0 };
+    const provider = source(async (symbol) => { counts.changes++; return CHANGES[symbol] ?? null; }, {
+      // The shipped listings know both as US stocks, as the command line's provider says.
+      knownUsStock: (symbol) => symbol === "AAPL" || symbol === "META",
+      getHolders: async (symbol) => ({ symbol, holders: [{ name: "Vanguard Group", shares: 1, value: 1, percentHeld: 0.1, reportDate: "2026-09-30", ownerType: "institution" }] }) as never,
+      getSecFilings: async () => [{ form: "10-Q", filingDate: "2026-10-30", accessionNumber: "0000320193-26-000001", filingUrl: "https://www.sec.gov/x" }] as never,
+    });
+    const quote = provider.getQuote.bind(provider);
+    provider.getQuote = async (...args) => { counts.quote++; return quote(...args); };
+    return { counts, provider };
+  };
+  const commands = [...marketDataCliCommands, ...overviewCliCommands];
+  // Each reads AAPL's quote once for itself (correlation each symbol's), as before: the quote says the line trades.
+  for (const [name, args, quotes] of [["holders", ["AAPL"], 1], ["13f", ["AAPL"], 1], ["filings", ["AAPL"], 1], ["correlation", ["AAPL", "META"], 2]] as const) {
+    const { counts, provider } = counted();
+    const cli = createTestCliContext({ config, dataProvider: provider });
+    await commands.find((command) => command.name === name)!.execute([...args], cli.context);
+    expect(cli.printed, name).toHaveLength(1);
+    expect(counts, name).toEqual({ quote: quotes, changes: 0 });
+  }
+  // HFC's holders come back, but its quote stopped in 2022: its change is looked up and named.
+  const { provider } = counted();
+  const cli = createTestCliContext({ config, dataProvider: provider });
+  const error = await marketDataCliCommands.find((command) => command.name === "holders")!.execute(["HFC"], cli.context).then(() => null, (failure: unknown) => failure);
+  expect((error as Error).message).toBe("HFC became DINO on 2022-03-15: `gloom holders DINO`");
+});
+
 async function runQuote(symbols: string[]) {
   const cli = createTestCliContext({ config, dataProvider: source() });
   await quote.execute(symbols, cli.context);
@@ -105,8 +155,10 @@ test("quote of a moved symbol names its new symbol beside the old line's last pr
   // META (a new company holds it) and AAPL (no change) serve their own bars and report, with nothing extra.
   const meta = await runHistory(["META"]);
   expect(meta.error).toBeNull();
-  expect((meta.printed!.result.data as Array<{ close: number }>).map((row) => row.close)).toEqual([736.72]);
-  expect(meta.printed!.result.warnings).toEqual(["Asked 1Y, data starts 2026-10-14 (first available bar)"]);
+  // Its served bar leads; a quote that says the session trades adds the day's bar after it, as for any daily history.
+  expect((meta.printed!.result.data as Array<{ close: number }>)[0]!.close).toBe(736.72);
+  expect(meta.printed!.result.warnings).toContain("Asked 1Y, data starts 2026-10-14 (first available bar)");
+  expect(meta.printed!.result.warnings!.join(" ")).not.toMatch(/became|no longer trading/);
   expect((await runTicker("AAPL")).error).toBeNull();
   // A change lookup that fails is no note and no failure: the bars are served.
   const offline = await runHistory(["HFC"], source(async () => { throw new Error("fetch failed"); }));
@@ -129,6 +181,28 @@ test("a stopped line waits for a slow change lookup before serving, while a symb
 });
 
 /** Gloom Cloud's stored IV: a reading for META, none yet for anything else. */
+const GOGL_FUND = createTestQuote({ symbol: "GOGL", name: "Corgi GOOGL 2x Daily ETF", price: 15.19, listingExchangeName: "BATS", exchangeName: "BATS" });
+const GOGL_BAR = { date: new Date("2026-10-14"), open: 15, high: 15, low: 15, close: 15, volume: 0 };
+
+/** GOGL: Golden Ocean merged into CMB.Tech in 2025 and a fund lists there now; the change answers after the data, past the short grace. */
+const mergedAway = () => source((symbol) => Bun.sleep(300).then(() => symbol === "GOGL" ? {
+  symbol, moved: null, formerly: null, listedName: null, changes: [],
+  formerIssuer: { symbol, name: "Golden Ocean Group Ltd", until: "2025-08-20", successor: { symbol: "CMBT", name: "Cmb.Tech NV" } },
+} : null), {
+  getQuote: async () => GOGL_FUND,
+  getQuotesBatch: async (targets) => targets.map((target) => ({ target, quote: GOGL_FUND })),
+  getTickerFinancials: async () => createTestFinancials({ quote: GOGL_FUND }),
+  getPriceHistory: async () => [GOGL_BAR],
+  getPriceHistoryWithMetadata: async () => ({ resolution: "1d", points: [GOGL_BAR] }),
+});
+
+test("history, ticker, fn and fn G of a symbol whose company merged away say what became of it, as quote does", async () => {
+  const line = "GOGL was Golden Ocean Group until 2025, now Cmb.Tech: CMBT";
+  expect((await runHistory(["GOGL"], mergedAway())).printed!.result.warnings).toContain(line);
+  expect((await runTicker("GOGL", mergedAway())).warnings).toContain(line);
+  for (const fn of ["GIP", "G"]) expect((await runFn([fn, "GOGL"], mergedAway())).printed!.result.warnings, fn).toContain(line);
+});
+
 function impliedVolatility(path: string) {
   const symbol = new URLSearchParams(path.split("?")[1]).get("symbol") ?? "";
   const symbols = new URLSearchParams(path.split("?")[1]).get("symbols")?.split(",") ?? [];

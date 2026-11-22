@@ -1,4 +1,5 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { MISSING_VALUE } from "../../../utils/format";
+import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import { act, useCallback, useState } from "react";
 import { apiClient } from "../../../api-client";
 import type { RateMeeting, RatePathPayload } from "../../../api-client/rates";
@@ -26,6 +27,7 @@ function payload(): RatePathPayload {
 const tui = createOpenTuiTestHarness();
 let spy: { mockRestore(): void } | undefined;
 afterEach(() => {
+  setSystemTime();
   spy?.mockRestore(); spy = undefined;
   ratePathCache.reset();
 });
@@ -69,6 +71,8 @@ test("the path fits the body: short panes give the meetings the room instead of 
 });
 
 test("the path names what it plots: one target range, the SEP dots, meetings by month", async () => {
+  // Before the payload's first meeting, so the header counts down to it instead of printing its date.
+  setSystemTime(new Date("2026-09-22T15:00:00Z"));
   spy = spyOn(apiClient, "getCloudRatePath").mockResolvedValue(payload());
   const lines = await render(140, 45);
   const header = lines.findIndex((line) => line.includes("MEETING"));
@@ -87,6 +91,19 @@ test("the path names what it plots: one target range, the SEP dots, meetings by 
   // Every meeting shares its rank and quote time, so neither is a column.
   expect(lines[header]).not.toContain("PCTL");
   expect(lines[header]).not.toContain("AS OF");
+});
+
+test("a slope with no figure is left out of the header rather than shown as dashes", async () => {
+  setSystemTime(new Date("2026-09-22T15:00:00Z"));
+  spy = spyOn(apiClient, "getCloudRatePath").mockResolvedValue(payload());
+  const shown = (await render(140, 45)).join("\n");
+  expect(shown).toContain("Oct '26 to Sep '27");
+  spy.mockRestore();
+  ratePathCache.reset();
+  spy = spyOn(apiClient, "getCloudRatePath").mockResolvedValue({ ...payload(), slope: { valueBps: null, percentile: null, samples: 0, asOf: null } });
+  const frame = (await render(140, 45)).join("\n");
+  expect(frame).not.toContain("Oct '26 to Sep '27");
+  expect(frame).not.toContain(`pctl ${MISSING_VALUE}`);
 });
 
 test("the selected meeting is the path's point", async () => {

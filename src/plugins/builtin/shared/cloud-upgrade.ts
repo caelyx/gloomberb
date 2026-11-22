@@ -1,3 +1,4 @@
+import { logFailure } from "../../../utils/log-failure";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { apiClient } from "../../../api-client";
 import { recordResearchActivity, researchUpgradeUrl } from "../../../api-client/research-activity";
@@ -10,10 +11,11 @@ import { useRendererHost } from "../../../ui";
 import type { RendererHost } from "../../../ui";
 import { getSharedRegistry } from "../../registry";
 import { requestAccountManagementTab } from "../account-management/navigation";
-import { resolvePlanAccess, usePlanAccess, type PlanAccess } from "../../../api-client/plan-access";
+import { freeQuotesDelayMinutes, resolvePlanAccess, usePlanAccess, type PlanAccess, type QuoteDelayFacts } from "../../../api-client/plan-access";
 import { useViewport } from "../../../react/input";
 import { type DialogApi, useOptionalDialog } from "../../../ui/dialog";
 import { promptCloudUpgrade } from "../../../account/upgrade-dialog";
+import { isAuthDialogOpen, requestAuthDialog } from "../../../account/auth-dialog";
 import { type CheckoutHandoffTarget, promptCheckoutHandoff } from "../../../account/checkout-handoff";
 
 const CLOUD_UPGRADE_URL = "https://gloom.sh/cloud?upgrade=pro";
@@ -51,6 +53,8 @@ interface CloudUpgradeOptions {
    * never for a press ignored as a repeat.
    */
   onOpening?: () => void;
+  /** What the press is about, said under the sign-up dialog's title when it opens first (`Stock quotes are 15 min delayed`). */
+  reason?: string;
 }
 
 function recordUpgradeIntent(placement: string | undefined): void {
@@ -159,7 +163,7 @@ async function openCheckoutWithHandoff(
     .then(({ url, link }): CheckoutHandoffTarget => ({
       url,
       link: link ?? null,
-      opened: rendererHost.openExternal(url).then((result) => result !== false, () => false),
+      opened: rendererHost.openExternal(url).then((result) => result !== false, logFailure("shared.cloud-upgrade", "Open checkout in the browser failed", false)),
     }));
   void promptCheckoutHandoff(dialog, target);
   await (await target).opened;
@@ -176,7 +180,7 @@ export function openCloudUpgradeUrl(placement: string): boolean {
   return true;
 }
 
-const CLOUD_UPGRADE_OPTION_KEYS: ReadonlyArray<keyof CloudUpgradeOptions> = ["placement", "interval", "recordIntent", "sheet", "onOpening"];
+const CLOUD_UPGRADE_OPTION_KEYS: ReadonlyArray<keyof CloudUpgradeOptions> = ["placement", "interval", "recordIntent", "sheet", "onOpening", "reason"];
 
 /** A press event carries none of these keys, so it never reads as options. */
 function isCloudUpgradeOptions(value: unknown): value is CloudUpgradeOptions {
@@ -194,8 +198,14 @@ function isCloudUpgradeOptions(value: unknown): value is CloudUpgradeOptions {
  *
  * A signed-in account without Pro sees the upgrade sheet first (what Pro adds,
  * what today costs), and checkout opens only once they choose to go on, with
- * the checkout hand-off over the app until Pro arrives. Signed-out users get
- * the public Cloud page and Pro accounts the billing portal, as before.
+ * the checkout hand-off over the app until Pro arrives. Signed out, the
+ * sign-up dialog opens first, as the UPGRADE command's does, and the upgrade
+ * goes on once signed in, to the sheet for an account without Pro and to
+ * nothing for one that has it: the Cloud page it opened before left a
+ * terminal over SSH with no browser looking as if `$` did nothing. A press
+ * while the dialog is up does nothing. Only with no dialog host (an isolated
+ * render) does it open the public Cloud page. Pro accounts get the billing
+ * portal.
  */
 export function useCloudUpgradeAction(placement: string): (options?: unknown) => Promise<void> {
   const rendererHost = useRendererHost();
@@ -221,11 +231,25 @@ export function useCloudUpgradeAction(placement: string): (options?: unknown) =>
         openCloudUpgradePage("cloud", async () => {
           const url = await apiClient.createBrowserHandoff()
             .then((handoff) => handoff.url)
-            .catch(() => CLOUD_UPGRADE_URL);
+            .catch(logFailure("shared.cloud-upgrade", "Create Cloud page handoff failed", CLOUD_UPGRADE_URL));
           await rendererHost.openExternal(url);
         })
-      )).catch(() => {});
+      )).catch(logFailure("shared.cloud-upgrade", "Open Cloud upgrade page failed"));
     };
+    if (checkout.sheet !== false && !apiClient.isSignedIn()) {
+      // A press while the sign-up dialog is up asks for nothing new, and counts nothing.
+      if (isAuthDialogOpen()) return;
+      // Counted once, on this press: the upgrade that goes on after sign-up does not count it again. An account that
+      // signs in with Pro already has what the press was for, so nothing more opens.
+      const continueSignedIn = () => {
+        if (resolvePlanAccess(apiClient.getCurrentUser()).hasProAccess) return;
+        void openUpgradeRef.current({ ...checkout, recordIntent: false });
+      };
+      if (requestAuthDialog({ mode: "signup", onSignedIn: continueSignedIn, checkout: true, ...(checkout.reason ? { reason: checkout.reason } : {}) })) {
+        if (checkout.recordIntent !== false) recordUpgradeIntent(checkout.placement);
+        return;
+      }
+    }
     if (
       checkout.sheet === false ||
       !dialog ||
@@ -235,7 +259,7 @@ export function useCloudUpgradeAction(placement: string): (options?: unknown) =>
       await openCheckout(checkout);
       return;
     }
-    recordUpgradeIntent(checkout.placement);
+    if (checkout.recordIntent !== false) recordUpgradeIntent(checkout.placement);
     // Checkout is opening or just opened: a second sheet would lead nowhere.
     if (isCloudUpgradeBlocked("checkout")) return;
     const interval = await promptCloudUpgrade(dialog, {
@@ -244,6 +268,9 @@ export function useCloudUpgradeAction(placement: string): (options?: unknown) =>
     });
     if (interval) await openCheckout({ ...checkout, interval, recordIntent: false });
   }, [dialog, placement, rendererHost]);
+  // The sign-up dialog's continuation runs the newest action, after the sign-in re-rendered it.
+  const openUpgradeRef = useRef(openUpgrade);
+  openUpgradeRef.current = openUpgrade;
   useEffect(() => {
     cloudUpgradeOpeners.add(openUpgrade);
     return () => {
@@ -363,4 +390,27 @@ export function useCloudAccessFooter({
   );
 
   return { access, hint, openUpgrade, segment };
+}
+
+/**
+ * The footer's clock for a pane whose prices this account sees late: the free
+ * tier's delay (`freeQuotesDelayMinutes`) on any of `quotes`, pressed for the
+ * upgrade, as the quote footer's clock is. Null with Pro or a trial, and while
+ * every price shown is live, so those accounts see nothing new. A pane whose
+ * data comes as one board says so with one `{ dataSource }` for the board.
+ */
+export function useQuoteDelayFooter(
+  quotes: Iterable<QuoteDelayFacts | null | undefined>,
+  placement: string,
+): PaneFooterSegment | null {
+  const language = useAppLanguage();
+  const minutes = freeQuotesDelayMinutes(usePlanAccess(), quotes);
+  const openUpgrade = useCloudUpgradeAction(placement);
+  return useMemo(() => (minutes == null ? null : delayedFooterSegment({
+    id: "quote-delay",
+    detail: tf("{delay} delayed · try Pro live", { delay: `${minutes}m` }),
+    delay: `${minutes}m`,
+    onPress: openUpgrade,
+    quoteStatus: true,
+  })), [language, minutes, openUpgrade]);
 }

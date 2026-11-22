@@ -1,5 +1,4 @@
 import { CLOUD_PLAN_KEY } from "../../shared/cloud-upgrade";
-import { getCurrentPluginTarget } from "../../../current-target";
 import {
   useCallback,
   useEffect,
@@ -16,6 +15,7 @@ import {
   ScrollBox,
   Text,
   TextAttributes,
+  useRendererHost,
   useUiCapabilities,
   type BoxRenderable,
   type ScrollBoxRenderable,
@@ -29,9 +29,9 @@ import {
   getPaneSidebarWidth,
   IconButton,
   MessageComposer,
+  PaneStatusBody,
   Prose,
   shouldShowPaneSidebar,
-  Spinner,
   usePaneFooter,
   type PaneHint,
 } from "../../../../components";
@@ -43,8 +43,12 @@ import {
   useAppSelector,
   usePaneAppConfig,
 } from "../../../../state/app/context";
+import { usePaneSession, usePaneSessionState } from "../../../../state/pane-session";
+import { usePaneUnsentWork } from "../../../../state/pane-unsent-work";
 import { useInlineTickers } from "../../../../state/hooks/inline-tickers";
 import { useRemoteControlHandler } from "../../../../remote/app-host";
+import { RemoteUiScope } from "../../../../remote/semantic-tree";
+import { ASKG_PROMPT_SCOPE } from "../terminal-relay/policy";
 import { useThemeColors } from "../../../../theme/theme-context";
 import type { PaneProps } from "../../../../types/plugin";
 import type { ContextMenuItem } from "../../../../types/context-menu";
@@ -59,12 +63,33 @@ import { usePlanAccess } from "../../../../api-client/plan-access";
 import { SignInWall } from "../auth-actions";
 import { afterLayout, revealInScrollBox } from "../../../../components/ui/reveal-in-scroll-box";
 import { describePortfolioTab } from "../../analytics/portfolio-selection";
-import { ASKGSessionController, type ASKGControllerManifest } from "./controller";
 import {
-  createASKGRendererToolExecutor,
-  loadASKGClientManifest,
+  buildASKGSourceShare,
+  type ASKGSourceShare,
   resolveToolPaneTarget,
 } from "./host";
+import { createASKGPaneSession, disposeASKGPaneSession } from "./pane-session";
+import { getSharedRegistry } from "../../../registry";
+import {
+  answerReadNothing,
+  answerSources,
+  answerWithSourceLinks,
+  createSourceResolver,
+  formatSourceCommand,
+  linkCitations,
+  SOURCE_LINK_SCHEME,
+  sourceRefFromHref,
+  type ASKGAnswerSource,
+  type ASKGSourceTarget,
+} from "./sources";
+import { AnswerSources, answerSourceLabel } from "./answer-sources";
+import { AnswerFollowUps, followUpKey } from "./answer-follow-ups";
+import { openSharedPane } from "../../../../shares/open";
+import { createShare, openLiveShareUrl } from "../../../../shares/api";
+import { ApiRequestError } from "../../../../api-client/errors";
+import { personalDataNotice } from "../../../../shares/pane-image";
+import { readyToShare } from "../../../../shares/ready";
+import type { PanePersonalData } from "../../../../types/plugin";
 import {
   askgConversationLabel,
   askgConversationListStore,
@@ -76,7 +101,6 @@ import type { AskGloomPaneAttachment } from "../../../../ask-gloom/pane-request"
 import { moveComposerCursorToOffset } from "../../chat/content/composer-cursor";
 import {
   ASKG_PANE_QUESTION,
-  attachedPaneContext,
   attachPane,
   type ASKGAttachedPane,
 } from "./pane-attachment";
@@ -86,9 +110,7 @@ import {
   attachedPaneBlockHeight,
   LEAVE_OUT_PANE_KEY,
 } from "./attached-pane";
-import { buildASKGUserData } from "./user-data";
 import { ASKGConversationSidebar } from "./sidebar";
-import { ASKGUndoManager } from "./undo";
 import {
   activeTurn,
   canRateTurn,
@@ -99,6 +121,7 @@ import {
   pendingConfirmation,
   toolResultTables,
   type ASKGConversationState,
+  type ASKGErrorState,
   type ASKGToolRow,
   type ASKGTurn,
   type ASKGTurnFeedback,
@@ -114,11 +137,13 @@ import {
   UNDO_KEY,
 } from "./tool-timeline";
 import { ClippedText } from "../../../../components/ui/display";
+import { TurnProgress, TurnQuestion } from "./turn-parts";
 import { logFailure } from "../../../../utils/log-failure";
+import { functionsForQuestion, type FunctionForQuestion } from "../../../../cli/pane-functions/catalog";
+import { ASKG_QUESTION_FUNCTIONS } from "./lock-note";
 
 export const ASKG_PANE_ID = "askg";
 
-const CLIENT_VERSION = "1";
 const MIN_DETAIL_HEIGHT = 8;
 /** The composer grows with the question up to this many lines, then scrolls. */
 const MAX_COMPOSER_LINES = 6;
@@ -127,9 +152,34 @@ const LOW_QUOTA = 20;
 /** What unlocks Ask Gloom: a free account with a verified email; a paid plan only changes the model. */
 const ASKG_WALL_HINT = "Free with a verified Gloom account.";
 
-function clientKind(): "tui" | "desktop" | "web" {
-  const target = getCurrentPluginTarget();
-  return target === "web" || target === "desktop" ? target : "tui";
+/**
+ * The wall's hint, with the functions the catalog finds for a question asked
+ * behind it: "Without one, these functions answer it: WEI World Equity
+ * Indices, CMP Comparison Chart." Each is typed by its code in the command bar.
+ */
+function askgWallHint(found: readonly FunctionForQuestion[]): string {
+  if (found.length === 0) return ASKG_WALL_HINT;
+  return `${ASKG_WALL_HINT} Without one, these functions answer it: ${found.map((entry) => `${entry.code} ${entry.label}`).join(", ")}.`;
+}
+
+/** The functions the catalog finds for a question asked behind the sign-in wall (`functionsForQuestion`); none without one. */
+function useWallQuestionFunctions(question: string | null): FunctionForQuestion[] {
+  const [found, setFound] = useState<FunctionForQuestion[]>([]);
+  useEffect(() => {
+    const registry = getSharedRegistry();
+    if (!question || !registry) {
+      setFound([]);
+      return;
+    }
+    let live = true;
+    functionsForQuestion(registry, question, ASKG_QUESTION_FUNCTIONS).then((entries) => {
+      if (live) setFound(entries);
+    }, logFailure("askg.pane", "Find the functions for a question failed"));
+    return () => {
+      live = false;
+    };
+  }, [question]);
+  return found;
 }
 
 function tierLabel(row: ASKGToolRow): string | null {
@@ -149,6 +199,11 @@ function previewLines(preview: JsonValue | undefined): string[] {
 
 /** Upgrade from a Pro-only answer, on the key every Pro prompt uses. */
 const UPGRADE_KEY = CLOUD_PLAN_KEY;
+
+/** A daily cap on the standard tier, which Pro's higher limit lifts. */
+function upgradeLiftsCap(error: ASKGErrorState): boolean {
+  return error.code === "daily_turn_cap" && error.tier === "standard";
+}
 
 /**
  * Three questions a first look can send with one click, worded for what the
@@ -183,6 +238,8 @@ function askgExampleQuestions({
 }
 
 const NO_EXAMPLES: string[] = [];
+const NO_SOURCES: readonly ASKGAnswerSource[] = [];
+const NO_FOLLOW_UPS: readonly string[] = [];
 
 /** Rate the answer the keyboard is on: the selected one, else the latest. */
 const GOOD_ANSWER_KEY = "g";
@@ -313,51 +370,77 @@ function AnswerFeedback({
   );
 }
 
-/** Rows the confirmation block reserves for the dry run preview. */
-const MAX_PREVIEW_LINES = 4;
+/** The answer reads its citations as links, and only them: a link the model wrote stays text. */
+function isSourceLink(href: string): boolean {
+  return href.startsWith(SOURCE_LINK_SCHEME);
+}
 
-function confirmationBlockHeight(row: ASKGToolRow): number {
-  return 3 + Math.min(MAX_PREVIEW_LINES, previewLines(row.preview).length);
+/**
+ * Rows the confirmation's preview always gets. It takes every line it has
+ * while the conversation keeps its slice, so an order shows its size and
+ * price, not only its symbol and side.
+ */
+const MIN_PREVIEW_LINES = 4;
+
+function confirmationPreviewRows(row: ASKGToolRow, room: number): number {
+  return Math.min(previewLines(row.preview).length, Math.max(MIN_PREVIEW_LINES, room));
+}
+
+/** The title row, then the preview, then the buttons under a blank row. */
+function confirmationBlockHeight(previewRows: number): number {
+  return 3 + previewRows;
 }
 
 function ConfirmationPrompt({
   row,
+  previewRows,
   width,
   onApprove,
   onDecline,
 }: {
   row: ASKGToolRow;
+  previewRows: number;
   width: number;
   onApprove: () => void;
   onDecline: () => void;
 }) {
   const colors = useThemeColors();
-  const lines = previewLines(row.preview).slice(0, MAX_PREVIEW_LINES);
+  const lines = previewLines(row.preview).slice(0, previewRows);
   return (
-    <Box
-      flexDirection="column"
-      flexShrink={0}
-      paddingX={1}
-      height={confirmationBlockHeight(row)}
-      backgroundColor={colors.panel}
-    >
-      <Box flexDirection="row" height={1}>
-        <Text fg={colors.warning} attributes={TextAttributes.BOLD}>{`Approve ${toolTitle(row.name)}?`}</Text>
-        <Text fg={colors.textDim}>
-          {`  changes ${tierLabel(row) ?? "data"}${row.argumentSummary ? ` · ${row.argumentSummary}` : ""}`}
-        </Text>
-      </Box>
-      {lines.map((line, index) => (
-        <Box key={index} height={1}>
-          <ClippedText fg={colors.text} text={line} width={Math.max(10, width - 2)} cut={truncateWithEllipsis} />
+    // Marked so no assistant's UI call can press Approve here (terminal-relay/policy.ts).
+    <RemoteUiScope scope={ASKG_PROMPT_SCOPE}>
+      <Box
+        flexDirection="column"
+        flexShrink={0}
+        paddingX={1}
+        height={confirmationBlockHeight(lines.length)}
+        backgroundColor={colors.panel}
+      >
+        <Box flexDirection="row" height={1}>
+          {row.confirmTitle ? (
+            // A UI action: the control it presses, by label and role.
+            <ClippedText fg={colors.warning} attributes={TextAttributes.BOLD} text={`${row.confirmTitle}?`} width={Math.max(10, width - 2)} cut={truncateWithEllipsis} />
+          ) : (
+            <>
+              <Text fg={colors.warning} attributes={TextAttributes.BOLD}>{`Approve ${toolTitle(row.name)}?`}</Text>
+              <Text fg={colors.textDim}>
+                {`  changes ${tierLabel(row) ?? "data"}${row.argumentSummary ? ` · ${row.argumentSummary}` : ""}`}
+              </Text>
+            </>
+          )}
         </Box>
-      ))}
-      <Box flexDirection="row" height={2} paddingTop={1}>
-        <Button label="Approve" variant="primary" shortcut="y" onPress={onApprove} />
-        <Box width={2} />
-        <Button label="Decline" shortcut="n" onPress={onDecline} />
+        {lines.map((line, index) => (
+          <Box key={index} height={1}>
+            <ClippedText fg={colors.text} text={line} width={Math.max(10, width - 2)} cut={truncateWithEllipsis} />
+          </Box>
+        ))}
+        <Box flexDirection="row" height={2} paddingTop={1}>
+          <Button label="Approve" variant="primary" shortcut="y" onPress={onApprove} />
+          <Box width={2} />
+          <Button label="Decline" shortcut="n" onPress={onDecline} />
+        </Box>
       </Box>
-    </Box>
+    </RemoteUiScope>
   );
 }
 
@@ -409,6 +492,11 @@ function TurnView({
   catalog,
   openTicker,
   tools,
+  sources,
+  followUps,
+  displayContext,
+  onOpenSource,
+  onAskFollowUp,
   onRetry,
   onUpgrade,
   onRate,
@@ -430,6 +518,13 @@ function TurnView({
   openTicker: (symbol: string) => void;
   /** The turn's tool timeline. */
   tools: ReactNode;
+  /** What the answer cites, or the reads behind it when it cites none. */
+  sources: readonly ASKGAnswerSource[];
+  /** Questions to ask next: only the newest answer offers them. */
+  followUps: readonly string[];
+  displayContext: ToolDisplayContext;
+  onOpenSource: (source: ASKGAnswerSource) => void;
+  onAskFollowUp: (question: string) => void;
   onRetry: () => void;
   onUpgrade: () => void;
   onRate: (rating: ASKGFeedbackRating) => void;
@@ -437,29 +532,49 @@ function TurnView({
   onShare: () => void;
 }) {
   const colors = useThemeColors();
+  // The server holds back the questions to ask next and leaves the blank
+  // lines before them, which would open a gap under the answer. A first
+  // line keeps its indent: it can start a block of code.
+  const answerText = turn.answer.replace(/^(?:[ \t]*\r?\n)+/, "").trimEnd();
+  // A citation opens its source; one that opens nothing stays the text it was.
+  const answer = useMemo(() => linkCitations(answerText, new Set(sources.flatMap((source) => (
+    source.ref !== null && source.target.kind === "pane" ? [source.ref] : []
+  )))), [answerText, sources]);
+  const openLink = useCallback((href: string) => {
+    const ref = sourceRefFromHref(href);
+    const source = ref === null ? undefined : sources.find((entry) => entry.ref === ref);
+    if (source) onOpenSource(source);
+  }, [onOpenSource, sources]);
+  const finished = turn.status === "complete" && answerText.length > 0;
   return (
     <Box flexDirection="column" paddingTop={1}>
-      <Prose
-        text={turn.prompt}
-        width={width}
-        color={colors.textBright}
-        figures={false}
-        attributes={TextAttributes.BOLD}
-      />
+      <TurnQuestion text={turn.prompt} width={width} />
       {tools}
-      {turn.answer ? (
+      {answerText ? (
         <Box paddingTop={1}>
           <MarkdownText
-            text={turn.answer}
+            text={answer}
             lineWidth={width}
             catalog={catalog}
             textColor={colors.text}
             openTicker={openTicker}
+            onOpenLink={openLink}
+            readsLink={isSourceLink}
+            linkChips
           />
         </Box>
-      ) : turn.status === "streaming" && turn.tools.length === 0 ? (
-        <Box paddingTop={1}><Spinner label="Gloom is thinking…" /></Box>
       ) : null}
+      {turn.status === "streaming" ? <TurnProgress turn={turn} /> : null}
+      {finished ? (
+        <AnswerSources
+          sources={sources}
+          readNothing={answerReadNothing(turn)}
+          width={width}
+          context={displayContext}
+          onOpen={onOpenSource}
+        />
+      ) : null}
+      {finished ? <AnswerFollowUps questions={followUps} width={width} onAsk={onAskFollowUp} /> : null}
       {rateable ? (
         <AnswerFeedback
           feedback={turn.feedback}
@@ -491,7 +606,7 @@ function TurnView({
             figures={false}
           />
           {/* A row of its own, so the desktop draws a button rather than a bar. */}
-          {turn.error.code === "tier_required" ? (
+          {turn.error.code === "tier_required" || upgradeLiftsCap(turn.error) ? (
             <Box flexDirection="row" paddingTop={1}>
               <Button label="Upgrade to Pro" variant="primary" shortcut={latest ? UPGRADE_KEY : undefined} onPress={onUpgrade} />
             </Box>
@@ -514,75 +629,41 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
   const config = usePaneAppConfig();
   const activeSymbol = useAppSelector((state) => state.recentTickers[0] ?? null);
   const { pinTicker } = usePluginTickerActions();
-  const { createPaneFromTemplate, showPane, openCommandBar } = usePluginAppActions();
+  const { openCommandBar, notify } = usePluginAppActions();
   const dialog = useDialog();
+  const rendererHost = useRendererHost();
 
-  const configRef = useRef(config);
-  configRef.current = config;
-  const remoteHandlerRef = useRef(remoteHandler);
-  remoteHandlerRef.current = remoteHandler;
-  const contextRef = useRef({ symbol: activeSymbol, paneId });
-  contextRef.current = { symbol: activeSymbol, paneId };
   // Read when a question is sent, so portfolio and ticker changes do not re-render the pane.
   const getAppState = useAppGetState();
-  const getAppStateRef = useRef(getAppState);
-  getAppStateRef.current = getAppState;
+
+  // The conversation belongs to the pane, not to this drawing of it: docking
+  // or floating the pane mounts it again, and it picks the conversation up
+  // where it was (see `usePaneSession`).
+  const session = usePaneSession(
+    "askg:conversation",
+    () => createASKGPaneSession({
+      config,
+      remoteHandler,
+      getAppState,
+      context: { symbol: activeSymbol, paneId },
+    }),
+    disposeASKGPaneSession,
+    paneId,
+  );
+  const { controller } = session;
+  session.bindings.config = config;
+  session.bindings.remoteHandler = remoteHandler;
+  session.bindings.getAppState = getAppState;
+  session.bindings.context = { symbol: activeSymbol, paneId };
 
   // The pane the conversation on screen is about, read whenever a question
   // goes so every turn of it carries the pane.
-  const [attached, setAttachedState] = useState<ASKGAttachedPane | null>(null);
-  const attachedRef = useRef<ASKGAttachedPane | null>(null);
+  const [attached, setAttachedState] = usePaneSessionState<ASKGAttachedPane | null>("askg:attached", null, paneId);
+  const attachedRef = session.attached;
   const setAttached = useCallback((next: ASKGAttachedPane | null) => {
     attachedRef.current = next;
     setAttachedState(next);
-  }, []);
-
-  // Each call and each undo gets a fresh executor, so the tokens live here:
-  // an executor's own manager would forget them as soon as its call returned.
-  const undoManager = useMemo(() => new ASKGUndoManager((request) => {
-    const handler = remoteHandlerRef.current;
-    if (!handler) return Promise.reject(new Error("This window cannot undo tool calls."));
-    return handler(request);
-  }), []);
-
-  const controller = useMemo(() => new ASKGSessionController({
-    transport: apiClient.askg,
-    loadManifest: () => loadASKGClientManifest(),
-    getExecutor: (manifest: ASKGControllerManifest) => {
-      const handler = remoteHandlerRef.current;
-      if (!handler) return null;
-      return createASKGRendererToolExecutor({
-        config: configRef.current,
-        remoteHandler: handler,
-        manifest: {
-          tools: manifest.tools,
-          manifestHash: manifest.manifestHash,
-          skipped: [],
-        },
-        undoManager,
-      });
-    },
-    client: { kind: clientKind(), version: CLIENT_VERSION },
-    getContext: () => {
-      const state = getAppStateRef.current();
-      const userData = buildASKGUserData({
-        config: state.config,
-        brokerAccounts: state.brokerAccounts,
-        tickers: state.tickers.values(),
-      });
-      const pane = attachedRef.current;
-      // An attached pane is what the question is about: its function, its
-      // symbol and, once that may go, what it shows.
-      if (pane) return { ...attachedPaneContext(pane), ...(userData ? { userData } : {}) };
-      return {
-        ...(contextRef.current.symbol ? { symbol: contextRef.current.symbol } : {}),
-        paneId: contextRef.current.paneId,
-        ...(userData ? { userData } : {}),
-      };
-    },
-  }), [undoManager]);
-
-  useEffect(() => () => controller.dispose(), [controller]);
+  }, [attachedRef, setAttachedState]);
 
   const state: ASKGConversationState = useSyncExternalStore(
     useCallback((listener) => controller.subscribe(listener), [controller]),
@@ -590,20 +671,24 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
     useCallback(() => controller.getState(), [controller]),
   );
 
-  const [inputValue, setInputValue] = useState("");
+  // What is in the composer and which row of the conversation the keyboard is
+  // on go with the conversation, so a dock change leaves them where they were.
+  const [inputValue, setInputValue] = usePaneSessionState("askg:draft", "", paneId);
   const [inputFocused, setInputFocused] = useState(false);
   // A tool row or a turn's folded calls; j/k walk them.
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [expandedToolCallId, setExpandedToolCallId] = useState<string | null>(null);
-  const [openGroups, setOpenGroups] = useState<ReadonlySet<string>>(() => new Set());
+  const [selectedId, setSelectedId] = usePaneSessionState<string | null>("askg:selected", null, paneId);
+  const [expandedToolCallId, setExpandedToolCallId] = usePaneSessionState<string | null>("askg:expanded", null, paneId);
+  const [openGroups, setOpenGroups] = usePaneSessionState<ReadonlySet<string>>("askg:open-groups", () => new Set(), paneId);
   // The answer whose thumbs down shows its reasons and the send action.
-  const [feedbackFollowUpTurnId, setFeedbackFollowUpTurnId] = useState<string | null>(null);
+  const [feedbackFollowUpTurnId, setFeedbackFollowUpTurnId] = usePaneSessionState<string | null>("askg:feedback-follow-up", null, paneId);
   // The example question the keyboard is on while the pane is empty.
   const [exampleIndex, setExampleIndex] = useState<number | null>(null);
   const inputRef = useRef<TextareaRenderable | null>(null);
   const scrollRef = useRef<ScrollBoxRenderable | null>(null);
   const [queuedQuestion, setQueuedQuestion] = useState<string | null>(null);
   const queuedQuestionRef = useRef<string | null>(null);
+  // A question asked behind the sign-in wall is offered the functions that answer it without an account.
+  const wallFunctions = useWallQuestionFunctions(planAccess.emailVerified ? null : queuedQuestion);
   // The conversation list is a drawer: open only while it has the keyboard or
   // the pointer, so it never takes the left of the pane unasked.
   const [sidebarFocused, setSidebarFocused] = useState(false);
@@ -613,6 +698,10 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
   // The expanded result's rows have the keyboard: j/k walk them and Enter
   // opens one. x moves in, Esc comes back to the timeline.
   const [resultFocused, setResultFocused] = useState(false);
+  // A conversation that could not be loaded: its failure takes the body until
+  // anything else is opened or asked.
+  const [openFailure, setOpenFailure] = useState<{ conversationId: string; message: string } | null>(null);
+  const openRequestRef = useRef(0);
 
   const conversations = useSyncExternalStore(
     useCallback((listener) => askgConversationListStore.subscribe(listener), []),
@@ -640,6 +729,9 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
       : getPaneSidebarWidth(width, !!nativePaneChrome, conversations.width);
 
   const running = isTurnRunning(state);
+  // The draft lives only as long as the pane does, and an answer coming in
+  // would be cut off: Esc never closes the pane over either.
+  usePaneUnsentWork(running || inputValue.trim().length > 0, paneId);
   const confirmation = pendingConfirmation(state);
   // A tool's approval goes first; the pane's question waits behind it.
   const paneConsentPending = attached?.consent === "pending" && !confirmation;
@@ -686,11 +778,16 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
   }, [state]);
   const needsUpgrade = useMemo(() => {
     const turn = activeTurn(state);
-    return turn?.status === "error" && turn.error?.code === "tier_required";
+    return turn?.status === "error" && !!turn.error && (turn.error.code === "tier_required" || upgradeLiftsCap(turn.error));
+  }, [state]);
+  // What to ask next: the newest answer's suggestions, once it is finished.
+  const followUps = useMemo(() => {
+    const turn = activeTurn(state);
+    return turn?.status === "complete" && turn.followUps ? turn.followUps : NO_FOLLOW_UPS;
   }, [state]);
 
   const profileExamples = useMemo(() => {
-    const appState = getAppStateRef.current();
+    const appState = getAppState();
     return askgExampleQuestions({
       config: appState.config,
       tickers: appState.tickers.values(),
@@ -700,11 +797,19 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
   // With a pane attached, the question in the field is about it; the examples are not.
   const examples = attached ? NO_EXAMPLES : profileExamples;
 
+  // Anything opened or asked since takes the body back from a conversation
+  // that failed to load, and a load still out no longer shows its failure.
+  const dropOpenFailure = useCallback(() => {
+    openRequestRef.current += 1;
+    setOpenFailure(null);
+  }, []);
+
   const ask = useCallback((question: string) => {
     const trimmed = question.trim();
     if (!trimmed) return;
+    dropOpenFailure();
     void controller.ask(trimmed);
-  }, [controller]);
+  }, [controller, dropOpenFailure]);
 
   const focusInput = useCallback(() => {
     setInputFocused(true);
@@ -733,9 +838,10 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
     if (focusedRef.current) focusInput();
   }, [ask, focusInput]);
   const retryAndCompose = useCallback((turnId: string) => {
+    dropOpenFailure();
     void controller.retryTurn(turnId);
     if (focusedRef.current) focusInput();
-  }, [controller, focusInput]);
+  }, [controller, dropOpenFailure, focusInput]);
 
   const resetTimeline = useCallback(() => {
     setSelectedId(null);
@@ -743,23 +849,45 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
     setOpenGroups(new Set());
     setExampleIndex(null);
     setFeedbackFollowUpTurnId(null);
-  }, []);
+    dropOpenFailure();
+  }, [dropOpenFailure]);
 
-  const openConversation = useCallback(async (conversationId: string) => {
-    setSidebarFocused(false);
-    setSidebarCursorId(null);
-    if (focusedRef.current) focusInput();
-    if (conversationId === state.conversationId) return;
-    const conversation = await apiClient.askg.loadConversation(conversationId);
+  /** Loads a conversation into the body; one that cannot be loaded leaves its failure there. */
+  const showConversation = useCallback(async (conversationId: string) => {
+    if (conversationId === state.conversationId) {
+      dropOpenFailure();
+      return;
+    }
+    const request = ++openRequestRef.current;
+    let conversation: Awaited<ReturnType<typeof apiClient.askg.loadConversation>>;
+    try {
+      conversation = await apiClient.askg.loadConversation(conversationId);
+    } catch (error) {
+      logFailure("cloud.askg.pane", "Load a conversation failed")(error);
+      if (request !== openRequestRef.current) return;
+      resetTimeline();
+      setOpenFailure({
+        conversationId,
+        message: error instanceof Error && error.message ? error.message : "Could not load this conversation.",
+      });
+      return;
+    }
     // A row the sidebar still shows may be gone; the refresh drops it.
     if (!conversation) {
-      void askgConversationListStore.refresh();
+      askgConversationListStore.refresh();
       return;
     }
     resetTimeline();
     setAttached(null);
     controller.openConversation(conversation);
-  }, [controller, focusInput, resetTimeline, setAttached, state.conversationId]);
+  }, [controller, dropOpenFailure, resetTimeline, setAttached, state.conversationId]);
+
+  const openConversation = useCallback((conversationId: string) => {
+    setSidebarFocused(false);
+    setSidebarCursorId(null);
+    if (focusedRef.current) focusInput();
+    showConversation(conversationId).catch(logFailure("cloud.askg.pane", "Open a conversation failed"));
+  }, [focusInput, showConversation]);
 
   const newConversation = useCallback(() => {
     resetTimeline();
@@ -885,10 +1013,11 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
   // Closing the pane is two Escs away, so the conversation it showed comes
   // back with the next one this session opens. A question typed with the
   // command that opened it starts a new one instead.
-  const restoredRef = useRef(false);
   useEffect(() => {
-    if (restoredRef.current || !planAccess.emailVerified) return;
-    restoredRef.current = true;
+    // Once per pane: a pane that comes back from a dock change has its
+    // conversation already, and one that was started empty stays empty.
+    if (session.restored || !planAccess.emailVerified) return;
+    session.restored = true;
     const remembered = askgConversationListStore.rememberedOpen();
     if (!remembered || queuedQuestionRef.current || queuedPaneRef.current || controller.getState().turns.length > 0) return;
     void apiClient.askg.loadConversation(remembered).then((conversation) => {
@@ -897,7 +1026,7 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
       if (!conversation || current.turns.length > 0 || current.conversationId || attachedRef.current || queuedPaneRef.current) return;
       controller.openConversation(conversation);
     }).catch(logFailure("cloud.askg.pane", "Restore the last open conversation failed"));
-  }, [controller, planAccess.emailVerified]);
+  }, [attachedRef, controller, planAccess.emailVerified, session]);
 
   useEffect(() => {
     if (state.conversationId) askgConversationListStore.rememberOpen(state.conversationId);
@@ -932,7 +1061,7 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
   useEffect(() => {
     const finished = wasRunningRef.current && !running;
     wasRunningRef.current = running;
-    if (finished) void askgConversationListStore.refresh();
+    if (finished) askgConversationListStore.refresh();
   }, [running]);
 
   // A list that shrank below the point of switching leaves nothing to focus.
@@ -1015,17 +1144,32 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
     return afterLayout(() => revealInScrollBox(scrollRef.current, selectedRowNodeRef.current));
   }, [expandedToolCallId, feedbackFollowUpTurnId, openGroups, selectedId]);
 
-  const openPaneForTool = useCallback((row: ASKGToolRow) => {
-    const target = resolveToolPaneTarget(row.name);
-    if (!target) return;
-    if (target.templateId) {
-      createPaneFromTemplate(target.templateId, row.argumentSummary
-        ? { arg: row.argumentSummary.split(" · ")[0] }
-        : undefined);
-      return;
+  // Each read as the function, ticker and options that show its data. The
+  // functions can arrive after the pane (a plugin loading late), so the
+  // resolver is built again when they change.
+  const registry = getSharedRegistry() ?? null;
+  const functionCount = registry?.paneTemplates.size ?? 0;
+  const sourceResolver = useMemo(() => createSourceResolver(registry), [registry, functionCount]);
+
+  // A source is the pane share of the view it was read from, built here, and
+  // opens the way a share link does (chat's chips), in a pane of its own.
+  const openSourceTarget = useCallback(async (target: ASKGSourceTarget) => {
+    if (target.kind !== "pane") return;
+    const failed = (reason: string) => notify({ body: `Could not open ${formatSourceCommand(target.command)}: ${reason}`, type: "error" });
+    try {
+      const share = await buildASKGSourceShare(target.command, session.bindings.config);
+      openSharedPane(share.data, () => failed("panes cannot open from here."));
+    } catch (error) {
+      failed(error instanceof Error ? error.message : String(error));
     }
-    showPane(target.paneId);
-  }, [createPaneFromTemplate, showPane]);
+  }, [notify]);
+  const openSource = useCallback((source: ASKGAnswerSource) => {
+    void openSourceTarget(source.target);
+  }, [openSourceTarget]);
+
+  const openPaneForTool = useCallback((row: ASKGToolRow) => {
+    void openSourceTarget(sourceResolver.target(row));
+  }, [openSourceTarget, sourceResolver]);
 
   const openSymbol = useCallback((symbol: string) => {
     pinTicker(symbol, { floating: true });
@@ -1132,6 +1276,133 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
       : null;
   }, [feedbackFollowUpTurnId, state]);
 
+  // What each answer cites, as the commands that show it.
+  const turnSources = useMemo(
+    () => state.turns.map((_turn, index) => answerSources(state.turns, index, sourceResolver)),
+    [sourceResolver, state.turns],
+  );
+  // The answer `o` and Copy Answer with Source Links act on, as `g` and `b`
+  // rate: the one the keyboard is on, else the newest, the one being read.
+  // Its sources count once it is finished and shows them.
+  const sourcesTurnIndex = useMemo(() => {
+    if (selectedId) {
+      const index = state.turns.findIndex((entry) => (
+        selectedId === answerStopId(entry.id)
+        || selectedId === toolGroupId(entry.id)
+        || entry.tools.some((row) => row.toolCallId === selectedId)
+      ));
+      if (index >= 0) return index;
+    }
+    return state.turns.length - 1;
+  }, [selectedId, state.turns]);
+  const openableSources = useMemo(() => {
+    const turn = state.turns[sourcesTurnIndex];
+    if (!turn || turn.status !== "complete") return [];
+    return (turnSources[sourcesTurnIndex] ?? []).filter((source) => source.target.kind === "pane");
+  }, [sourcesTurnIndex, state.turns, turnSources]);
+  const chooseAnswerSource = useCallback(async () => {
+    if (openableSources.length === 1) {
+      openSource(openableSources[0]!);
+      return;
+    }
+    if (openableSources.length === 0) return;
+    const picked = await dialog.prompt<string>({
+      closeOnClickOutside: true,
+      content: (context: unknown) => (
+        <ChoiceDialog
+          {...(context as PromptContext<string>)}
+          title="Sources of the answer"
+          choices={openableSources.map((source, index) => ({
+            id: String(index),
+            label: answerSourceLabel(source, displayContext),
+            description: source.target.kind === "pane" ? source.target.label : undefined,
+          }))}
+        />
+      ),
+    }).catch(logFailure("cloud.askg.pane", "The answer sources prompt failed"));
+    const source = picked === undefined ? undefined : openableSources[Number(picked)];
+    if (source) openSource(source);
+  }, [dialog, displayContext, openSource, openableSources]);
+
+  // A source is a pane share held here; sharing the answer makes each one a
+  // link (`createShare`), so it opens for whoever reads it. Made once per
+  // source in this pane, by the words it opens, so copying again makes none anew.
+  const sourceLinksRef = useRef(new Map<string, string>());
+  const copyAnswerRef = useRef<() => void>(() => {});
+  // One copy at a time: a second press while links are being made would make them twice.
+  const copyingAnswerRef = useRef(false);
+  const copyAnswerWithSourceLinks = useCallback(async () => {
+    const turn = state.turns[sourcesTurnIndex];
+    const sources = turnSources[sourcesTurnIndex] ?? [];
+    if (!turn || openableSources.length === 0 || copyingAnswerRef.current) return;
+    if (!readyToShare(notify, () => copyAnswerRef.current(), "share an answer's sources")) return;
+    copyingAnswerRef.current = true;
+    const links = sourceLinksRef.current;
+    try {
+      const pending: Array<{ key: string; share: ASKGSourceShare | null }> = [];
+      let personal: PanePersonalData | null = null;
+      for (const source of sources) {
+        if (source.target.kind !== "pane") continue;
+        const key = formatSourceCommand(source.target.command);
+        if (links.has(key) || pending.some((entry) => entry.key === key)) continue;
+        const share = await buildASKGSourceShare(source.target.command, session.bindings.config).catch((error: unknown) => {
+          logFailure("cloud.askg.pane", "An answer source could not be shared")(error);
+          return null;
+        });
+        const declared = share?.data.version === 2
+          ? registry?.panes.get(share.data.layout.layout.instances[0]?.paneId ?? "")?.personalData
+          : undefined;
+        if (typeof declared === "string") personal ??= declared;
+        pending.push({ key, share });
+      }
+      if (personal && !await confirmDialog(dialog, {
+        title: "Copy public links?",
+        body: [personalDataNotice(personal), "Anyone with a link can open its pane with its settings."],
+        confirmLabel: "Copy links",
+        defaultAction: "cancel",
+      })) return;
+      // A source that cannot be shared leaves the rest linked; once the
+      // service says the share limit is reached, the rest are not tried.
+      let limited = false;
+      let failure: string | null = null;
+      for (const { key, share } of pending) {
+        if (!share || limited) continue;
+        try {
+          links.set(key, openLiveShareUrl((await createShare(share)).id));
+        } catch (error) {
+          limited = error instanceof ApiRequestError && error.status === 429;
+          failure ??= error instanceof Error && error.message ? error.message : "Could not share a source.";
+        }
+      }
+      const linkOf = (source: ASKGAnswerSource) => (
+        source.target.kind === "pane" ? links.get(formatSourceCommand(source.target.command)) ?? null : null
+      );
+      const text = answerWithSourceLinks(turn.answer, sources.map((source) => ({
+        label: answerSourceLabel(source, displayContext),
+        url: linkOf(source),
+      })));
+      await rendererHost.copyText(text);
+      const unlinked = openableSources.filter((source) => linkOf(source) === null);
+      if (unlinked.length === 0) {
+        notify({ body: "Answer copied, with a link to each source", type: "success" });
+      } else {
+        const names = unlinked.map((source) => (
+          source.ref !== null ? `[${source.ref}]` : source.target.kind === "pane" ? formatSourceCommand(source.target.command) : ""
+        ));
+        const reason = limited ? "the share limit is reached for now" : failure ?? "they could not be shared";
+        notify({
+          body: `Answer copied without a link for ${names.join(", ")}: ${reason}`,
+          type: unlinked.length === openableSources.length ? "error" : "info",
+        });
+      }
+    } catch (error) {
+      notify({ body: error instanceof Error && error.message ? error.message : "Could not copy this answer.", type: "error" });
+    } finally {
+      copyingAnswerRef.current = false;
+    }
+  }, [dialog, displayContext, notify, openableSources, registry, rendererHost, sourcesTurnIndex, state.turns, turnSources]);
+  copyAnswerRef.current = () => { void copyAnswerWithSourceLinks(); };
+
   // A second thumbs down on the same answer opens or closes its reasons, so
   // they are always one press away and never in the way. A thumbs down hands
   // the keyboard to the answer, so its reasons answer 1 to 4 straight away.
@@ -1164,7 +1435,6 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
   // section bar, column header and rows), up to half the pane.
   const expandedNeed = 3 + (expandedTables.length > 1 ? 1 : 0)
     + Math.max(0, ...expandedTables.map((table) => table.rows.length));
-  const confirmationHeight = confirmation ? confirmationBlockHeight(confirmation) : 0;
   const attachedHeight = attachedPaneBlockHeight(attached);
   const draftLines = useMemo(() => {
     const textWidth = Math.max(8, width - sidebarWidth - (nativePaneChrome ? 6 : 5));
@@ -1173,6 +1443,10 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
   const composerHeight = nativePaneChrome ? draftLines + 2 : draftLines;
   const composerBlockHeight = nativePaneChrome ? composerHeight : composerHeight + 2;
   // The conversation keeps a readable slice no matter what else is open.
+  const confirmationPreview = confirmation
+    ? confirmationPreviewRows(confirmation, height - composerBlockHeight - attachedHeight - confirmationBlockHeight(0) - 6)
+    : 0;
+  const confirmationHeight = confirmation ? confirmationBlockHeight(confirmationPreview) : 0;
   const detailBudget = height - composerBlockHeight - confirmationHeight - attachedHeight - 6;
   const detailHeight = expandedRow && expandedHasRows && detailBudget >= MIN_DETAIL_HEIGHT
     ? Math.min(Math.floor(height / 2), detailBudget, Math.max(MIN_DETAIL_HEIGHT, expandedNeed))
@@ -1180,7 +1454,7 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
   const resultActive = resultFocused && !!expandedRow && detailHeight > 0 && !inputFocused && !showSidebar;
   // `o` opens the pane of the result the rows belong to, else the selected row's.
   const paneRow = resultActive ? expandedRow : selectedRow;
-  const canOpenPane = !!paneRow && !!resolveToolPaneTarget(paneRow.name);
+  const canOpenPane = !!paneRow && sourceResolver.target(paneRow).kind === "pane";
   const expandTarget = resultActive ? expandedRow : selectedRow;
 
   const toggleResult = useCallback((row: ASKGToolRow) => {
@@ -1256,7 +1530,7 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
         consume();
         const target = sidebarTargetId;
         leaveSidebar();
-        if (target) void openConversation(target);
+        if (target) openConversation(target);
         else focusInput();
       } else if (isPlainKey(event, "j", "down")) {
         consume();
@@ -1321,6 +1595,13 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
         shareAnswer(feedbackFollowUp);
         return;
       }
+    }
+    // Each suggested question asks on its key, unless a thumbs down's reasons have them.
+    const followUp = followUps.find((_question, index) => isPlainKey(event, followUpKey(index)));
+    if (followUp && !feedbackFollowUp && !running) {
+      consume();
+      askAndCompose(followUp);
+      return;
     }
     if (isPlainKey(event, GOOD_ANSWER_KEY, BAD_ANSWER_KEY) && feedbackTarget) {
       consume();
@@ -1389,6 +1670,12 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
       openPaneForTool(paneRow);
       return;
     }
+    // Off a call, `o` opens what the answer cites.
+    if (isPlainKey(event, "o") && !paneRow && openableSources.length > 0) {
+      consume();
+      void chooseAnswerSource();
+      return;
+    }
     if (isPlainKey(event, UNDO_KEY) && selectedRow && canUndo(selectedRow)) {
       consume();
       void controller.undo(selectedRow.toolCallId);
@@ -1428,13 +1715,13 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
     if (!planAccess.emailVerified) return list;
     if (confirmation) {
       list.push(
-        { id: "approve", key: "y", label: "es approve", title: "Approve", onPress: () => controller.resolveConfirmation(confirmation.toolCallId, true) },
-        { id: "decline", key: "n", label: "o decline", title: "Decline", onPress: () => controller.resolveConfirmation(confirmation.toolCallId, false) },
+        { id: "approve", key: "y", label: "es approve", title: "Approve", remoteScope: ASKG_PROMPT_SCOPE, onPress: () => controller.resolveConfirmation(confirmation.toolCallId, true) },
+        { id: "decline", key: "n", label: "o decline", title: "Decline", remoteScope: ASKG_PROMPT_SCOPE, onPress: () => controller.resolveConfirmation(confirmation.toolCallId, false) },
       );
     } else if (paneConsentPending) {
       list.push(
-        { id: "attach-pane", key: ATTACH_PANE_KEY, label: " attach", title: "Attach the Pane's Contents", onPress: () => answerPaneConsent(true) },
-        { id: "leave-out-pane", key: LEAVE_OUT_PANE_KEY, label: " leave out", title: "Leave Out the Pane's Contents", onPress: () => answerPaneConsent(false) },
+        { id: "attach-pane", key: ATTACH_PANE_KEY, label: " attach", title: "Attach the Pane's Contents", remoteScope: ASKG_PROMPT_SCOPE, onPress: () => answerPaneConsent(true) },
+        { id: "leave-out-pane", key: LEAVE_OUT_PANE_KEY, label: " leave out", title: "Leave Out the Pane's Contents", remoteScope: ASKG_PROMPT_SCOPE, onPress: () => answerPaneConsent(false) },
       );
     }
     if (showSidebar) {
@@ -1468,6 +1755,16 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
         });
       }
       if (paneRow && canOpenPane) list.push({ id: "open-pane", key: "o", label: "pen pane", onPress: () => openPaneForTool(paneRow) });
+      else if (!paneRow && openableSources.length > 0) {
+        const one = openableSources.length === 1;
+        list.push({
+          id: "open-source",
+          key: "o",
+          label: one ? "pen source" : "pen sources",
+          title: one ? "Open Source" : "Open a Source",
+          onPress: () => void chooseAnswerSource(),
+        });
+      }
       if (selectedRow && canUndo(selectedRow)) {
         list.push({ id: "undo", key: UNDO_KEY, label: " undo", title: "Undo", onPress: () => void controller.undo(selectedRow.toolCallId) });
       }
@@ -1490,6 +1787,18 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
           { id: "feedback-bad", key: BAD_ANSWER_KEY, label: "ad", title: "Bad Answer", onPress: () => rateAnswer(feedbackTarget, "down") },
         );
       }
+      // `[1] [2] [3] ask next`: the keys read as one action, each its own question.
+      if (!feedbackFollowUp && !running) {
+        followUps.forEach((question, index) => {
+          list.push({
+            id: `follow-up-${index}`,
+            key: followUpKey(index),
+            label: index === followUps.length - 1 ? " ask next" : "",
+            title: `Ask: ${question}`,
+            onPress: () => askAndCompose(question),
+          });
+        });
+      }
       if (answerTickers.length > 0) list.push({ id: "tickers", key: "t", label: "ickers", onPress: () => void chooseAnswerTicker() });
     }
     if (state.turns.length > 0 && !confirmation) list.push({ id: "new", key: "n", label: "ew", title: "New Conversation", onPress: newConversation });
@@ -1498,8 +1807,10 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
   }, [
     planAccess.emailVerified,
     answerPaneConsent,
+    askAndCompose,
     answerTickers.length,
     canOpenPane,
+    chooseAnswerSource,
     chooseAnswerTicker,
     chooseFeedbackReason,
     confirmation,
@@ -1510,6 +1821,7 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
     feedbackFollowUp,
     feedbackTarget,
     focusSidebar,
+    followUps,
     inputFocused,
     leaveSidebar,
     listRoom,
@@ -1517,6 +1829,7 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
     newConversation,
     openGroups,
     openPaneForTool,
+    openableSources.length,
     paneConsentPending,
     paneRow,
     rateAnswer,
@@ -1558,14 +1871,26 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
         : []),
     ],
     hints,
-    menu: state.turns.length === 0 && planAccess.emailVerified
-      ? examples.map((question, index): ContextMenuItem => ({
-        id: `example-${index}`,
-        label: `Ask: ${question}`,
-        onSelect: () => askAndCompose(question),
-      }))
-      : [],
-  }), [askAndCompose, confirmation, examples, hints, planAccess.emailVerified, quota, running, state]);
+    menu: !planAccess.emailVerified
+      ? []
+      : state.turns.length === 0
+        ? examples.map((question, index): ContextMenuItem => ({
+          id: `example-${index}`,
+          label: `Ask: ${question}`,
+          onSelect: () => askAndCompose(question),
+        }))
+        // The terminal cannot press a citation inside a line: the menu opens each.
+        : [
+          ...openableSources.map((source, index): ContextMenuItem => ({
+            id: `source-${index}`,
+            label: `Open ${answerSourceLabel(source, displayContext)}`,
+            onSelect: () => openSource(source),
+          })),
+          ...(openableSources.length > 0
+            ? [{ id: "copy-answer-sources", label: "Copy Answer with Source Links", onSelect: () => copyAnswerRef.current() }]
+            : []),
+        ],
+  }), [askAndCompose, confirmation, displayContext, examples, hints, openSource, openableSources, planAccess.emailVerified, quota, running, state]);
 
   if (!planAccess.emailVerified) {
     return (
@@ -1573,7 +1898,7 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
         placement="gp-signin"
         action="ask questions about anything on screen"
         needsVerification={planAccess.signedIn}
-        hint={ASKG_WALL_HINT}
+        hint={askgWallHint(wallFunctions)}
       />
     );
   }
@@ -1602,7 +1927,7 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
           height={height}
           focused={focused}
           keyboardFocused={focused}
-          onSelect={(conversationId) => void openConversation(conversationId)}
+          onSelect={openConversation}
           onFocusRequest={() => {
             if (inputFocused) blurInput();
             setResultFocused(false);
@@ -1630,14 +1955,20 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
         onMouseDown={() => setSidebarFocused(false)}
       >
       <ScrollBox ref={scrollRef} flexGrow={1} minHeight={0} scrollY focusable={false} paddingX={1}>
-        {state.turns.length === 0 ? (
+        {openFailure ? (
+          <PaneStatusBody
+            subject="Conversation"
+            error={openFailure.message}
+            retry={{ onRetry: () => showConversation(openFailure.conversationId) }}
+          />
+        ) : state.turns.length === 0 ? (
           <ASKGWelcome
             examples={examples}
             width={contentWidth}
             selectedIndex={inputFocused ? null : exampleIndex}
             onAsk={askAndCompose}
           />
-        ) : state.turns.map((turn) => (
+        ) : state.turns.map((turn, index) => (
           <TurnView
             key={turn.id}
             turn={turn}
@@ -1664,6 +1995,14 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
                 onUndo={(toolCallId) => void controller.undo(toolCallId)}
               />
             )}
+            sources={turnSources[index] ?? NO_SOURCES}
+            followUps={turn.id === lastTurnId ? followUps : NO_FOLLOW_UPS}
+            displayContext={displayContext}
+            onOpenSource={openSource}
+            onAskFollowUp={(question) => {
+              leaveSidebar();
+              askAndCompose(question);
+            }}
             onRetry={() => retryAndCompose(turn.id)}
             onUpgrade={upgrade}
             // The controls keep their press from the column behind them, so
@@ -1687,6 +2026,7 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
       {confirmation ? (
         <ConfirmationPrompt
           row={confirmation}
+          previewRows={confirmationPreview}
           width={contentWidth}
           onApprove={() => controller.resolveConfirmation(confirmation.toolCallId, true)}
           onDecline={() => controller.resolveConfirmation(confirmation.toolCallId, false)}
@@ -1702,7 +2042,7 @@ export function ASKGPane({ paneId, focused, width, height }: PaneProps) {
             width={nativePaneChrome ? bodyWidth : bodyWidth - 2}
             height={detailHeight - 1}
             focused={focused && resultActive}
-            canOpenPane={!!resolveToolPaneTarget(expandedRow.name)}
+            canOpenPane={sourceResolver.target(expandedRow).kind === "pane"}
             openPaneShortcut={paneRow?.toolCallId === expandedRow.toolCallId && canOpenPane ? "o" : undefined}
             onOpenSymbol={openSymbol}
             onOpenPane={() => openPaneForTool(expandedRow)}

@@ -16,6 +16,13 @@ main() {
   case "$OS" in
     Darwin) os="darwin" ;;
     Linux)  os="linux" ;;
+    # Git Bash, MSYS2 and Cygwin on Windows: the Windows build installs from PowerShell.
+    MINGW*|MSYS*|CYGWIN*)
+      echo "This script installs Gloom on macOS and Linux. On Windows, run this in PowerShell:" >&2
+      echo "  irm https://gloom.sh/install.ps1 | iex" >&2
+      echo "Or install the desktop app, which includes the gloom command: https://gloom.sh/download" >&2
+      exit 1
+      ;;
     *)
       echo "Unsupported OS: $OS" >&2
       exit 1
@@ -45,6 +52,23 @@ main() {
     esac
   fi
 
+  # The x64 build needs SSE4.2 and POPCNT (Intel Nehalem, AMD Bulldozer and
+  # later). An older CPU would install a binary that dies with SIGILL at once.
+  if [ "$os" = "linux" ] && [ "$arch" = "x64" ]; then
+    cpu_flags="$(grep -m 1 '^flags' /proc/cpuinfo 2>/dev/null || true)"
+    if [ -n "$cpu_flags" ]; then
+      for flag in sse4_2 popcnt; do
+        case " ${cpu_flags#*:} " in
+          *" $flag "*) ;;
+          *)
+            echo "Error: Gloom needs an x64 CPU with SSE4.2 and POPCNT (Intel Nehalem, AMD Bulldozer or newer), and this one has no ${flag}. Nothing was installed." >&2
+            exit 1
+            ;;
+        esac
+      done
+    fi
+  fi
+
   # Apple Silicon shells under Rosetta report x86_64, and they still want the
   # arm64 build. Genuine Intel Macs keep x64 and get the terminal app, because
   # the desktop app bundle is published for Apple Silicon only.
@@ -69,75 +93,26 @@ main() {
     fi
   }
 
-  # Read only asset names, digests and URLs. Track object depth so nested uploader
-  # fields and escaped strings cannot be mistaken for release asset metadata.
-  release_assets() {
-    awk '
-      {
-        for (i = 1; i <= length($0); i++) {
-          c = substr($0, i, 1)
-          if (quoted) {
-            if (escaped) { value = value c; escaped = 0 }
-            else if (c == "\\") escaped = 1
-            else if (c == "\"") {
-              quoted = 0
-              if (is_key[depth]) { key[depth] = value; is_key[depth] = 0 }
-              else if (key[depth] == "name" || key[depth] == "digest" || key[depth] == "browser_download_url")
-                fields[depth, key[depth]] = value
-            } else value = value c
-          } else if (c == "\"") { quoted = 1; value = "" }
-          else if (c == "{") { depth++; is_key[depth] = 1 }
-          else if (c == "}") {
-            if (fields[depth, "browser_download_url"] != "")
-              printf "%s\t%s\t%s\n", fields[depth, "name"], fields[depth, "digest"], fields[depth, "browser_download_url"]
-            delete fields[depth, "name"]
-            delete fields[depth, "digest"]
-            delete fields[depth, "browser_download_url"]
-            depth--
-          } else if (c == ",") is_key[depth] = 1
-        }
-      }
-    ' "$TMP_DIR/release.json"
-  }
-
+  # Every asset comes from the latest release's download URL, and its SHA-256
+  # from `<asset>.sha256` beside it: no API, so no rate limit stands between a
+  # download and its checksum.
   select_asset() {
     ASSET="$1"
-    DOWNLOAD_URL="$(awk -F '\t' -v asset="$ASSET" '$1 == asset { print $3; exit }' "$TMP_DIR/assets")"
-    # If metadata is unavailable, retain the existing latest-release install path.
-    if [ -z "$DOWNLOAD_URL" ]; then
-      DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
-    fi
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
   }
 
-  checksum_digest() {
-    awk -F '\t' -v asset="$ASSET" '
-      $1 == asset ".sha256" || tolower($1) ~ /^(sha256sums?|checksums?)(\.sha256)?(\.txt)?$/ {
-        print $1 " " $3
-      }
-    ' "$TMP_DIR/assets" | while read -r checksum_name checksum_url; do
-      if download_file "$checksum_url" "$TMP_DIR/checksums" 2>/dev/null; then
-        checksum="$(awk -v asset="$ASSET" -v sidecar="$checksum_name" '
-          $2 == asset || $2 == "*" asset || $2 == "./" asset { print $1; exit }
-          $1 == "SHA256" && $2 == "(" asset ")" && $3 == "=" { print $4; exit }
-          NF == 1 && sidecar == asset ".sha256" { print $1; exit }
-        ' "$TMP_DIR/checksums")"
-        if printf '%s\n' "$checksum" | grep -Eq '^[[:xdigit:]]{64}$'; then
-          printf '%s\n' "$checksum"
-          break
-        fi
-      fi
-    done
-  }
-
+  # Nothing is installed unverified: a checksum that cannot be read, or that
+  # does not match, stops the install.
   verify_download() {
-    expected="$(awk -F '\t' -v asset="$ASSET" '$1 == asset && $2 ~ /^sha256:/ { sub(/^sha256:/, "", $2); print $2; exit }' "$TMP_DIR/assets")"
-    if ! printf '%s\n' "$expected" | grep -Eq '^[[:xdigit:]]{64}$'; then
-      expected="$(checksum_digest)"
+    if ! download_file "${DOWNLOAD_URL}.sha256" "$TMP_DIR/checksum" 2>/dev/null; then
+      echo "Error: could not read the SHA-256 checksum for ${ASSET} from ${DOWNLOAD_URL}.sha256. Nothing was installed." >&2
+      echo "Try again in a minute, or download Gloom from https://gloom.sh/download" >&2
+      exit 1
     fi
-    if [ -z "$expected" ]; then
-      echo "Warning: could not obtain a SHA-256 digest or checksum file for ${ASSET}." >&2
-      echo "Continuing without checksum verification." >&2
-      return
+    expected="$(awk 'NR == 1 { print $1; exit }' "$TMP_DIR/checksum" | tr 'A-F' 'a-f')"
+    if ! printf '%s\n' "$expected" | grep -Eq '^[[:xdigit:]]{64}$'; then
+      echo "Error: ${DOWNLOAD_URL}.sha256 holds no SHA-256 checksum. Nothing was installed." >&2
+      exit 1
     fi
 
     if command -v sha256sum >/dev/null 2>&1; then
@@ -148,7 +123,6 @@ main() {
       echo "Error: sha256sum or shasum is required to verify this download." >&2
       exit 1
     fi
-    expected="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"
     if [ "$actual" != "$expected" ]; then
       echo "Error: SHA-256 mismatch for ${ASSET}. Nothing was installed." >&2
       exit 1
@@ -209,10 +183,6 @@ main() {
     RUN_COMMAND="gloomberb"
   }
 
-  has_asset() {
-    awk -F '\t' -v asset="$1" '$1 == asset { found = 1 } END { exit !found }' "$TMP_DIR/assets"
-  }
-
   # The bundle identifier in an app's Info.plist, empty when it has none.
   # PlistBuddy, on every Mac, reads binary plists too; elsewhere (the tests)
   # the XML one Electrobun writes is read as text.
@@ -233,9 +203,13 @@ main() {
     ' "$plist"
   }
 
-  # Whether the app at $1 is a build of Gloom, under either name.
+  # Whether the app at $1 is a build of Gloom, under either name and either
+  # bundle identifier: the one it has carried, and the one it moves to.
   is_our_app() {
-    [ "$(app_identifier "$1")" = "com.vincelwt.gloomberb" ]
+    case "$(app_identifier "$1")" in
+      com.vincelwt.gloomberb|sh.gloom.desktop) return 0 ;;
+      *) return 1 ;;
+    esac
   }
 
   # Points a `gloom` or `gloomberb` link that leads into the old bundle at the
@@ -303,11 +277,8 @@ main() {
   install_macos_app() {
     # Releases from before the rename ship the app only as Gloomberb.app, and
     # this script is served from main, so it meets those too. Either way the
-    # app goes in as Gloom.app. Without release metadata, both names are tried.
+    # app goes in as Gloom.app. Both names are tried, the new one first.
     app_assets="stable-macos-arm64-Gloom.app.zip stable-macos-arm64-Gloomberb.app.zip"
-    if [ -s "$TMP_DIR/assets" ] && ! has_asset "stable-macos-arm64-Gloom.app.zip"; then
-      app_assets="stable-macos-arm64-Gloomberb.app.zip"
-    fi
     DEST_APP="${APP_DIR}/Gloom.app"
     DEST_CLI="${INSTALL_DIR}/gloom"
     # A Gloom.app that is not this app belongs to another program and stays.
@@ -413,7 +384,7 @@ main() {
       fi
       if [ "$variant" = "-musl" ]; then
         echo "musl systems such as Alpine need a release that ships ${ASSET}." >&2
-        echo "Install with Bun meanwhile: bun install -g gloomberb" >&2
+        echo "Install with Bun meanwhile: bun install -g @gloom-sh/terminal" >&2
       fi
       exit 1
     fi
@@ -439,11 +410,6 @@ main() {
   }
 
   RUN_COMMAND="gloom"
-  echo "Fetching release metadata from https://api.github.com/repos/${REPO}/releases/latest"
-  : > "$TMP_DIR/assets"
-  if download_file "https://api.github.com/repos/${REPO}/releases/latest" "$TMP_DIR/release.json" 2>/dev/null; then
-    release_assets > "$TMP_DIR/assets"
-  fi
 
   if [ "$os" = "darwin" ] && [ "$arch" = "arm64" ]; then
     install_macos_app
@@ -466,13 +432,34 @@ main() {
     fi
   fi
 
+  # A folder this shell does not search (~/.local/bin on a new Mac) cannot run
+  # the command by name: the first run goes by its path, so the line printed
+  # works pasted into this same terminal, and the PATH line, appended to the
+  # login shell's startup file, makes the name work in every new one.
   case ":$PATH:" in
-    *":$INSTALL_DIR:"*) ;;
-    *) echo "Warning: $INSTALL_DIR is not in your PATH. Add it with:"
-       echo "  export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
+    *":$INSTALL_DIR:"*)
+      echo "Run '${RUN_COMMAND}' to start."
+      ;;
+    *)
+      case "$INSTALL_DIR" in
+        "$HOME"/*) path_dir="\$HOME/${INSTALL_DIR#"$HOME"/}" ;;
+        *) path_dir="$INSTALL_DIR" ;;
+      esac
+      case "${SHELL##*/}" in
+        zsh) path_hint="echo 'export PATH=\"${path_dir}:\$PATH\"' >> ~/.zshrc" ;;
+        bash)
+          if [ "$os" = "darwin" ]; then bash_profile="~/.bash_profile"; else bash_profile="~/.bashrc"; fi
+          path_hint="echo 'export PATH=\"${path_dir}:\$PATH\"' >> ${bash_profile}"
+          ;;
+        fish) path_hint="fish_add_path ${INSTALL_DIR}" ;;
+        *) path_hint="export PATH=\"${INSTALL_DIR}:\$PATH\"  (in your shell's startup file)" ;;
+      esac
+      echo "${INSTALL_DIR} is not on your PATH yet, so start Gloom with:"
+      echo "  ${INSTALL_DIR}/${RUN_COMMAND}"
+      echo "To run it as '${RUN_COMMAND}' in new terminals, add the folder to your PATH:"
+      echo "  ${path_hint}"
+      ;;
   esac
-
-  echo "Run '${RUN_COMMAND}' to start."
 }
 
 # Keep invocation last: a truncated download must not begin installing.

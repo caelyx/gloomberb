@@ -11,12 +11,15 @@ import {
   inferBrowserTabFromQuery,
   latestLikely13FQuarter,
   newestDueQuarter,
+  nextThirteenFDue,
   thirteenFDueDate,
   buildPeriodReports,
   oneFundPerCik,
   quartersBehindLatest,
   sortFilingPositionRows,
 } from "./model";
+import { holdingSplitNotes, nextFilingText } from "./report-notes";
+import { holdingActionLabel } from "./format";
 import type { FundDetailData, ThirteenFFormSummary, ThirteenFHoldingRecord } from "./types";
 
 function form(overrides: Partial<ThirteenFFormSummary>): ThirteenFFormSummary {
@@ -97,6 +100,19 @@ describe("13F model", () => {
     // Still 14 Aug in New York, so Q2 is not missed yet; four hours later it is.
     expect(newestDueQuarter(new Date("2026-08-15T03:00:00Z"))).toEqual({ period: "2026-03-31", due: "2026-05-15" });
     expect(newestDueQuarter(new Date("2026-08-15T05:00:00Z"))).toEqual({ period: "2026-06-30", due: "2026-08-14" });
+  });
+
+  test("a fund's next 13F is the first quarter after its latest whose deadline has not passed in New York", () => {
+    // Berkshire on Fri 6 Nov 2026, with Q2 on file: Q3's deadline is Saturday 14 Nov, so Monday 16 Nov.
+    const next = nextThirteenFDue("2026-06-30", new Date("2026-11-06T12:35:00Z"));
+    expect(next).toEqual({ period: "2026-09-30", due: "2026-11-16" });
+    expect(nextFilingText(next!)).toEqual({ quarter: "Q3 2026", due: "due Mon 16 Nov 2026" });
+    // Q4's 14 Feb 2027 is a Sunday before Presidents' Day.
+    expect(nextFilingText(nextThirteenFDue("2026-09-30", new Date("2026-11-20T12:00:00Z"))!).due).toBe("due Tue 16 Feb 2027");
+    // Still 16 Nov in New York: Q3 is still the next one, not Q4.
+    expect(nextThirteenFDue("2026-06-30", new Date("2026-11-17T04:00:00Z"))?.period).toBe("2026-09-30");
+    expect(nextThirteenFDue("2026-06-30", new Date("2026-11-17T06:00:00Z"))?.period).toBe("2026-12-31");
+    expect(nextThirteenFDue(undefined)).toBeNull();
   });
 
   test("the latest EDGAR filing for the missed quarter decides what a fund behind it filed", () => {
@@ -253,7 +269,7 @@ describe("13F model", () => {
     const steady = { previous: holding({ cusip: "B", ticker: "BBB", value: 1000, shares: 100 }), current: holding({ cusip: "B", ticker: "BBB", value: 1100, shares: 100 }) };
     const forward = fund([holding({ cusip: "A", value: 1000, shares: 10 }), steady.previous], [holding({ cusip: "A", value: 1200, shares: 100 }), steady.current]);
     expect(filingSplitCandidates(forward)).toEqual([expect.objectContaining({ ticker: "AAA" })]);
-    expect(quarter(forward, { AAA: 10 })).toEqual({ percent: expect.closeTo(15), splits: [{ ticker: "AAA", issuer: "Issuer", ratio: 10 }], skipped: [] });
+    expect(quarter(forward, { AAA: 10 })).toEqual({ percent: expect.closeTo(15), splits: [{ ticker: "AAA", issuer: "Issuer", ratio: 10 }], skipped: [], skippedShare: null });
     // Sold down to 73 of the 100 split shares, the 73 held through gain 2 each on a start of 10: (146 + 100) / (730 + 1000).
     const traded = fund([holding({ cusip: "A", value: 1000, shares: 10 }), steady.previous], [holding({ cusip: "A", value: 876, shares: 73 }), steady.current]);
     expect(quarter(traded, { AAA: 10 })).toMatchObject({ percent: expect.closeTo((246 / 1730) * 100), splits: [expect.objectContaining({ ratio: 10 })] });
@@ -265,9 +281,12 @@ describe("13F model", () => {
     expect([1.5, 1.25, 50].map(formatSplitRatio)).toEqual(["3:2", "5:4", "50:1"]);
     // Half the shares sold into a 32% rally (Berkshire's Nucor in 2026Q2) moves the same way; with no split it is a trim.
     const trim = fund([holding({ cusip: "A", value: 660_686_383, shares: 3_907_075 })], [holding({ cusip: "A", value: 413_814_258, shares: 1_857_752 })]);
-    expect(quarter(trim, { AAA: 1 })).toEqual({ percent: expect.closeTo((222.75 / 169.1 - 1) * 100, 1), splits: [], skipped: [] });
-    // Unchecked, a candidate is left out rather than read as a crash or a split it may not be.
-    expect(quarter(forward)).toEqual({ percent: expect.closeTo(10), splits: [], skipped: [{ ticker: "AAA", issuer: "Issuer" }] });
+    expect(quarter(trim, { AAA: 1 })).toEqual({ percent: expect.closeTo((222.75 / 169.1 - 1) * 100, 1), splits: [], skipped: [], skippedShare: null });
+    // Unchecked, a candidate is left out rather than read as a crash or a split it may not be, with what it weighed
+    // at the quarter's start (half the book here), and whether the lookups' time ran out on it.
+    expect(quarter(forward)).toEqual({ percent: expect.closeTo(10), splits: [], skipped: [{ ticker: "AAA", issuer: "Issuer", previousValue: 1000 }], skippedShare: 0.5 });
+    const late = Object.assign(new Map<string, number | null>(), { late: new Set(filingSplitCandidates(forward).map((line) => line.id)) });
+    expect(estimateFilingQuarterReturn(forward, late).skipped).toEqual([{ ticker: "AAA", issuer: "Issuer", previousValue: 1000, late: true }]);
     // A crash without a share change, or an add with the price flat, is no candidate.
     for (const current of [holding({ cusip: "A", value: 100, shares: 10 }), holding({ cusip: "A", value: 10000, shares: 100 })]) {
       expect(filingSplitCandidates(fund([holding({ cusip: "A", value: 1000, shares: 10 })], [current]))).toEqual([]);
@@ -327,6 +346,60 @@ describe("13F model", () => {
     // 70 shares held through a 1:10 reverse split are 7: unchanged, though 70 × 0.1 is 7.000000000000001.
     const held = fund([holding({ cusip: "A", value: 700, shares: 70 })], [holding({ cusip: "A", value: 700, shares: 7 })]);
     expect(buildFundHoldingRows(held, new Map([[id, 0.1]]))[0]).toMatchObject({ sharesChange: 0, sharesChangePercent: 0, action: "held", splitRatio: 0.1 });
+  });
+
+  // Anatole's Q2 13F read Brera's 1-for-10 reverse split as an exit of G13311116 beside a new G13311132.
+  test("an exit and a new share line of one issuer read as one position only when the SEC list or a split confirms it", () => {
+    const fund = (previous: ThirteenFHoldingRecord[], current: ThirteenFHoldingRecord[]): FundDetailData => ({
+      cik: "0001693745", name: "Anatole", forms: [],
+      latestForm: form({}), previousForm: form({ periodOfReport: "2025-12-31" }),
+      latestHoldings: current, previousHoldings: previous,
+    });
+    const before = holding({ ticker: "", cusip: "G13311116", issuer: "Brera Holdings PLC", value: 2_952_000, shares: 4_920_000 });
+    const after = holding({ ticker: "", cusip: "G13311132", issuer: "Brera Holdings PLC", value: 2_490_000, shares: 492_000 });
+    // Counts that fit a split with nothing to confirm it stay as filed: an exit and a new line.
+    const unconfirmed = fund([before], [after]);
+    expect(buildFundHoldingRows(unconfirmed).map((row) => [row.cusip, row.action])).toEqual([["G13311132", "new"], ["G13311116", "exit"]]);
+    // So the new line's split record is read.
+    expect(filingSplitCandidates(unconfirmed)).toEqual([{ id: "G13311132||SH", ticker: "", issuer: "Brera Holdings PLC" }]);
+    // The SEC's list deleting the old CUSIP and adding the new confirms it.
+    const listed = fund(
+      [{ ...before, secListStatus: "deleted" }, holding({ ticker: "AXTI", cusip: "00246W103", issuer: "AXT Inc", value: 1_000, shares: 463_200 })],
+      [{ ...after, secListStatus: "added" }, holding({ ticker: "NBIS", cusip: "N97284108", issuer: "Nebius Group N.V.", value: 302_110_000, shares: 1_090_000 })],
+    );
+    const rows = buildFundHoldingRows(listed);
+    expect(rows.map((row) => [row.cusip, row.action])).toEqual([["G13311132", "held"], ["N97284108", "new"], ["00246W103", "exit"]]);
+    expect(rows[0]).toMatchObject({
+      previousShares: 4_920_000, shares: 492_000, sharesChange: 0, splitRatio: 0.1,
+      cusipChange: { previousCusip: "G13311116", label: "new CUSIP, 1-for-10 split", confirmedBy: "sec-list" },
+    });
+    expect(filingSplitCandidates(listed)).toEqual([]);
+    // Priced on split-adjusted shares: 0.60 a share before is 6.00 after, against 5.06 now.
+    expect(rows[0]!.estimatedPnl).toBeCloseTo(2_490_000 - 2_952_000, 0);
+    expect(holdingActionLabel(rows[0]!)).toBe("Held, new CUSIP, 1-for-10 split");
+    // A split record of the new line's ticker confirms it too; the fraction of a share paid in cash is no trade.
+    const split = buildFundHoldingRows(fund(
+      [holding({ ticker: "BREA", cusip: "G13311116", issuer: "Brera Holdings PLC", value: 3_857_474, shares: 4_920_248 })],
+      [holding({ ticker: "BREA", cusip: "G13311132", issuer: "Brera Holdings PLC", value: 2_489_647, shares: 492_025 })],
+    ), new Map([["G13311132||SH", 0.1]]));
+    expect(split[0]).toMatchObject({ action: "held", sharesChange: 0 });
+    expect(holdingSplitNotes(split)).toEqual(["New CUSIP across a split: BREA 1:10, was G13311116 (per the split record); Est P&L on split-adjusted shares"]);
+    // A split record that does not carry the old count onto the new one confirms nothing.
+    expect(buildFundHoldingRows(unconfirmed, new Map([["G13311132||SH", 0.5]])).map((row) => row.action)).toEqual(["new", "exit"]);
+    // 10,000,000 to 150,000 is no 1-for-67 split (carried across one it is 149,254), even marked on the list.
+    const sold = buildFundHoldingRows(fund(
+      [holding({ cusip: "G13311116", value: 100, shares: 10_000_000, secListStatus: "deleted" })],
+      [holding({ cusip: "G13311132", value: 100, shares: 150_000, secListStatus: "added" })],
+    ));
+    expect(sold.map((row) => row.action)).toEqual(["new", "exit"]);
+    // Only share lines pair: a note or a warrant beside the shares stays as filed.
+    for (const line of [{ shareType: "PRN" }, { titleOfClass: "WTS EXP 2031" }, { titleOfClass: "UNIT 99/99/9999" }]) {
+      const paired = buildFundHoldingRows(fund(
+        [{ ...before, secListStatus: "deleted" }],
+        [{ ...after, ...line, secListStatus: "added" }],
+      ));
+      expect(paired.map((row) => row.action)).toEqual(["new", "exit"]);
+    }
   });
 
   test("does not call a first filing or a missing-quarter comparison new buying", () => {

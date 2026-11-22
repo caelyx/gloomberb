@@ -11,6 +11,8 @@ import { createSnapshotDataProvider } from "../market-data/snapshot-provider";
 import { fetchHistoryResult } from "../sources/history-result";
 import { chartQuoteOverrideKeyForSource } from "./live-quotes";
 import { createTestHeadlessContext } from "../test-support/headless";
+import { setSharedMarketDataCoordinator } from "../market-data/coordinator";
+import { createIdleEntry } from "../market-data/result-types";
 
 const time = (value: string) => Date.parse(value);
 const NOW = time("2026-09-22T12:42:00Z");
@@ -31,7 +33,7 @@ const provider = (get: () => Promise<PriceHistoryResult>) => createTestDataProvi
   getPriceHistoryForResolution: async () => { throw new Error("The array projection must not replace the actual metadata acquisition"); },
   getPriceHistoryForResolutionWithMetadata: get,
 });
-afterEach(() => setSystemTime());
+afterEach(() => { setSystemTime(); setSharedMarketDataCoordinator(null); });
 
 test("price, volume and SMA200 share a current history acquisition and refresh exactly when the first new-session bar is due", async () => {
   setSystemTime(NOW);
@@ -79,7 +81,7 @@ test("a behind 5-minute session copy is drawn with a notice while refetches fail
   const cache = new ChartResolveCache(), spec = chart();
   spec.viewport = { range: "1D", resolution: "5m" };
   spec.studies = [];
-  const notice = "AAPL:XNAS: newer bars are unavailable; showing saved bars as of Sep 21 15:45 ET.";
+  const notice = "AAPL:NASDAQ: newer bars are unavailable; showing saved bars as of 21 Sep 15:45 ET.";
   const resolve = async () => {
     const resolved = await resolveChartSpecData(spec, { dataProvider, now: new Date() }, cache);
     expect(resolved.errors).toEqual([]);
@@ -114,7 +116,7 @@ test("a behind 5-minute session copy is drawn with a notice while refetches fail
 
 test("a saved copy the router calls behind draws one notice, with a session record or without, until a refetch answers a current copy", async () => {
   setSystemTime(NOW);
-  const notice = "AAPL:XNAS: newer bars are unavailable; showing saved bars as of Sep 21 15:45 ET.";
+  const notice = "AAPL:NASDAQ: newer bars are unavailable; showing saved bars as of 21 Sep 15:45 ET.";
   const saved = time("2026-09-21T19:50:00Z");
   let calls = 0, behind = true;
   // The Cloud session record covers US 1- and 5-minute bars only: this copy has none.
@@ -169,7 +171,7 @@ test("recent explicit windows revalidate across the opening boundary just like c
   // The source answers the same bars, still behind the session: they are drawn, and the footer says so.
   const behind = await resolveChartSpecData(spec, { dataProvider, now: new Date() }, cache);
   expect(behind.series.find(series => series.id === "close")!.points).toHaveLength(234);
-  expect(behind.warnings).toContain("AAPL:XNAS: newer bars are unavailable; showing saved bars as of Sep 21 15:45 ET.");
+  expect(behind.warnings).toContain("AAPL:NASDAQ: newer bars are unavailable; showing saved bars as of 21 Sep 15:45 ET.");
   expect(calls).toBe(2);
 });
 
@@ -309,4 +311,24 @@ test("GIP snapshot replay retains study warmup outside the visible session", asy
     expect(replay.snapshot.financials[0]![1].priceHistorySourceKey).toBe("provider:actual-history-source");
     expect(calls).toBe(1);
   }
+});
+
+test("a chart takes the listing's currency and type from the quote the app already holds", async () => {
+  setSystemTime(NOW);
+  let metadataReads = 0;
+  const dataProvider = createTestDataProvider({ id: "preferred-router-id",
+    getQuoteMetadata: async symbol => { metadataReads++; return { symbol, currency: "USD", instrumentType: "EQUITY" }; },
+    getChartResolutionSupport: () => [{ resolution: "15m", maxRange: "ALL" }],
+    getPriceHistoryForResolutionWithMetadata: async () => result(),
+  });
+  const quote = { symbol: "AAPL", price: 100, currency: "USD", instrumentType: "EQUITY", listingExchangeName: "NASDAQ", lastUpdated: NOW };
+  setSharedMarketDataCoordinator({
+    getQuoteEntry: ({ symbol }: { symbol: string }) => symbol === "AAPL"
+      ? { ...createIdleEntry(), phase: "ready", data: quote, lastGoodData: quote }
+      : createIdleEntry(),
+  } as never);
+  const resolved = await resolveChartSpecData(chart(), { dataProvider, now: new Date() }, new ChartResolveCache());
+  expect(resolved.errors).toEqual([]);
+  expect(resolved.series.find(series => series.id === "close")!.points).toHaveLength(234);
+  expect(metadataReads).toBe(0);
 });

@@ -1,13 +1,16 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { DataTableColumn } from "../../../components";
 import { DATE_OPTION_EXAMPLES, isoDateOption } from "../../../utils/calendar-date";
 import { optionFlag } from "../../../cli/pane-functions/capabilities";
+import { companyDataNotes } from "../../../types/company-from";
 import type { HeadlessBundleSection, HeadlessPaneColumn, HeadlessPaneDefinition } from "../../../types/plugin";
 import { withoutQuietColumns } from "../shared/research-cells";
 import { resolveHeadlessIssuerListing } from "../shared/headless-market-data";
 import { companyQuery, fetchCompanyData, type CompanyDataset, type CompanyMode } from "./client";
-import { allGuidance, allObservations, companyCellText, companyColumns, companyPreviewNote, KPI_COVERAGE_NOTE, kpiFreeLimitNote, QUIET_COLUMNS,
+import { allGuidance, allObservations, companyCellText, companyColumns, companyEmptyState, companyPreviewNote, guidanceIssueNote, KPI_COVERAGE_NOTE, kpiFreeLimitNote, QUIET_COLUMNS,
   type CompanyRow } from "./model";
 import type { KpiObservation } from "../../../api-client/company-kpis";
+import { currentKpiSeries } from "./latest";
 
 /** What the server takes as a metric; anything else is not a metric id and is not sent. */
 const METRIC_ID = /^[a-z0-9_]{1,80}$/;
@@ -28,8 +31,10 @@ function reportColumns(mode: CompanyMode, history: boolean, revisions: boolean, 
     ...(revisions ? [{ id: "revision", label: "Revision", width: 12, align: "left" as const }] : [])];
   return [...withoutQuietColumns(columns, rows, (row, id) => companyCellText(row, id, observations), QUIET_COLUMNS).map((column): HeadlessPaneColumn => ({
     key: column.id === "value" && mode === "guidance" ? "rangeText" : ROW_KEYS[column.id] ?? column.id, header: column.label, align: column.align === "right" ? "right" : "left",
-    format: (_value, row) => companyCellText(row as unknown as CompanyRow, column.id, observations),
-  })), { key: "asOf", header: "As of", format: (value) => typeof value === "string" ? value.slice(0, 10) : "--" }];
+    format: (_value, row) => mode === "guidance" && column.id === "value" && typeof row.rangeText === "string" && /plus or minus|±/i.test(row.rangeText)
+      ? `${row.rangeText}${row.currency ? ` ${row.currency}` : ""}`
+      : companyCellText(row as unknown as CompanyRow, column.id, observations),
+  })), { key: "asOf", header: "As of", format: (value) => typeof value === "string" ? value.slice(0, 10) : MISSING_VALUE }];
 }
 
 function datasetRows(data: CompanyDataset): CompanyRow[] {
@@ -104,17 +109,25 @@ export function companyHeadless(mode: CompanyMode): HeadlessPaneDefinition<"bund
         const shown = rows.filter(keep);
         return { title, columns: reportColumns(mode, history, revisions, shown, observations), rows: shown.map((row) => ({ ...row })), ...(empty && first ? { empty } : {}) };
       };
-      const latest = ("series" in data ? data.series.map((series) => series.latest) : data.guidance).filter(keep);
+      const latest = ("series" in data ? currentKpiSeries(data.series).map((series) => series.latest) : data.guidance).filter(keep);
       const ignored = data.access === "preview" ? PRO_FILTERS.filter((key) => typeof args.options[key] === "string" && args.options[key] !== "") : [];
       const notes = [ageNote(data, latest, mode),
-        ignored.length ? `The free preview is fixed: ${ignored.map(optionFlag).join(", ")} ${ignored.length > 1 ? "need" : "needs"} Gloom Pro.` : null].filter((note): note is string => !!note);
-      return { complete: !data.truncated, errors: data.truncated ? [data.access === "preview" ? companyPreviewNote(data, mode === "guidance") : "Response limit reached; narrow the metric or date range"] : [],
+        ...("guidance" in data ? data.guidance.filter(keep).flatMap((row) => {
+          const note = guidanceIssueNote(row, data.guidance);
+          return note ? [`${row.metric.name}: ${note}.`] : [];
+        }) : []),
+        ignored.length ? `The free preview is fixed: ${ignored.map(optionFlag).join(", ")} ${ignored.length > 1 ? "need" : "needs"} Gloom Pro.` : null,
+        ...companyDataNotes(data.companyFrom)].filter((note): note is string => !!note);
+      // A company with nothing on file says so once, as the pane does, rather than "not covered".
+      const nothingOnFile = datasetRows(data).length === 0 && data.lockedRows === 0 && !requested;
+      const { title, hint } = companyEmptyState(mode, symbol, { tab: "table", hasRows: !nothingOnFile }, "cli");
+      return { complete: !data.truncated, ...(nothingOnFile ? { empty: [title, hint].filter(Boolean).join(" ") } : {}), errors: data.truncated ? [data.access === "preview" ? companyPreviewNote(data, mode === "guidance") : "Response limit reached; narrow the metric or date range"] : [],
         ...(notes.length ? { notes } : {}),
         sections: "series" in data ? [
-          section("Latest KPIs", data.series.map((series) => series.latest), { first: true }),
+          section("Latest KPIs", currentKpiSeries(data.series).map((series) => series.latest), { first: true }),
           section("KPI history", data.series.flatMap((series) => series.observations)),
           section("Revisions and conflicts", data.revisions, { revisions: true }),
-        ] : [section("Current guidance", data.guidance, { first: true }), section("Guidance history", data.history, { history: true })],
+        ] : [section("Latest disclosed guidance", data.guidance, { first: true }), section("Guidance history", data.history, { history: true })],
         metadata: { symbol: data.symbol, asOf: data.asOf, access: data.access, coverage: data.coverage, dictionary: data.dictionary,
           lockedRows: data.lockedRows, totalRows: data.totalRows, methodology: data.methodology } };
     },

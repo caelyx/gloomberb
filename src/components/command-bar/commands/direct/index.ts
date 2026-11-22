@@ -20,6 +20,7 @@ import type { Command } from "../registry";
 import type { AppConfig, BrokerInstanceConfig } from "../../../../types/config";
 import { requestFeedbackDialog } from "../../../feedback-dialog";
 import type { OpenInlineConfirm } from "../../routing/confirm";
+import { HEADER_MARKET_SEARCH } from "../../../../core/state/app/command-bar-launch";
 import {
   isRouteCommandId,
   routeCommandIdToScreen,
@@ -29,9 +30,12 @@ import { parseWindowModeCommandArg } from "../../layout-items";
 import type { CommandBarRoute } from "../../workflow/types";
 import { recordFunctionOpen } from "../../../../telemetry/usage-counts";
 import { reportTelemetryConfig } from "../../../../telemetry/live-config";
+import { ATTENTION_OFF_MESSAGE } from "../../../../telemetry/attention-setting";
 import { NIGHTLY_CHANNEL_SUMMARY, withUpdateChannel } from "../../../../updater/channel";
 import { isPrereleaseVersion } from "../../../../utils/semver";
 import { VERSION } from "../../../../version";
+import { getDesktopWindows } from "../../../../state/desktop-windows";
+import { fireAndForget } from "../../../../utils/fire-and-forget";
 
 type NotifyFn = (body: string, options?: { type?: "info" | "success" | "error" }) => void;
 
@@ -53,9 +57,11 @@ export function runDirectCommandAction(options: {
   getState: () => AppState;
   notify: NotifyFn;
   onCheckForUpdates?: () => void | Promise<void>;
+  /** Settings' Run Setup Again; absent where setup cannot run. */
+  onRunSetupAgain?: () => Promise<void>;
   openBuiltInWorkflow: (actionId: string) => void;
   openInlineConfirm: OpenInlineConfirm;
-  openModeRoute: (screen: "ticker-search" | "layout", initialQuery?: string) => void;
+  openModeRoute: (screen: "ticker-search" | "layout", initialQuery?: string, payload?: Record<string, unknown>) => void;
   openPaneSettings: (paneId: string | null) => void;
   pluginRegistry: PluginRegistry;
   persistConfig: (nextConfig: AppState["config"]) => void;
@@ -78,6 +84,7 @@ export function runDirectCommandAction(options: {
     getState,
     notify,
     onCheckForUpdates,
+    onRunSetupAgain,
     openBuiltInWorkflow,
     openInlineConfirm,
     openModeRoute,
@@ -120,6 +127,10 @@ export function runDirectCommandAction(options: {
     case "window-mode":
       closeAll({ revertThemePreview: false });
       pluginRegistry.openWindowMode(state.focusedPaneId ?? undefined, parseWindowModeCommandArg(arg) ?? "move");
+      return;
+    case "new-window":
+      closeAll({ revertThemePreview: false });
+      fireAndForget(getDesktopWindows()?.openWindow(), "desktop.openWindow");
       return;
     case "minimize-window":
     case "maximize-window":
@@ -233,31 +244,58 @@ export function runDirectCommandAction(options: {
       return;
     case "export-config": {
       const exportPath = getDefaultConfigBackupPath();
-      void exportConfig(state.config, exportPath)
-        .then(() => {
-          notify(`Config exported to ${exportPath}`, { type: "success" });
-          closeAll({ revertThemePreview: false });
-        })
-        .catch((error) => {
-          notify(error instanceof Error ? error.message : "Export failed.", { type: "error" });
-        });
+      // A file written to the home folder, over any copy there, says where before it is written: `config` and Enter
+      // once wrote it without a word.
+      openInlineConfirm({
+        confirmId: "export-config",
+        title: "Export Config",
+        body: [
+          `This saves your layouts, portfolios, watchlists, settings and recent commands to ${exportPath}, replacing any copy there.`,
+        ],
+        confirmLabel: "Export",
+        cancelLabel: "Back",
+        onConfirm: async () => {
+          try {
+            await exportConfig(getState().config, exportPath);
+            notify(`Config exported to ${exportPath}`, { type: "success" });
+            closeAll({ revertThemePreview: false });
+          } catch (error) {
+            notify(error instanceof Error ? error.message : "Export failed.", { type: "error" });
+          }
+        },
+      });
       return;
     }
     case "import-config": {
       const importPath = getDefaultConfigBackupPath();
-      void importConfig(state.config.dataDir, importPath)
-        .then((imported) => {
-          cancelThemePreview();
-          clearTransientThemePreview();
-          dispatch({ type: "SET_CONFIG", config: imported });
-          applyTheme(imported.theme);
-          dispatch({ type: "SET_THEME", theme: imported.theme });
-          notify(`Imported config from ${importPath}.`, { type: "success" });
-          closeAll({ revertThemePreview: false });
-        })
-        .catch((error) => {
-          notify(error instanceof Error ? error.message : "Import failed.", { type: "error" });
-        });
+      // An import replaces every layout, portfolio and setting at once, so it
+      // is never one keystroke away.
+      openInlineConfirm({
+        confirmId: "import-config",
+        title: "Import Config",
+        body: [
+          `This replaces your layouts, portfolios, watchlists and settings with the ones saved in ${importPath}.`,
+          "What you have now is not kept unless you export it first.",
+        ],
+        confirmLabel: "Import",
+        cancelLabel: "Back",
+        tone: "danger",
+        // A stray Enter keeps what is there.
+        defaultAction: "cancel",
+        onConfirm: async () => {
+          try {
+            const imported = await importConfig(getState().config.dataDir, importPath);
+            cancelThemePreview();
+            clearTransientThemePreview();
+            dispatch({ type: "SET_CONFIG", config: imported });
+            applyTheme(imported.theme);
+            dispatch({ type: "SET_THEME", theme: imported.theme });
+            notify(`Imported config from ${importPath}.`, { type: "success" });
+          } catch (error) {
+            notify(error instanceof Error ? error.message : "Import failed.", { type: "error" });
+          }
+        },
+      });
       return;
     }
     case "cycle-chart-renderer": {
@@ -303,6 +341,9 @@ export function runDirectCommandAction(options: {
       closeAll({ revertThemePreview: false });
       return;
     }
+    case "header-market":
+      openModeRoute("ticker-search", arg, HEADER_MARKET_SEARCH);
+      return;
     case "toggle-value-flashing": {
       const nextConfig = {
         ...state.config,
@@ -313,46 +354,32 @@ export function runDirectCommandAction(options: {
       closeAll({ revertThemePreview: false });
       return;
     }
-    case "toggle-crash-reports":
-    case "toggle-usage-counts": {
-      const key = command.id === "toggle-crash-reports" ? "crashReports" : "usage";
-      const enabled = state.config.telemetry?.[key] === false;
-      const nextConfig = { ...state.config, telemetry: { ...state.config.telemetry, [key]: enabled } };
-      reportTelemetryConfig(nextConfig.telemetry);
+    case "toggle-since-last-visit": {
+      // Only off is saved; on is the default.
+      const { sinceLastVisit, ...rest } = state.config;
+      const enabled = sinceLastVisit === false;
+      const nextConfig: AppConfig = enabled ? rest : { ...rest, sinceLastVisit: false };
       dispatch({ type: "SET_CONFIG", config: nextConfig });
       persistConfig(nextConfig);
       notify(`${t(command.label)}: ${t(enabled ? "on" : "off")}`, { type: "success" });
       closeAll({ revertThemePreview: false });
       return;
     }
+    case "toggle-crash-reports":
+    case "toggle-usage-counts":
     case "toggle-attention-counts": {
-      const setEnabled = (enabled: boolean) => {
-        const current = getState().config;
-        const nextConfig = { ...current, telemetry: { ...current.telemetry, attention: enabled } };
-        // Clear unsent counts before React commits the settings update.
-        reportTelemetryConfig(nextConfig.telemetry);
-        dispatch({ type: "SET_CONFIG", config: nextConfig });
-        persistConfig(nextConfig);
-        notify(`${t(command.label)}: ${t(enabled ? "on" : "off")}`, { type: "success" });
-      };
-      if (state.config.telemetry?.attention === true) {
-        setEnabled(false);
-        closeAll({ revertThemePreview: false });
-      } else {
-        openInlineConfirm({
-          confirmId: "enable-attention-counts",
-          title: "Share Attention Counts?",
-          body: [
-            "While signed in with a verified account, share the tickers you open in DES, charts, quotes and options, and add to watchlists.",
-            "Gloom uses your account to limit contributions. Published counts are delayed and rounded, and require at least 20 contributors. Your holdings, watchlist names and searches are not included.",
-            "This is separate from Usage Counts and is off by default. Turn it off at any time to stop collection and discard unsent counts. Already published anonymous totals cannot be removed.",
-          ],
-          confirmLabel: "Share Counts",
-          cancelLabel: "Keep Off",
-          tone: "default",
-          onConfirm: async () => { setEnabled(true); },
-        });
-      }
+      const key = command.id === "toggle-crash-reports" ? "crashReports" : command.id === "toggle-usage-counts" ? "usage" : "attention";
+      // All three are on by default: only an explicit false is off.
+      const enabled = state.config.telemetry?.[key] === false;
+      const nextConfig = { ...state.config, telemetry: { ...state.config.telemetry, [key]: enabled } };
+      // Reported before React commits, so turning Attention Counts off drops unsent counts at once.
+      reportTelemetryConfig(nextConfig.telemetry);
+      dispatch({ type: "SET_CONFIG", config: nextConfig });
+      persistConfig(nextConfig);
+      notify(key === "attention" && !enabled
+        ? t(ATTENTION_OFF_MESSAGE)
+        : `${t(command.label)}: ${t(enabled ? "on" : "off")}`, { type: "success" });
+      closeAll({ revertThemePreview: false });
       return;
     }
     case "font-size-increase":
@@ -372,9 +399,19 @@ export function runDirectCommandAction(options: {
       closeAll({ revertThemePreview: false });
       return;
     }
+    case "quit":
+      closeAll({ revertThemePreview: false });
+      quitApp();
+      return;
     case "check-for-updates":
       void onCheckForUpdates?.();
       closeAll({ revertThemePreview: false });
+      return;
+    case "run-setup-again":
+      closeAll({ revertThemePreview: false });
+      void onRunSetupAgain?.().catch((error: unknown) => {
+        notify(error instanceof Error ? error.message : String(error), { type: "error" });
+      });
       return;
     case "release-channel": {
       // The runtime checks again as soon as the channel changes.

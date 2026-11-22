@@ -61,7 +61,8 @@ describe("financial ratios", () => {
     expect(evaluateRatio(ratio("roa"), period(closing, opening, { quarterly: true })).value).toBeCloseTo(0.05);
     // Both ends must use one definition: common equity at one end and total at the other is not an average.
     expect(evaluateRatio(ratio("roe"), period(closing, { date: "2025-03-31", commonStockEquity: 80 })).value).toBe("not-reported");
-    expect(evaluateRatio(ratio("roe"), period(closing)).value).toBe("not-reported");
+    // The oldest column, with no opening balance sheet loaded, says it needs the period before rather than "not reported".
+    expect(evaluateRatio(ratio("roe"), period(closing)).value).toBe("no-opening");
   });
 
   test("ROE reads N/M when equity changes sign or is under a fifth of net income, keeping its inputs", () => {
@@ -160,8 +161,20 @@ describe("financial ratios", () => {
     });
     const table = ratioTableForFinancials(financials, RATIO_TABS.find((tab) => tab.key === "profitability")!, "annual");
     expect(table.periods.map(({ statement }) => statement.date)).toEqual(["2025-12-31", "2024-12-31"]);
-    expect(table.cells.get("roe")!.map((cell) => cell.value)).toEqual([0.24, "not-reported"]);
-    expect(table.rows.filter((row) => row.kind === "input").length).toBe(12);
+    expect(table.cells.get("roe")!.map((cell) => cell.value)).toEqual([0.24, "no-opening"]);
+    // Two inputs a ratio: ROE, ROA, ROIC, ROIC ex Cash and the three margins.
+    expect(table.rows.filter((row) => row.kind === "input").length).toBe(14);
+    // A year whose prior year is missing from the statements needs it too, mid-history, not only the oldest column.
+    const gap = createTestFinancials({
+      annualStatements: [
+        { date: "2022-12-31", netIncome: 8, totalRevenue: 80, totalEquity: 30 },
+        { date: "2024-12-31", netIncome: 10, totalRevenue: 100, totalEquity: 40 },
+        { date: "2025-12-31", netIncome: 12, totalRevenue: 120, totalEquity: 60 },
+      ],
+      quarterlyStatements: [],
+    });
+    const gapped = ratioTableForFinancials(gap, RATIO_TABS.find((tab) => tab.key === "profitability")!, "annual");
+    expect(gapped.cells.get("roe")!.map((cell) => cell.value)).toEqual([0.24, "no-opening", "no-opening"]);
   });
 
   test("quarterly leverage divides by the trailing year, not a quarter times four, and says when four quarters are not on file", () => {
@@ -197,6 +210,55 @@ describe("financial ratios", () => {
     expect(annual.rows.find((row) => row.id === "net-debt-ebitda:1")!.label).toBe("÷ EBITDA");
   });
 
+  test("IFRS net debt and EV include the balance sheet's leases, a US GAAP filer's operating leases stay out, and a row says which", () => {
+    // IAG's years in EUR: borrowings, IFRS 16 leases beside them, cash and short-term investments, EBITDA.
+    const B = 1e9;
+    const year = (date: string, debt: number, leases: number | undefined, cash: number, ebitda: number): FinancialStatement => ({
+      date, currency: "EUR", dateSource: "provider", totalDebt: debt * B, longTermDebt: debt * 0.8 * B, currentDebt: debt * 0.2 * B,
+      capitalLeaseObligations: leases === undefined ? undefined : leases * B, cashCashEquivalentsAndShortTermInvestments: cash * B,
+      ebitda: ebitda * B, ordinarySharesNumber: 4.9 * B,
+    });
+    const annual = (...annualStatements: FinancialStatement[]) => createTestFinancials({
+      quote: createTestQuote({ symbol: "IAG", currency: annualStatements[0]!.currency! }), annualStatements, quarterlyStatements: [],
+    });
+    const iag = annual(year("2023-12-31", 7.115, undefined, 6.806, 6.214), year("2024-12-31", 8.699, 8.646, 9.799, 6.829), year("2025-12-31", 7.272, 6.995, 8.29, 7.951));
+    const leverage = RATIO_TABS.find((tab) => tab.key === "leverage")!;
+    const table = ratioTableForFinancials(iag, leverage, "annual");
+    const netDebt = table.cells.get("net-debt-ebitda")!;
+    // -1.02bn and -0.13x without the leases.
+    expect(netDebt[0]!.inputs[0] as number / B).toBeCloseTo(7.272 + 6.995 - 8.29);
+    expect(netDebt[0]!.inputs[1]).toBe(6.995 * B);
+    expect(netDebt[0]!.value).toBeCloseTo((7.272 + 6.995 - 8.29) / 7.951);
+    // A balance sheet without its lease line has no net debt, never one without leases beside years with them.
+    expect(netDebt[2]).toEqual({ value: "not-reported", inputs: ["not-reported", "not-reported", 6.214 * B] });
+    expect(table.rows.filter((row) => row.kind === "input").slice(0, 3).map((row) => row.label)).toEqual(["Net Debt", "incl. leases", "\u00f7 EBITDA"]);
+    // A total that already holds the lease line counts the leases once.
+    const held = annual({ ...year("2025-12-31", 7.272, 6.995, 8.29, 7.951), totalDebt: (7.272 + 6.995) * B });
+    expect(ratioTableForFinancials(held, leverage, "annual").cells.get("net-debt-ebitda")![0]!.inputs[0] as number / B).toBeCloseTo(7.272 + 6.995 - 8.29);
+    // Valuation's EV is market cap plus the same net debt.
+    const valuation = ratioTableForFinancials(iag, RATIO_TABS.find((tab) => tab.key === "valuation")!, "annual", [day("2025-12-31", 4)]);
+    expect(valuation.cells.get("ev-ebitda")![0]!.inputs[0] as number / B).toBeCloseTo(4 * 4.9 + 7.272 + 6.995 - 8.29);
+    // Delta's statements are dated by its 10-Q: finance leases are in total debt, operating leases are not added.
+    const delta = annual({
+      date: "2026-09-30", currency: "USD", dateSource: "sec", totalDebt: 12.851 * B, capitalLeaseObligations: 5.984 * B,
+      cashCashEquivalentsAndShortTermInvestments: 3.787 * B, ebitda: 9.3 * B,
+    });
+    const gaap = ratioTableForFinancials(delta, leverage, "annual");
+    expect(gaap.cells.get("net-debt-ebitda")![0]).toEqual({ value: (12.851 - 3.787) / 9.3, inputs: [(12.851 - 3.787) * B, 5.984 * B, 9.3 * B] });
+    expect(gaap.rows.find((row) => row.id === "net-debt-ebitda:1")!.label).toBe("excl. op. leases");
+    // The basis follows the standard the issuer reports in, not the form: Alibaba's 20-F is US GAAP, though no
+    // 10-K or 10-Q dates its rows.
+    const alibaba = annual({
+      date: "2026-03-31", currency: "CNY", dateSource: "provider", accountingStandard: "us-gaap", totalDebt: 180 * B,
+      capitalLeaseObligations: 21 * B, cashCashEquivalentsAndShortTermInvestments: 500 * B, ebitda: 190 * B,
+    });
+    expect(ratioTableForFinancials(alibaba, leverage, "annual").rows.find((row) => row.id === "net-debt-ebitda:1")!.label)
+      .toBe("excl. op. leases");
+    // No lease line anywhere: no row about them.
+    expect(ratioTableForFinancials(annual(year("2025-12-31", 7.272, undefined, 8.29, 7.951)), leverage, "annual")
+      .rows.filter((row) => row.def.id === "net-debt-ebitda").map((row) => row.label)).toEqual(["Net Debt / EBITDA", "Net Debt", "\u00f7 EBITDA"]);
+  });
+
   test("liquidity's runway reads the months ticker reads, at the quarter's burn and the trailing year's", () => {
     // A fiscal year to December, its last quarter's year on file, and an inflow quarter that turns the burn off.
     const quarter = (date: string, operatingCashFlow: number, cash: number): FinancialStatement => ({
@@ -229,6 +291,21 @@ describe("financial ratios", () => {
     const annual = ratioTableForFinancials(financials, liquidity, "annual");
     expect(annual.ratios.map((def) => def.id)).not.toContain("runway-quarter");
     expect(annual.cells.get("runway-ttm")!.map((cell) => cell.value)).toEqual([months(runway.trailing), 700 / (300 / 12)]);
+  });
+
+  test("the cash and quick ratios read cash + ST investments as the runway does, and receivables as short-term investments", () => {
+    // Viking's June 2025 quarter carries only its cash (33.88M); its ST investments (773.84M) are reported in other quarters.
+    const missing = period({ date: "2025-06-30", cashAndCashEquivalents: 33.88, currentLiabilities: 26 }, undefined, { shortTermTotalOnFile: true });
+    expect(evaluateRatio(ratio("cash-ratio"), missing)).toEqual({ value: "not-reported", inputs: ["not-reported", 26] });
+    expect(evaluateRatio(ratio("quick-ratio"), missing).value).toBe("not-reported");
+    expect(evaluateRatio(ratio("net-debt-ebitda"), { ...missing, statement: { ...missing.statement, totalDebt: 10, ebitda: 5 } }).value).toBe("not-reported");
+    // A balance sheet with no receivables line: the quick ratio is cash and investments over current liabilities.
+    const noReceivables = period({ date: "2025-09-30", cashCashEquivalentsAndShortTermInvestments: 714.6, currentLiabilities: 26.07 }, undefined, { shortTermTotalOnFile: true });
+    expect(evaluateRatio(ratio("quick-ratio"), noReceivables)).toEqual({ value: 714.6 / 26.07, inputs: [714.6, "not-reported", 26.07] });
+    expect(evaluateRatio(ratio("quick-ratio"), { ...noReceivables, statement: { ...noReceivables.statement, accountsReceivable: 10 } }).value)
+      .toBe(724.6 / 26.07);
+    // A filer that reports receivables in other periods is missing them in this one: not reported, not cash alone.
+    expect(evaluateRatio(ratio("quick-ratio"), { ...noReceivables, receivablesOnFile: true }).value).toBe("not-reported");
   });
 
   describe("quarterly valuation reads the trailing year", () => {

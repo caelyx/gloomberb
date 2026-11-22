@@ -1,3 +1,4 @@
+import { formatShortDate } from "../../../utils/datetime-format";
 import { resolveChartPalette } from "../../../components/chart/core/palette";
 import type { CompositeAxisDomain } from "../../../components/chart/composite/types";
 import { spanDigits } from "../../../components/chart-table";
@@ -5,7 +6,7 @@ import { colors, priceColor } from "../../../theme/colors";
 import type { TickerFinancials, PricePoint } from "../../../types/financials";
 import type { BrokerAccount, BrokerPortfolioPerformance } from "../../../types/trading";
 import type { Portfolio, TickerRecord } from "../../../types/ticker";
-import { formatCompact, formatNumber, formatPercentRaw } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact, formatNumber, formatPercentRaw } from "../../../utils/format";
 import { formatRelativeAge } from "../../../utils/datetime-format";
 import type { PriceHistoryIntegrity } from "../../../utils/price-history-integrity";
 import { instrumentFromTicker, type ChartRequest, type TickerInstrumentOptions } from "../../../market-data/request-types";
@@ -31,7 +32,7 @@ import {
   type DatedReturn,
   type WeightedReturnSeries,
   type ReturnHistoryResult,
-} from "./metrics";
+} from "../../../portfolio/return-metrics";
 import { getPortfolioPositionValue } from "./sector-model";
 import type { AnalyticsMetricRow } from "./view";
 import { qualifySharpeCadence, qualifyReturnTimestamps, type SharpeCadenceResult, type ReturnTimestampResult, type TimestampHistory } from "./sharpe-cadence";
@@ -57,10 +58,7 @@ function formatIsoDateMonthDay(value: string): string {
   const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!match) return value;
   const [, year, month, day] = match;
-  return new Date(Number(year), Number(month) - 1, Number(day)).toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-  });
+  return formatShortDate(new Date(Number(year), Number(month) - 1, Number(day)), { year: false });
 }
 
 function formatAccountFreshness(account: ResolvedPortfolioAccountState["account"] | undefined): string | null {
@@ -418,7 +416,7 @@ export function buildAnalyticsRiskRows({
 }): AnalyticsMetricRow[] {
   const unavailable = unvaluedCount > 0
     ? `${unvaluedCount} holding${unvaluedCount === 1 ? "" : "s"} unvalued; check prices and FX`
-    : historyIntegrity.length > 0 ? `Inconsistent OHLC history: ${historyIntegrity.map((entry) => entry.symbol).join(", ")}`
+    : historyIntegrity.length > 0 ? `Contradictory prices in the history: ${historyIntegrity.map((entry) => entry.symbol).join(", ")}`
     : unsupportedReason ?? (missingCount > 0 ? "Incomplete holding history" : null);
   const partial = formatRiskCoverage(coverage, missingCount);
   return [
@@ -427,19 +425,17 @@ export function buildAnalyticsRiskRows({
   ].map((row) => {
     const rowTimestamps = row.id === "beta" ? betaHoldingTimestamps ?? returnTimestamps : returnTimestamps;
     const reason = unavailable ?? (rowTimestamps && !rowTimestamps.supported ? rowTimestamps.reason : null)
-      ?? (row.id === "beta" && benchmarkIntegrity ? "SPY benchmark: inconsistent OHLC history"
+      ?? (row.id === "beta" && benchmarkIntegrity ? "SPY benchmark: contradictory prices in its history"
       : row.id === "beta" && benchmarkTimestamps && !benchmarkTimestamps.supported ? "SPY timestamps unverified"
       : row.id === "sharpe" && sharpeCadence && !sharpeCadence.supported ? sharpeCadence.reason : null);
     const sample = row.id === "beta" && returns && benchmarkReturns ? alignedAssetReturns(returns, benchmarkReturns) : returns;
-    const compactDate = (value: string) => new Date(`${value}T00:00:00Z`).toLocaleDateString("en-GB", {
-      day: "2-digit", month: "short", year: "2-digit", timeZone: "UTC",
-    }).replaceAll(" ", "");
+    const compactDate = (value: string) => formatShortDate(value, { day: "2-digit", year: "2-digit", utc: true }).replaceAll(" ", "");
     const window = sample?.length
       ? `${compactDate(sample[0]!.startDateKey)}–${compactDate(sample.at(-1)!.dateKey)} ·${sample.length}` : undefined;
     return {
       id: row.id,
       label: row.label,
-      value: reason ? "—" : formatNumber(row.value ?? undefined, 2),
+      value: reason ? MISSING_VALUE : formatNumber(row.value ?? undefined, 2),
       detail: reason ?? (row.value == null ? "Insufficient history for basket estimate" : window ?? (partial ? `Partial: ${partial}` : undefined)),
       color: colors.textMuted,
     };

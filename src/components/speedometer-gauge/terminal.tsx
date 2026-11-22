@@ -29,11 +29,16 @@ function blankGaugeLine(width: number): GaugeCell[] {
   return Array.from({ length: width }, () => ({ char: " " }));
 }
 
+/** The cells a label centred on `center` takes, kept inside the row. */
+function textSpan(width: number, label: string, center: number): { text: string; start: number } {
+  const text = label.length > width ? label.slice(0, width) : label;
+  return { text, start: Math.max(0, Math.min(width - text.length, Math.round(center - text.length / 2))) };
+}
+
 function placeText(cells: GaugeCell[], label: string, center: number, color?: string): void {
   const width = cells.length;
   if (width <= 0) return;
-  const text = label.length > width ? label.slice(0, width) : label;
-  const start = Math.max(0, Math.min(width - text.length, Math.round(center - text.length / 2)));
+  const { text, start } = textSpan(width, label, center);
   for (let index = 0; index < text.length; index += 1) {
     cells[start + index] = { char: text[index]!, color };
   }
@@ -55,22 +60,38 @@ function cellsToChunks(cells: GaugeCell[]): GaugeChunk[] {
 function labelForSegment(segment: SpeedometerSegment, gaugeWidth: number): string {
   if (gaugeWidth >= 64) return segment.label;
   const compact = compactSegmentLabel(segment);
-  if (gaugeWidth >= 44) {
-    return compact === "NEUTRAL" ? "NEUT" : compact;
-  }
-  if (compact === "EXT FEAR") return "XF";
-  if (compact === "EXT GREED") return "XG";
-  if (compact === "NEUTRAL") return "NEUT";
-  return compact;
+  return compact === "NEUTRAL" ? "NEUT" : compact;
+}
+
+/** A label's last word ("EXT FEAR" is FEAR), for a dial with no room for both ends' whole names. */
+function lastWord(label: string): string {
+  return label.split(" ").at(-1) ?? label;
 }
 
 function renderLabelRow(width: number, min: number, max: number, segments: SpeedometerSegment[]): GaugeChunk[] {
   const cells = blankGaugeLine(width);
-  for (const segment of segments) {
-    const centerValue = (segment.from + segment.to) / 2;
-    const center = normalizeValue(centerValue, min, max) * (width - 1);
-    placeText(cells, labelForSegment(segment, width), center, segment.color);
-  }
+  const labels = segments.map((segment) => ({
+    segment,
+    label: labelForSegment(segment, width),
+    center: normalizeValue((segment.from + segment.to) / 2, min, max) * (width - 1),
+  }));
+  // Every label with a space between neighbours, else only the two ends: on a
+  // narrow dial the middle names ran together ("NEUTGREED").
+  let end = -2;
+  const fit = labels.every(({ label, center }) => {
+    const { text, start } = textSpan(width, label, center);
+    const clear = start > end + 1;
+    end = start + text.length - 1;
+    return clear;
+  });
+  const ends = fit || labels.length <= 2 ? labels : [labels[0]!, labels[labels.length - 1]!];
+  // Words, never letters: a narrow dial's ends read FEAR and GREED where
+  // EXT FEAR and EXT GREED would meet, not XF and XG (review, 12 Nov 2026).
+  const [first, last] = [ends[0], ends[ends.length - 1]];
+  const endsMeet = !fit && first && last && first !== last
+    && textSpan(width, first.label, first.center).start + first.label.length + 1 > textSpan(width, last.label, last.center).start;
+  const shown = endsMeet ? ends.map((entry) => ({ ...entry, label: lastWord(entry.label) })) : ends;
+  for (const { segment, label, center } of shown) placeText(cells, label, center, segment.color);
   return cellsToChunks(cells);
 }
 
@@ -210,7 +231,12 @@ export function TerminalSpeedometerGauge({
     pixelRatio = 1,
   } = useUiCapabilities();
   const nativeRenderer = useNativeRenderer();
-  const gaugeWidth = Math.max(minWidth, Math.min(maxWidth, Math.floor(width - 4)));
+  // Its preferred size, but never wider than the pane: a narrow docked pane
+  // wrapped the dial's rows into each other.
+  const gaugeWidth = Math.min(
+    Math.max(minWidth, Math.min(maxWidth, Math.floor(width - 4))),
+    Math.max(1, Math.floor(width - 2)),
+  );
   const labelRow = useMemo(() => renderLabelRow(gaugeWidth, min, max, segments), [gaugeWidth, max, min, segments]);
   const tickRow = useMemo(
     () => renderTickRow(gaugeWidth, min, max, colors),
@@ -266,7 +292,7 @@ export function TerminalSpeedometerGauge({
   ]);
 
   return (
-    <Box flexDirection="column" alignItems="center" marginTop={1}>
+    <Box flexDirection="column" alignItems="center" marginTop={1} flexShrink={0}>
       <GaugeLine chunks={labelRow} />
       <ChartSurface width={gaugeWidth} height={arcRows.length} flexDirection="column" bitmaps={bitmap ? [bitmap] : null}>
         {arcRows.map((chunks, index) => (

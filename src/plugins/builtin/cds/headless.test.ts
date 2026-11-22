@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { describe, expect, test } from "bun:test";
 import type { CloudCdsHistoryPointPayload, CloudCdsTradePayload } from "../../../api-client";
 import { deriveHeadlessFreshness } from "../../../cli/pane-functions/freshness";
@@ -69,7 +70,8 @@ const STATUS = { complete: true, unavailableSymbols: [] };
 /** A CSV line's cells, quotes taken off. */
 const csvCells = (line: string) => line.match(/("[^"]*"|[^,]*)(,|$)/g)!.map((cell) => cell.replace(/,$/, "").replace(/^"|"$/g, "")).slice(0, -1);
 /** The five fixed columns every export row ends with: symbol, unit, interval, source, as of. */
-const exportIdentity = (line: string) => csvCells(line).slice(-5);
+/** What an exported row is and is dated by: the five fixed columns before its retrieval time. */
+const exportIdentity = (line: string) => csvCells(line).slice(-6, -1);
 
 async function report(
   argument: string | null,
@@ -134,8 +136,8 @@ describe("CDS report", () => {
       loadHistory: async () => ({ ...FORD_LINE, change1W: null, change1M: null }),
     });
     expect(result.sections[0]!.entries!.find((entry) => entry.key === "change1mBp")?.value).toBeNull();
-    expect(text).toMatch(/1W change\s+--/);
-    expect(text).toMatch(/1M change\s+--/);
+    expect(text).toMatch(new RegExp(String.raw`1W change\s+${MISSING_VALUE}`));
+    expect(text).toMatch(new RegExp(String.raw`1M change\s+${MISSING_VALUE}`));
   });
 
   test("exports the daily 5Y levels, newest first, over --days", async () => {
@@ -176,6 +178,8 @@ describe("CDS report", () => {
       load: async () => ({ ...FORD, query: "Barclays PLC", issuer: "Barclays PLC", trades: [] }),
       loadHistory: async () => barclays,
     });
+    expect(result.sections[0]?.rows?.[0]).toMatchObject({ status: "not-derivable", spreadBp: null });
+    expect(result.errors).toBeUndefined();
     expect(result.notes).toEqual(["5Y level not derivable: DTCC prints carry upfront without payer side."]);
     expect(text).toContain("5Y level not derivable: DTCC prints carry upfront without payer side");
     expect(text).not.toContain("No 5Y spread level");
@@ -185,6 +189,59 @@ describe("CDS report", () => {
       loadHistory: async () => ({ ...barclays, issuer: null, points: [level("2025-10-17", 120)] }),
     });
     expect(stale.result.notes).toEqual(["5Y level not derivable after 2025-10-17: DTCC prints carry upfront without payer side."]);
+  });
+
+  test("quotes a print whose upfront is its points in a Points column, and names the issuer one way", async () => {
+    // Whirlpool, 27 Oct 2026: two prints keyed 6.5 and 15.25 into the spread field, spelled three ways on the tape.
+    const whirlpool = (id: string, executed: string, overrides: Partial<CloudCdsTradePayload>) => tape(id, executed, {
+      issuerName: "Whirlpool Corp", fixedRate: null, spreadNotation: "3", ...overrides,
+    });
+    const trades = normalizeCdsTrades([
+      tape("1", "2026-10-27T20:15:00Z", { issuerName: "WHIRLPOOL CORPORATION", fixedRate: 0.01, upfrontAmount: 1_232_374 }),
+      whirlpool("2", "2026-10-27T20:14:00Z", { maturityDate: "2028-12-20", reportedSpread: 0.00065, upfrontAmount: 319_861 }),
+      whirlpool("3", "2026-10-27T20:13:00Z", { maturityDate: "2029-12-20", reportedSpread: 0.001525, upfrontAmount: 757_361 }),
+      tape("4", "2026-10-27T19:34:00Z", { issuerName: "Whirlpool Corporation", fixedRate: 0.01, upfrontAmount: 895_000 }),
+    ]);
+    const { result, text, tables } = await report("WHR", {
+      load: async () => ({ ...FORD, query: "WHR", issuer: "Whirlpool Corporation", trades }),
+      loadHistory: async () => ({ ...FORD_LINE, issuer: "Whirlpool Corporation" }),
+    });
+    const rows = result.sections.find((section) => section.title === "Trades")!.rows!;
+    expect(rows.map((row) => [row.issuer, row.spreadBp, row.pointsUpfront])).toEqual([
+      ["Whirlpool Corporation", null, null],
+      ["Whirlpool Corporation", null, 6.5],
+      ["Whirlpool Corporation", null, 15.25],
+      ["Whirlpool Corporation", null, null],
+    ]);
+    expect(text).toMatch(new RegExp(String.raw`Whirlpool Corporation\s+2028-12-20\s+5M\+\s+USD\s+${MISSING_VALUE}\s+${MISSING_VALUE}\s+6\.5 pts\s+319\.9k USD`));
+    expect(text).not.toMatch(/Whirlpool Corp\s|WHIRLPOOL/);
+    const csv = renderReportCsv(selectReportTables(tables, "trades")).split("\n");
+    expect(csv[0]).toMatch(/^Time UTC,Issuer,Maturity,Notional,CCY,Coupon \(bp\),Spread \(bp\),Points,Abs upfront \(USD\),/);
+    expect(csvCells(csv[3]!).slice(1, 9)).toEqual(["Whirlpool Corporation", "2029-12-20", "5M+", "USD", "", "", "15.25", "757361"]);
+    // A tape without such a print keeps the columns it had.
+    const ford = await report("F", { load: async () => FORD, loadHistory: async () => FORD_LINE });
+    expect(ford.text).not.toContain("Points");
+  });
+
+  test("says no CDS issuer matches a name the covered issuers and the tape both lack, and offers the closest", async () => {
+    const nothing: CdsSpreadHistory = { ...FORD_LINE, issuer: null, points: [], change1W: null, change1M: null };
+    const unmatched = (typed: string, nearest: string[]) => report(typed, {
+      load: async () => ({ ...FORD, query: typed, issuer: typed, trades: [], unmatched: { nearest } }),
+      loadHistory: async () => nothing,
+    });
+    const typo = await unmatched("goodyer", ["The Goodyear Tire & Rubber Company"]);
+    expect(typo.text).toContain("No CDS issuer matches goodyer. Closest covered issuers: The Goodyear Tire & Rubber Company.");
+    expect(typo.text).not.toContain("No 5Y spread level");
+    const far = await unmatched("getty images", []);
+    expect(far.text).toContain("No CDS issuer matches getty images.");
+    expect(far.result.notes).toEqual(["fn CDS lists the covered issuers."]);
+    // A name the tape still knows by its own spelling reads as that issuer.
+    const nokia = await report("nokia", {
+      load: async () => ({ ...FORD, query: "nokia", issuer: "nokia", trades: [], unmatched: { nearest: [] } }),
+      loadHistory: async () => ({ ...FORD_LINE, issuer: "Nokia Oyj" }),
+    });
+    expect(nokia.result.sections[0]!.title).toBe("Nokia Oyj");
+    expect(nokia.text).toContain("No CDS trades for nokia in the last 5 days.");
   });
 
   test("lists issuers with their 5Y level and its date from one request, however many are listed", async () => {
@@ -246,7 +303,7 @@ describe("CDS report", () => {
     // last trade), or by its last trade without one: never the day of the newest row.
     const lines = renderReportCsv(headlessReportTables(cdsHeadless, result, args(null), "CDS", freshness, STATUS), freshness).split("\n");
     const cells = (line: string) => line.match(/("[^"]*"|[^,]*)(,|$)/g)!.map((cell) => cell.replace(/,$/, "").replace(/^"|"$/g, "")).slice(0, -1);
-    const identity = (issuer: string) => cells(lines.find((row) => cells(row)[0] === issuer)!).slice(-5);
+    const identity = (issuer: string) => cells(lines.find((row) => cells(row)[0] === issuer)!).slice(-6, -1);
     expect(identity("Issuer 7 Holdings")).toEqual(["Issuer 7 Holdings", "bp", "", "DTCC", "2026-10-07"]);
     expect(identity("Amazon.com, Inc.")).toEqual(["Amazon.com, Inc.", "bp", "", "DTCC", "2026-10-09"]);
     expect(identity("Ford Motor Company")).toEqual(["Ford Motor Company", "bp", "", "DTCC", "2026-10-09T13:21:00.000Z"]);
@@ -330,7 +387,7 @@ describe("CDS report", () => {
     // The bp level stays beside the quote, with the coupon the points are on.
     expect(rows[2]).toMatchObject({ quote: "upfront", spread5yBp: 18654.4, couponBp: 500 });
     expect(text).toMatch(/VIRGIN MEDIA FINANCE PLC\s+1\s+2026-10-09 18:00\s+57\.6 pts\s+\+10\.9 pts\s+\+36\.1 pts\s+2026-10-08/);
-    expect(text).toMatch(/American Airlines Group Inc\.\s+1\s+2026-10-09 17:00\s+512bp\s+--\s+--\s+2026-10-01/);
+    expect(text).toMatch(new RegExp(String.raw`American Airlines Group Inc\.\s+1\s+2026-10-09 17:00\s+512bp\s+${MISSING_VALUE}\s+${MISSING_VALUE}\s+2026-10-01`));
     expect(text).not.toContain("18654");
     // Exports write the number and its unit, as the index board's do.
     const csv = renderReportCsv(tables).split("\n");

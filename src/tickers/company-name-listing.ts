@@ -1,32 +1,111 @@
 import { logFailure } from "../utils/log-failure";
 import type { DataProvider } from "../types/data-provider";
+import type { Quote } from "../types/financials";
 import type { InstrumentSearchResult } from "../types/instrument";
-import { canonicalExchange, isUsListingExchange, parsePublicTickerKey } from "../utils/exchanges";
-import { companyNameMatch, sameCompany, shortCompanyName } from "./company-name";
+import { canonicalExchange, isUsEquityExchange, isUsListingExchange, parsePublicTickerKey } from "../utils/exchanges";
+import { companyLines, companyNameExtraWords, companyNameMatch, foldNameLetters, namedByService, runTogether, sameCompany, shortCompanyName } from "./company-name";
 import { LISTING_SEARCH_LIMIT } from "./search";
-import { lineDistance } from "./search/home-listing";
+import { isFundReceipt, lineDistance, primaryCompanyLine } from "./search/home-listing";
 import { classifyInstrumentKind, isCryptoInstrumentType } from "./search/ranking";
 import { isProviderBusy, type ProviderBusyError } from "../sources/provider-errors";
 import { readTerminalListingCode, type TerminalListing, type TerminalListingCode } from "./terminal-codes";
 import { hasNonLatinLetters } from "../utils/typed-text";
+import { formerIssuerLine } from "./ticker-changes";
+import { listingSuffixVenue } from "../sources/listing-symbols";
 
 export interface CompanyNameListing {
   symbol: string;
-  /** Canonical code of its exchange. */
+  /** Canonical code of its exchange; empty for a US symbol read bare (a line its company `moved` to). */
   exchange: string;
   /** The listing's name as search gives it. */
   name: string;
+  /** The service marked the listing with the name as typed (`searchAliases`): the company it means by it. */
+  named?: true;
+  /** The service marks the listing as its company's home line (`homeListing`). */
+  home?: true;
   /**
    * When the listing is a fund or an index carrying the name ("JP Morgan" read
    * as ^JTEK, JP MORGAN ETF TRUS), the company's common stock the name says
    * run together (JPM, JPMorgan Chase & Co.), which the reader is asked about.
    */
   meant?: Omit<CompanyNameListing, "meant">;
+  /**
+   * When the company's US line, which search still lists, moved to another
+   * symbol and this is the line it trades as now (GETY became GETYQ): the
+   * change in one line, "GETY became GETYQ on 2026-10-22".
+   */
+  moved?: string;
+  /**
+   * The company's own lines on other venues, where it is listed more than
+   * once under one symbol and name (ESLT:TASE beside ESLT:NASDAQ), as
+   * `SYM:EXCH`: never a line quoting
+   * shares listed elsewhere (a regional German venue, OTC), a receipt, or a US
+   * line's other US venues, which quote the same shares.
+   */
+  otherLines?: string[];
 }
+
+/**
+ * Where a listing's company trades now when it moved off the symbol (GETY
+ * became GETYQ on 2026-10-22), from the line's quote (null when it has none)
+ * and the name search gives it: the symbol it took, and the change in one
+ * line. Null when it did not move, or that cannot be told.
+ */
+export type MovedLineLookup = (
+  listing: { symbol: string; exchange: string; quote: Quote | null; name: string | null },
+) => Promise<{ symbol: string; note: string } | null>;
 
 /** Share lines that are not the company's common stock, though search may type them as such. */
 const NOT_COMMON = /preferred|warrant|right|unit|note|bond|debenture/i;
+/**
+ * A bond a venue lists under its issuer's name and types as common stock
+ * ("Turkiye Is Bankasi A.S. 9.125% Perpetual Junior Subordinated Notes" in
+ * Munich): a coupon, a maturity or subordinated debt in the name. Never a stock's name.
+ */
+const DEBT_NAME = /\d(?:[.,]\d+)?\s?%|\bsubordinated\b|\b(?:notes?|bonds?|debentures?)\s+due\b|\bdue\s+(?:\d{1,2}\s+\p{L}+\s+)?(?:19|20)\d{2}\b/iu;
+
+/** Whether a search row is a bond or another line that is not the common share, by its type or by its name. */
+export function isDebtLine(type: string, name: string | null | undefined): boolean {
+  return NOT_COMMON.test(type) || DEBT_NAME.test(name ?? "");
+}
+
+/** Venues past which a company counts as listed broadly: its home market and at least two more lines abroad or by receipt. */
+const BROAD_COMPANY_LINES = 3;
 const RECEIPT = /depositary|^(?:ADR|ADS|GDR|CDR|BDR)$/i;
+
+/**
+ * The searches `findListingOfCompanyName` asks for a name: as typed, without
+ * its legal form, and in plain letters (Sabanci for Sabancı), as search finds
+ * a name venues spell without its accents.
+ */
+export function companyNameQueries(typed: string): string[] {
+  const name = typed.trim();
+  return [...new Set([name, shortCompanyName(name), foldNameLetters(shortCompanyName(name))])].filter(Boolean);
+}
+
+/**
+ * The search asked when the first answers list a company of three words or
+ * more only abroad or by receipts: its name without the first word, which
+ * finds the home line search misses under the whole name ("Hava Yollari"
+ * lists Türk Hava Yolları in Istanbul, "Is Bankasi" Türkiye İş Bankası).
+ * Null for a shorter name.
+ */
+function homeLineQuery(typed: string): string | null {
+  const words = foldNameLetters(shortCompanyName(typed.trim())).split(/\s+/).filter(Boolean);
+  return words.length >= 3 ? words.slice(1).join(" ") : null;
+}
+
+/** A word written as a ticker: capitals and digits, short, with a class or venue mark after a dot, dash, slash or colon. */
+const TICKER_WORD = /^\$?[A-Z0-9]{1,6}(?:[.\-/:][A-Z0-9]{1,6})*$/;
+
+/**
+ * Whether every word of a line is written as a ticker (`V MCO CPRT`, `0700 0005`), as a company's name, which has
+ * words longer than a ticker or in lower case (`Turk Hava Yollari`, `TURK HAVA YOLLARI`), is not.
+ */
+function wordsAreTickers(typed: string): boolean {
+  const words = typed.trim().split(/\s+/).filter(Boolean);
+  return words.length > 0 && words.every((word) => TICKER_WORD.test(word));
+}
 
 /** A list entry with a space inside is a company's name, never a symbol: "Whirlpool Corporation". */
 export function isCompanyNameInput(input: string): boolean {
@@ -50,7 +129,10 @@ export function isCompanyNameInput(input: string): boolean {
  * depositary receipt (SAP's NYSE line for "SAP SE"), so a receipt is the
  * listing only of a company listed by receipts alone (PDD); then the row the
  * service marks with the name, a US line, the shortest symbol (WHR before
- * WHR-A) and search's order. The row the service marks with the name as typed
+ * WHR-A) and search's order. The first then gives way to the line `search`
+ * calls the company's primary listing (`primaryCompanyLine`), though its name
+ * says more: "lufthansa" is LHA on XETRA, not LUFTHANSA on Budapest, a
+ * cross-listing with no search score. The row the service marks with the name as typed
  * (`searchAliases`: JPM for "JP Morgan", SIE for "SIEMENS AG", though its name
  * is Siemens Aktiengesellschaft) is named by it exactly. Contracts, preferred
  * shares and notes are never the listing. With `quoted`, a listing with no
@@ -70,50 +152,165 @@ export function isCompanyNameInput(input: string): boolean {
 export async function findListingOfCompanyName(
   dataProvider: Pick<DataProvider, "search"> & Partial<Pick<DataProvider, "getQuote">>,
   typed: string,
-  options: { meant?: boolean; oneWord?: boolean; quoted?: boolean } = {},
+  options: { meant?: boolean; oneWord?: boolean; quoted?: boolean; movedLine?: MovedLineLookup } = {},
 ): Promise<CompanyNameListing | null> {
   const name = typed.trim();
   if (!name) return null;
-  const queries = [...new Set([name, shortCompanyName(name)])].filter(Boolean);
+  const queries = companyNameQueries(name);
   const answers = await Promise.all(queries.map((query) => searchListings(dataProvider, query)));
   const busy = answers.find(isProviderBusy);
-  const results = answers.flatMap((answer) => Array.isArray(answer) ? answer : []);
-  const ranked = results.flatMap((result, order) => {
+  let results = answers.flatMap((answer) => Array.isArray(answer) ? answer : []);
+  let listed = rankCompanyLines(name, results, options);
+  // A company the answers list only abroad or by receipts (Türk Hava Yolları on Frankfurt and OTC) is searched again
+  // under its later words, which can list its home line: THYAO in Istanbul. A line of tickers (`V MCO CPRT`) that
+  // search found nothing for names no company, abroad or at home, so a shorter line would find nothing either.
+  const lead = listed.find((listing) => listing.namesCompany);
+  const tickersOnly = results.length === 0 && wordsAreTickers(name);
+  const again = !options.oneWord && !tickersOnly && (!lead || (!lead.home && lead.rank[3]! > 1)) ? homeLineQuery(name) : null;
+  if (again && !queries.includes(again)) {
+    const more = await searchListings(dataProvider, again);
+    if (Array.isArray(more) && more.length) {
+      results = [...results, ...more];
+      listed = rankCompanyLines(name, results, options);
+    }
+  }
+  // The service's first answer, marked as its company's home, with every word typed in its name word for word.
+  const servedFirst = listed.some((listing) => namedByService(name, listing.result)) ? undefined
+    : listed.find((listing) => listing.served && listing.namesCompany && listing.result.symbol.toUpperCase() !== name.toUpperCase());
+  const first = servedFirst ?? (options.oneWord ? broadlyListedInstead(listed) : undefined) ?? listed.find((listing) => listing.namesCompany);
+  return settleCompanyListing(dataProvider, name, first, listed, results, busy, options);
+}
+
+/** Search's rows that can be the company a name means, nearest the name first (`findListingOfCompanyName`). */
+function rankCompanyLines(name: string, results: readonly InstrumentSearchResult[], options: { oneWord?: boolean }) {
+  return results.flatMap((result, order) => {
     const exchange = listedExchange(result);
     const type = listedType(result);
     const named = namedByService(name, result);
     const match = named ? { extra: 0, abbreviated: 0 } : companyNameMatch(name, result.name);
-    if (!exchange || match == null || classifyInstrumentKind(type) === "derivative" || NOT_COMMON.test(type)
+    if (!exchange || match == null || classifyInstrumentKind(type) === "derivative" || isDebtLine(type, result.name)
       || parsePublicTickerKey(result.symbol).exchange) return [];
-    if (options.oneWord && (match.abbreviated > 0 || isCryptoInstrumentType(type) || !(order === 0 || named || match.extra === 0))) return [];
-    // A receipt is a company's shares too, however search types it ("Depositary Receipt" or "American Depositary Receipt").
-    const stock = classifyInstrumentKind(type) === "equity" || RECEIPT.test(type) ? 0 : 1;
+    // A word alone names a company by these lines only; the company's other lines are still its lines.
+    const namesCompany = !(options.oneWord && (match.abbreviated > 0 || isCryptoInstrumentType(type) || !(order === 0 || named || match.extra === 0)));
+    // A receipt is a company's shares too, however search types it ("Depositary Receipt" or "American Depositary Receipt"),
+    // unless it is one on a fund search lists under its name: the Tracker Fund's Thai receipt is the fund's line.
+    const stock = RECEIPT.test(type) ? (isFundReceipt(result, results) ? 1 : 0) : classifyInstrumentKind(type) === "equity" ? 0 : 1;
     const home = result.homeListing === true;
     const line = home ? 0 : 1 + lineDistance(type, exchange, result.symbol);
     return [{
-      result, exchange, stock, home,
+      result, exchange, stock, home, namesCompany,
+      // The service's first answer, marked as its company's home, with every word typed in its name word for word.
+      served: order === 0 && home && match.abbreviated === 0 && stock === 0 && classifyInstrumentKind(type) === "equity",
       rank: [match.extra, match.abbreviated, stock, line, named ? 0 : 1, isUsListingExchange(exchange) ? 0 : 1, result.symbol.length, order],
     }];
   }).sort((left, right) => {
     const at = left.rank.findIndex((value, index) => value !== right.rank[index]);
     return at < 0 ? 0 : left.rank[at]! - right.rank[at]!;
   });
-  const first = ranked[0];
+}
+
+type RankedCompanyLine = ReturnType<typeof rankCompanyLines>[number];
+
+/** At most this many of a company's other lines are named (`CompanyNameListing.otherLines`). */
+const MAX_OTHER_LINES = 2;
+
+/**
+ * The listing `findListingOfCompanyName` settles on from its first pick: the
+ * company's primary line, a quoted one, or the line it moved to.
+ * The company the service answers the name with first, and marks the home line of, is the one it means, though
+ * another line's name is nearer the one typed: "Panasonic" is Panasonic Holdings on JPX, not a Frankfurt line
+ * under the name it had before (Panasonic Corporation), whose lines would lead it to a Malaysian subsidiary.
+ * The row the service marks with the name outranks that answer, and a line whose symbol is the word typed is no answer to a name.
+ */
+async function settleCompanyListing(
+  dataProvider: Pick<DataProvider, "search"> & Partial<Pick<DataProvider, "getQuote">>,
+  name: string,
+  first: RankedCompanyLine | undefined,
+  listed: readonly RankedCompanyLine[],
+  results: readonly InstrumentSearchResult[],
+  busy: ProviderBusyError | undefined,
+  options: { meant?: boolean; quoted?: boolean; movedLine?: MovedLineLookup },
+): Promise<CompanyNameListing | null> {
   // Listings are named in Latin letters: a name in another script ("任天堂 ソニー") names none, answered or not.
   if (!first && busy && !hasNonLatinLetters(name)) throw busy;
   if (!first) return null;
-  // The first may give way to its company's other lines: as near the name and of its kind. Another line the
-  // service marks as a home is another company's (Siemens Ltd. on NSE, for "SIEMENS AG"), and so is a line
-  // named as that one is (Siemens Ltd. on BSE).
-  const otherHomes = new Set(ranked.filter((listing) => listing.home && listing !== first).map(({ result }) => plainName(result.name)));
-  otherHomes.delete(plainName(first.result.name));
-  const lines = ranked.filter((listing) => listing === first || (!listing.home && !otherHomes.has(plainName(listing.result.name))
-    && sameCompany(first.result.name, listing.result.name)
-    && listing.rank.slice(0, NAME_RANKS).every((value, index) => value === first.rank[index])));
-  const best = options.quoted ? await firstQuoted(dataProvider, lines) : first;
-  const found = { symbol: best.result.symbol.toUpperCase(), exchange: best.exchange, name: best.result.name };
+  // Another line the service marks as a home is another company's (Siemens Ltd. on NSE, for "SIEMENS AG"), and
+  // so is a line named as that one is (Siemens Ltd. on BSE).
+  const otherHomesThan = (lead: typeof first) => {
+    const homes = new Set(listed.filter((listing) => listing.home && listing !== lead).map(({ result }) => plainName(result.name)));
+    homes.delete(plainName(lead.result.name));
+    return homes;
+  };
+  // The listing `search` calls the company's primary leads, though its name says more than the one typed: the
+  // name typed opens what a search for it lists first (LHA on XETRA for "lufthansa", not LUFTHANSA on Budapest).
+  const named = namedByService(name, first.result);
+  const firstHomes = otherHomesThan(first);
+  // Never a line of another business its name is in (`companyLines`): Siemens Energy AG is not Siemens AG's.
+  const lead = first.home ? first : primaryCompanyLine(first, companyLines(first, listed, lineFacts).filter((listing) => listing === first
+    || (!listing.home && !firstHomes.has(plainName(listing.result.name)) && listing.stock === first.stock
+    && (!named || companyNameExtraWords(listing.result.name, first.result.name) != null))),
+  ({ result, exchange }) => ({ distance: lineDistance(listedType(result), exchange, result.symbol), score: result.popularity ?? null }),
+  { named });
+  // The lead may give way to its company's other lines: as near the name and of its kind.
+  const otherHomes = otherHomesThan(lead);
+  const lines = [lead, ...companyLines(lead, listed, lineFacts).filter((listing) => listing !== lead && !listing.home
+    && !otherHomes.has(plainName(listing.result.name))
+    && listing.rank.slice(0, NAME_RANKS).every((value, index) => value === lead.rank[index]))];
+  const quoted = options.quoted ? await firstQuoted(dataProvider, lines, options.movedLine) : { line: lead, moved: null };
+  const best = quoted.line;
+  const found: CompanyNameListing = quoted.moved
+    // The line it moved to is a US symbol, read bare as `quote` reads one (GETYQ, which trades over the counter).
+    ? { symbol: quoted.moved.symbol, exchange: "", name: best.result.name, moved: quoted.moved.note }
+    : {
+      // A vendor's venue suffix on the venue it names is the listing's own code: GARAN.IS on BIST is GARAN there. An
+      // index keeps the symbol its sources quote it by (XU100.IS, as ^GSPC): there is no share code to read it as.
+      symbol: /^index$/i.test(listedType(best.result).trim()) ? best.result.symbol.toUpperCase()
+        : suffixFree(best.result.symbol.toUpperCase(), best.exchange),
+      exchange: best.exchange, name: best.result.name,
+      ...namedByService(name, best.result) ? { named: true as const } : {},
+      ...best.home ? { home: true as const } : {},
+    };
+  // The same symbol under the same name: a line under another symbol or name can be another company's (AEON on AMEX
+  // beside Aeon Co.'s 8267 on JPX), however alike the names.
+  const bestSymbol = suffixFree(best.result.symbol.toUpperCase(), best.exchange);
+  const otherLines = quoted.moved || best.stock ? [] : [...new Set(companyLines(best, listed, lineFacts).flatMap((listing) => {
+    if (listing === best || listing.stock || listing.exchange === best.exchange || otherHomes.has(plainName(listing.result.name))) return [];
+    if (plainName(listing.result.name) !== plainName(best.result.name)) return [];
+    if (suffixFree(listing.result.symbol.toUpperCase(), listing.exchange) !== bestSymbol) return [];
+    if (lineDistance(listedType(listing.result), listing.exchange, listing.result.symbol) !== 0) return [];
+    // Over the counter, a line quotes shares listed elsewhere; so does another US venue of a US line (IEX).
+    if (listing.exchange.startsWith("OTC") || listing.exchange === "PNK" || listing.exchange === "PINK") return [];
+    if (isUsVenue(best.exchange) && (isUsVenue(listing.exchange) || isUsEquityExchange(listing.exchange))) return [];
+    return [`${suffixFree(listing.result.symbol.toUpperCase(), listing.exchange)}:${listing.exchange}`];
+  }))].slice(0, MAX_OTHER_LINES);
+  const listing = otherLines.length ? { ...found, otherLines } : found;
   const meant = best.stock && options.meant ? await stockNamedRunTogether(dataProvider, name, results) : null;
-  return meant ? { ...found, meant } : found;
+  return meant ? { ...listing, meant } : listing;
+}
+
+/**
+ * A company that merged away, found by its old name typed where a symbol goes
+ * ("Comerica"): search lists the company it merged into with the old one as
+ * its former issuer (FITB, formerly CMA, COMERICA INC). Its line, as `search`
+ * says it ("CMA was COMERICA until 2026, now Fifth Third Bancorp: FITB"), and
+ * the symbol it trades as now. Null when no row's former issuer is the name
+ * typed, and when search fails or is busy.
+ */
+export async function findFormerIssuerOfName(
+  dataProvider: Pick<DataProvider, "search">,
+  typed: string,
+): Promise<{ note: string; successor: string } | null> {
+  const name = typed.trim();
+  if (!/\p{L}/u.test(name)) return null;
+  const answer = await searchListings(dataProvider, name);
+  if (!Array.isArray(answer)) return null;
+  for (const result of answer) {
+    const former = result.formerIssuer;
+    if (!former?.symbol || !former.name || !former.until || !companyNameMatch(name, former.name)) continue;
+    const successor = former.successor?.symbol?.trim() ? former.successor : { symbol: result.symbol, name: result.name };
+    return { note: formerIssuerLine(former.symbol, former, successor), successor: successor.symbol.toUpperCase() };
+  }
+  return null;
 }
 
 /** The ranks that say how near a listing's name is to the one typed, and whether it is a stock: one company's lines share them. */
@@ -127,21 +324,50 @@ interface RankedListing {
   exchange: string;
 }
 
+/** A US exchange, or the US over-the-counter market a line moves to when it leaves one. */
+function isUsVenue(exchange: string): boolean {
+  return isUsListingExchange(exchange) || exchange.startsWith("OTC") || exchange === "PNK";
+}
+
 /**
  * The first of a company's lines, in their order, that has a quote: the first
  * itself, or when it has none, the first of the next few that does, asked
- * together. The first stands when none has a quote, when the source is too
- * busy to say, and when nothing here can ask for quotes.
+ * together. A first US line whose company moved to another symbol (GETY
+ * became GETYQ) is followed there before any other line, so a name never lands
+ * on a listing abroad that still quotes the old shares. The first stands when none has a quote,
+ * when the source is too busy to say, and when nothing here can ask for quotes.
  */
-async function firstQuoted<T extends RankedListing>(dataProvider: Partial<Pick<DataProvider, "getQuote">>, lines: readonly T[]): Promise<T> {
+async function firstQuoted<T extends RankedListing>(
+  dataProvider: Partial<Pick<DataProvider, "getQuote">>,
+  lines: readonly T[],
+  movedLine?: MovedLineLookup,
+): Promise<{ line: T; moved: { symbol: string; note: string } | null }> {
   const first = lines[0]!;
-  if (!dataProvider.getQuote) return first;
-  const quoted = ({ result, exchange }: RankedListing) => dataProvider.getQuote!(result.symbol.toUpperCase(), exchange).then(hasPrice);
+  const only = (line: T) => ({ line, moved: null });
+  if (!dataProvider.getQuote) return only(first);
+  const quoteOf = ({ result, exchange }: RankedListing) => dataProvider.getQuote!(result.symbol.toUpperCase(), exchange);
+  let quote: Quote | null = null;
   try {
-    if (await quoted(first)) return first;
+    quote = await quoteOf(first) ?? null;
   } catch (error) {
     // A busy source says nothing of the listing; any other failure is a listing with no quote.
-    if (isProviderBusy(error)) return first;
+    if (isProviderBusy(error)) return only(first);
+  }
+  if (movedLine && isUsVenue(first.exchange)) {
+    const symbol = first.result.symbol.toUpperCase();
+    const moved = await movedLine({ symbol, exchange: first.exchange, quote, name: first.result.name?.trim() || null });
+    if (moved && moved.symbol.toUpperCase() !== symbol) return { line: first, moved: { ...moved, symbol: moved.symbol.toUpperCase() } };
+  }
+  if (hasPrice(quote)) return only(first);
+  // A US line no source prices (ZION on IEX, as search lists it) is its symbol's: the US listing its own quote names
+  // and prices (ZION on NASDAQ), as `quote ZION` reads it. The US venues share one symbol, so it is the same company.
+  if (isUsEquityExchange(first.exchange)) {
+    const own = await dataProvider.getQuote(first.result.symbol.toUpperCase(), "").catch(() => {
+      // Intentional ignore: with no quote of its own, the symbol's other lines are asked below.
+      return null;
+    });
+    const venue = canonicalExchange(own?.listingExchangeName || own?.exchangeName);
+    if (hasPrice(own) && venue && venue !== first.exchange && isUsEquityExchange(venue)) return only({ ...first, exchange: venue });
   }
   const keys = new Set([listingKey(first)]);
   const next: T[] = [];
@@ -151,16 +377,48 @@ async function firstQuoted<T extends RankedListing>(dataProvider: Partial<Pick<D
     keys.add(listingKey(line));
     next.push(line);
   }
-  const priced = await Promise.all(next.map((line) => quoted(line).catch(() => {
+  const priced = await Promise.all(next.map((line) => quoteOf(line).then(hasPrice).catch(() => {
     // Intentional ignore: a line whose quote fails is a line with no quote.
     return false;
   })));
-  return next.find((_, index) => priced[index]) ?? first;
+  return only(next.find((_, index) => priced[index]) ?? first);
+}
+
+/**
+ * For a word that names several companies on one market ("Garanti"), the one
+ * the answer lists broadly when its top answer is a company it lists once:
+ * Türkiye Garanti Bankası, listed in Istanbul, over the counter and by
+ * receipts in New York and Frankfurt, is GARAN rather than Garanti Faktoring,
+ * the top answer. The company's line on the top answer's market is the
+ * listing. Undefined when the top answer is no lone company's stock or no
+ * other company named with the word, word for word, is listed broadly there.
+ */
+function broadlyListedInstead<T extends { result: InstrumentSearchResult; exchange: string; stock: number; namesCompany: boolean; rank: number[] }>(
+  listed: readonly T[],
+): T | undefined {
+  const top = listed.find((listing) => listing.rank.at(-1) === 0);
+  if (!top || !top.namesCompany || top.stock !== 0) return undefined;
+  const linesOf = (lead: T) => listed.filter((listing) => sameCompany(listing.result.name, lead.result.name));
+  if (new Set(linesOf(top).map((listing) => listing.exchange)).size > 1) return undefined;
+  return listed.find((listing) => listing.exchange === top.exchange && listing.stock === 0 && listing.rank[1] === 0
+    && !sameCompany(listing.result.name, top.result.name)
+    && linesOf(listing).length >= BROAD_COMPANY_LINES
+    && new Set(linesOf(listing).map((line) => line.exchange)).size >= BROAD_COMPANY_LINES - 1);
 }
 
 /** A name as two venues may spell it alike: "SIEMENS LTD" for Siemens Ltd. */
+/** A listing as `companyLines` weighs it. */
+function lineFacts({ result, exchange, home }: { result: InstrumentSearchResult; exchange: string; home: boolean }) {
+  return { name: result.name, exchange, receipt: RECEIPT.test(listedType(result)), home };
+}
+
+function suffixFree(symbol: string, exchange: string): string {
+  const own = listingSuffixVenue(symbol, exchange);
+  return own && own.exchange === exchange ? own.symbol : symbol;
+}
+
 function plainName(name: string | null | undefined): string {
-  return (name ?? "").normalize("NFKD").replace(/\p{M}/gu, "").toUpperCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  return foldNameLetters(name ?? "").toUpperCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
 
 function listingKey({ result, exchange }: RankedListing): string {
@@ -169,6 +427,50 @@ function listingKey({ result, exchange }: RankedListing): string {
 
 function hasPrice(quote: { price?: number } | null | undefined): boolean {
   return !!quote && Number.isFinite(quote.price) && quote.price !== 0;
+}
+
+/**
+ * Whether search marks a listing under another symbol with the word as typed
+ * (`searchAliases`): "siemens" marks SIE on XETRA, whose symbol is not the
+ * word. One search, the one `findListingOfCompanyName` asks first, so asking
+ * this before it costs nothing more.
+ */
+export async function marksAnotherListing(dataProvider: Partial<Pick<DataProvider, "search">>, word: string): Promise<boolean> {
+  // A source that cannot search marks nothing.
+  if (typeof dataProvider.search !== "function") return false;
+  const answer = await searchListings(dataProvider as Pick<DataProvider, "search">, word.trim());
+  return Array.isArray(answer) && answer.some((result) =>
+    result.symbol.toUpperCase() !== word.trim().toUpperCase() && namedByService(word, result));
+}
+
+/**
+ * The listing under another symbol the service marks with the word as typed
+ * (`searchAliases`), off `exchange`: "NTT" marks 9432 on JPX (NTT, Inc.),
+ * which a bare NTT read on Warsaw is not. The search `marksAnotherListing`
+ * asks; null when it marks none, cannot search or is too busy to say.
+ */
+export async function serviceMarkedOtherListing(dataProvider: Partial<Pick<DataProvider, "search">>, word: string,
+  exchange: string): Promise<{ symbol: string; exchange: string; name: string } | null> {
+  if (typeof dataProvider.search !== "function") return null;
+  const answer = await searchListings(dataProvider as Pick<DataProvider, "search">, word.trim());
+  const marked = Array.isArray(answer) ? answer.find((result) => result.symbol.toUpperCase() !== word.trim().toUpperCase()
+    && namedByService(word, result) && !!listedExchange(result) && listedExchange(result) !== canonicalExchange(exchange)
+    && !parsePublicTickerKey(result.symbol).exchange) : undefined;
+  return marked ? { symbol: marked.symbol.toUpperCase(), exchange: listedExchange(marked), name: marked.name } : null;
+}
+
+/**
+ * The listing of `symbol` the service marks with `word` (`^VIX` on CXI for
+ * "VIX"), as `marksAnotherListing` reads the same search; null when search
+ * marks no listing of it, cannot search or is too busy to say.
+ */
+export async function serviceMarkedListing(dataProvider: Partial<Pick<DataProvider, "search">>, word: string,
+  symbol: string): Promise<{ symbol: string; exchange: string; name: string } | null> {
+  if (typeof dataProvider.search !== "function") return null;
+  const answer = await searchListings(dataProvider as Pick<DataProvider, "search">, word.trim());
+  const marked = Array.isArray(answer) ? answer.find((result) => result.symbol.toUpperCase() === symbol.toUpperCase()
+    && namedByService(word, result)) : undefined;
+  return marked ? { symbol: marked.symbol.toUpperCase(), exchange: listedExchange(marked), name: marked.name } : null;
 }
 
 function searchListings(dataProvider: Pick<DataProvider, "search">, query: string): Promise<InstrumentSearchResult[] | ProviderBusyError> {
@@ -186,18 +488,6 @@ function listedExchange(result: InstrumentSearchResult): string {
 
 function listedType(result: InstrumentSearchResult): string {
   return result.brokerContract?.secType || result.type || "";
-}
-
-/** Letters and digits only, in capitals: "JP Morgan" and "JPMorgan" are JPMORGAN. */
-function runTogether(text: string): string {
-  return text.normalize("NFKD").replace(/\p{M}/gu, "").toUpperCase().replace(/[^\p{L}\p{N}]/gu, "");
-}
-
-/** Whether the service marked the row with the name as typed: the company it means by it. */
-export function namedByService(typed: string, result: InstrumentSearchResult): boolean {
-  const wanted = runTogether(typed);
-  return !!wanted && Array.isArray(result.searchAliases)
-    && result.searchAliases.some((alias) => typeof alias === "string" && runTogether(alias) === wanted);
 }
 
 /**
@@ -237,13 +527,40 @@ const shareClassSymbol = (symbol: string) => symbol.trim().toUpperCase().replace
  * be too ("Putnam US Equity", "Global US Equity"), so one for the US, or typed
  * in lower case, is one only when search lists its root there (JPM on a US
  * exchange, VOD on LSE); otherwise it is the name it reads as, and is searched
- * as one. One in capitals naming a venue abroad (`MC FP`) is one as typed: the
- * venue's own check speaks when the symbol is not there. A code that can name
+ * as one. One in capitals naming a venue abroad (`MC FP`), or the US with its
+ * yellow key as the terminal writes it (`SEAS US Equity`, never all in
+ * capitals), is one as typed: the venue's own check speaks
+ * when the symbol is not there. A code that can name
  * several listings (`VOLVB SS` is VOLVB or VOLV.B in Stockholm, `RY CN`
  * Toronto or the Venture exchange) is the first of them search lists. A
  * search that fails says nothing either way, and the code stands. Null for
  * anything else.
  */
+/**
+ * Whether a terminal code is looked for in search before it is taken: its
+ * root in capitals and its yellow key typed as the terminal shows it (`SEAS
+ * US Equity`), a US code is one as typed, as a code abroad is: a line that
+ * stopped trading is one search no longer lists, and it is still that symbol,
+ * never a name. All in capitals (`PUTNAM US EQUITY`) it may be a fund's name,
+ * so search decides; so it does for a root in lower case.
+ */
+function terminalCodeVerified(code: TerminalListingCode): boolean {
+  const us = !code.exchange || isUsListingExchange(code.exchange);
+  const keyed = /\s[Ee]quity$/.test(code.typed) && !/\p{Ll}/u.test(code.typed.split(" ")[0]!);
+  return (us && !keyed) || /\p{Ll}/u.test(code.typed.split(" ")[0]!);
+}
+
+/**
+ * A terminal's code read as its listing with no search (`VOD LN`, `7203 JT`,
+ * `SAFE LN Equity`), as `readTerminalCodeArg` takes it; null for a code it
+ * looks for in search first, and for anything that is no code. A pasted
+ * list asks nothing for these but their quotes.
+ */
+export function settledTerminalCode(typed: string): TerminalListingCode | null {
+  const code = readTerminalListingCode(typed);
+  return code?.market && !code.alternatives && !terminalCodeVerified(code) ? code : null;
+}
+
 export async function readTerminalCodeArg(
   dataProvider: Pick<DataProvider, "search">,
   typed: string,
@@ -251,7 +568,7 @@ export async function readTerminalCodeArg(
   const code = readTerminalListingCode(typed);
   if (!code?.market) return code;
   const us = !code.exchange || isUsListingExchange(code.exchange);
-  const verify = us || /\p{Ll}/u.test(code.typed.split(" ")[0]!);
+  const verify = terminalCodeVerified(code);
   if (!verify && !code.alternatives) return code;
   const listings: TerminalListing[] = [code, ...code.alternatives ?? []];
   try {

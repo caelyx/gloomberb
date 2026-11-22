@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, jest, test } from "bun:test";
+import { afterEach, describe, expect, jest, spyOn, test } from "bun:test";
 import {
   ConnectionHealthRegistry,
   GLOOM_CLOUD_SOCKET_CONNECTION_ID,
   type ConnectionHealthStatus,
 } from "../core/connection-health";
-import { CloudApiSocket } from "./socket";
+import { CloudApiSocket, SOCKET_CONNECT_TIMEOUT_MS, SOCKET_FIRST_RECONNECT_MAX_MS, SOCKET_PING_ANSWER_MS, SOCKET_QUIET_PING_MS } from "./socket";
+import { followDataServiceHealth, QUOTE_STREAM_DOWN_GRACE_MS } from "../market-data/connection-follow";
 import { createTestSocketDeps, TestWebSocket } from "../test-support/cloud-api";
 
 const originalWebSocket = globalThis.WebSocket;
@@ -149,12 +150,191 @@ describe("CloudApiSocket connection health", () => {
       expect(() => socket.subscribeQuotes([{ symbol: "AAPL" }], () => {})).not.toThrow();
       expect(health.getSnapshot().sources[0]).toMatchObject({ status: "error", currentDetail: "blocked by the page" });
       refuse = false;
-      jest.advanceTimersByTime(2_000);
+      jest.advanceTimersByTime(SOCKET_FIRST_RECONNECT_MAX_MS);
       expect(sockets.map((opened) => opened.url)).toEqual(["wss://api.example.test/api/cloud/ws"]);
       sockets[0]!.open();
       expect(health.getSnapshot().sources[0]).toMatchObject({ status: "connected", socketState: "open" });
     } finally {
       socket.dispose();
+    }
+  });
+});
+
+// A half-open link (a laptop that slept, a network that changed) left prices
+// frozen for over a minute: nothing noticed a connection that stopped
+// answering, or one that never finished opening.
+describe("CloudApiSocket on a link that stops answering", () => {
+  test("a connection that never opens is given up after ten seconds and tried again", () => {
+    jest.useFakeTimers();
+    const sockets = installStrictWebSocket();
+    const health = healthWithSocketSource();
+    const socket = new CloudApiSocket(createTestSocketDeps(), health);
+    try {
+      socket.subscribeQuotes([{ symbol: "AAPL" }], () => {});
+      jest.advanceTimersByTime(SOCKET_CONNECT_TIMEOUT_MS - 1);
+      expect(sockets[0]!.closeCalls).toBe(0);
+      jest.advanceTimersByTime(1);
+      expect(sockets[0]!.closeCalls).toBe(1);
+      expect(health.getSnapshot().sources[0]).toMatchObject({ socketState: "error", currentDetail: "Connecting timed out" });
+      jest.advanceTimersByTime(SOCKET_FIRST_RECONNECT_MAX_MS);
+      expect(sockets).toHaveLength(2);
+    } finally {
+      socket.dispose();
+    }
+  });
+
+  test("a quiet connection is pinged, kept while it answers, and dropped and opened again once it goes silent", () => {
+    jest.useFakeTimers();
+    const sockets = installStrictWebSocket();
+    const health = healthWithSocketSource();
+    const details: string[] = [];
+    health.subscribe(() => {
+      const source = health.getSnapshot().sources[0];
+      if (source?.socketState === "error") details.push(source.currentDetail ?? "");
+    });
+    let answered = 0;
+    const socket = new CloudApiSocket(createTestSocketDeps({ onServiceAnswered: () => { answered += 1; } }), health);
+    try {
+      socket.subscribeQuotes([{ symbol: "AAPL" }], () => {});
+      const first = sockets[0]!;
+      first.open();
+      first.receive({ type: "ready", features: [] });
+      // Opening and every frame say the service answers.
+      expect(answered).toBe(2);
+
+      jest.advanceTimersByTime(SOCKET_QUIET_PING_MS + 2_500);
+      expect(first.sent).toContainEqual({ type: "ping" });
+      first.receive({ type: "pong" });
+      jest.advanceTimersByTime(SOCKET_QUIET_PING_MS);
+      expect(first.closeCalls).toBe(0);
+
+      // The next ping goes unanswered: the link is half open, and is dropped and opened again.
+      expect(first.sent.filter((frame) => (frame as { type?: string }).type === "ping")).toHaveLength(2);
+      jest.advanceTimersByTime(SOCKET_PING_ANSWER_MS + 2_500 + SOCKET_FIRST_RECONNECT_MAX_MS);
+      expect(first.closeCalls).toBe(1);
+      expect(details).toEqual(["No answer from the stream"]);
+      expect(sockets).toHaveLength(2);
+      sockets[1]!.open();
+      expect(sockets[1]!.sent).toContainEqual({ type: "market.subscribe", symbols: [{ symbol: "AAPL", exchange: "" }] });
+    } finally {
+      socket.dispose();
+    }
+  });
+
+  // A hidden tab runs its timers late, and a laptop wakes with a clock far
+  // ahead: the late check found a working connection silent and dropped it.
+  test("a check that runs late pings first, and keeps a connection that answers", () => {
+    jest.useFakeTimers();
+    const sockets = installStrictWebSocket();
+    const health = healthWithSocketSource();
+    const socket = new CloudApiSocket(createTestSocketDeps(), health);
+    const timerClock = Date.now.bind(Date);
+    const clockAhead = spyOn(Date, "now");
+    try {
+      socket.subscribeQuotes([{ symbol: "AAPL" }], () => {});
+      const first = sockets[0]!;
+      first.open();
+      first.receive({ type: "ready", features: [] });
+
+      // The next check runs a minute after the last frame.
+      clockAhead.mockImplementation(() => timerClock() + 60_000);
+      jest.advanceTimersByTime(2_500);
+      expect(first.closeCalls).toBe(0);
+      expect(first.sent).toContainEqual({ type: "ping" });
+      first.receive({ type: "pong" });
+      jest.advanceTimersByTime(SOCKET_PING_ANSWER_MS);
+      expect(first.closeCalls).toBe(0);
+      expect(sockets).toHaveLength(1);
+    } finally {
+      clockAhead.mockRestore();
+      socket.dispose();
+    }
+  });
+});
+
+// A backend deploy cuts every open stream (close 1001, or 1006 with the error
+// the browser fires first), and the client is back within a second or two:
+// prices must not flash stale for it. A stream that never opened, or went
+// silent, has already waited out its failure and reads stale at once.
+describe("CloudApiSocket quote stream going stale", () => {
+  function followedSocket() {
+    jest.useFakeTimers();
+    const sockets = installStrictWebSocket();
+    const health = healthWithSocketSource();
+    const calls: string[] = [];
+    const stopFollowing = followDataServiceHealth(health, {
+      reloadAfterOutage: () => {},
+      setQuoteStreamDown: (since) => calls.push(since == null ? "live" : "down"),
+    });
+    const socket = new CloudApiSocket(createTestSocketDeps(), health);
+    socket.subscribeQuotes([{ symbol: "AAPL" }], () => {});
+    const first = sockets[0]!;
+    first.open();
+    first.receive({ type: "ready", features: [] });
+    calls.length = 0;
+    return { calls, first, health, sockets, stop: () => { socket.dispose(); stopFollowing(); } };
+  }
+
+  /** What the browser does to an open socket the server or a proxy cuts. */
+  function cut(socket: TestWebSocket): void {
+    socket.onerror?.({});
+    socket.closeWith({ code: 1006, reason: "" });
+  }
+
+  test("an open socket that is cut is stale only once the grace runs out, and not when it reconnects within it", () => {
+    const { calls, first, health, sockets, stop } = followedSocket();
+    try {
+      cut(first);
+      expect(health.socketState(GLOOM_CLOUD_SOCKET_CONNECTION_ID)).toBe("closed");
+      jest.advanceTimersByTime(QUOTE_STREAM_DOWN_GRACE_MS - 1);
+      expect(calls).toEqual([]);
+      // No reconnect opened in time.
+      jest.advanceTimersByTime(1);
+      expect(calls).toEqual(["down"]);
+
+      sockets[1]!.open();
+      expect(calls).toEqual(["down", "live"]);
+
+      calls.length = 0;
+      cut(sockets[1]!);
+      // The first reconnect waits at most 2.25 s, inside the grace.
+      jest.advanceTimersByTime(SOCKET_FIRST_RECONNECT_MAX_MS);
+      expect(sockets).toHaveLength(3);
+      sockets[2]!.open();
+      jest.advanceTimersByTime(QUOTE_STREAM_DOWN_GRACE_MS * 2);
+      expect(calls).toEqual(["live"]);
+    } finally {
+      stop();
+    }
+  });
+
+  test("a reconnect that fails to connect is stale at once", () => {
+    const { calls, first, health, sockets, stop } = followedSocket();
+    try {
+      cut(first);
+      jest.advanceTimersByTime(SOCKET_FIRST_RECONNECT_MAX_MS);
+      expect(calls).toEqual([]);
+      // The new socket never opens: the server is still down.
+      sockets[1]!.onerror?.({});
+      expect(health.socketState(GLOOM_CLOUD_SOCKET_CONNECTION_ID)).toBe("error");
+      expect(calls).toEqual(["down"]);
+    } finally {
+      stop();
+    }
+  });
+
+  test("an open socket whose ping goes unanswered is stale at once", () => {
+    const { calls, first, health, stop } = followedSocket();
+    try {
+      jest.advanceTimersByTime(SOCKET_QUIET_PING_MS);
+      expect(first.sent).toContainEqual({ type: "ping" });
+      jest.advanceTimersByTime(SOCKET_PING_ANSWER_MS - 1);
+      expect(calls).toEqual([]);
+      jest.advanceTimersByTime(1);
+      expect(health.socketState(GLOOM_CLOUD_SOCKET_CONNECTION_ID)).toBe("error");
+      expect(calls).toEqual(["down"]);
+    } finally {
+      stop();
     }
   });
 });

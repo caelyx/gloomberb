@@ -2,6 +2,7 @@ import { publishedWeekClose } from "../analytics/sharpe-cadence";
 import { historyStatistics } from "../../../components/chart/curve/model";
 import type { CloudPricePointPayload } from "../../../api-client/types";
 import { getSectorCollection } from "../sectors/sector-data";
+import { rotationQuadrant, rotationSeries, type RotationQuadrantName } from "../alerts/metric-model";
 import { indexHomeExchange, publicListingVenue } from "../../../sources/listing-target";
 import {
   canonicalExchange,
@@ -12,6 +13,8 @@ import {
 const DAY = 86_400_000;
 const WEEK = 7 * DAY;
 export const ROTATION_LIMIT = 24;
+/** RRG's benchmark when none is chosen; RRG alerts default to it too. */
+export const DEFAULT_ROTATION_BENCHMARK = "SPY:NYSEARCA";
 export interface RotationInstrument {
   symbol: string;
   exchange: string;
@@ -47,8 +50,7 @@ export interface RotationRow {
   asOf: string | null;
   strength: number | null;
   momentum: number | null;
-  quadrant:
-    "Leading" | "Weakening" | "Lagging" | "Improving" | "Neutral" | null;
+  quadrant: RotationQuadrantName | null;
   strengthRank: RotationRank;
   momentumRank: RotationRank;
   relativeReturn13w: number | null;
@@ -155,21 +157,8 @@ function rotationRank(
     lastDate: stats.endDate,
   };
 }
-export function rotationQuadrant(
-  strength: number | null,
-  momentum: number | null,
-): RotationRow["quadrant"] {
-  if (strength == null || momentum == null) return null;
-  if (Math.abs(strength - 100) < 1e-9 || Math.abs(momentum - 100) < 1e-9)
-    return "Neutral";
-  return strength > 100
-    ? momentum > 100
-      ? "Leading"
-      : "Weakening"
-    : momentum > 100
-      ? "Improving"
-      : "Lagging";
-}
+/** The weekly strength, momentum and quadrant math is the RRG alert's, shared with Gloom Cloud's delivery. */
+export { rotationQuadrant };
 export function buildRotation(
   benchmark: RotationHistory,
   instruments: RotationHistory[],
@@ -225,10 +214,12 @@ export function buildRotation(
   const benchmarkUsable = !!benchmark.currency && !!asOf;
   const rows = instruments.map((source): RotationRow => {
     const closes = rotationCloses(source.points, through);
+    // A benchmark with no usable weeks says so once in `gaps`; its rows are not to blame for it.
     const gaps = [
       source.error,
       source.stale ? "History is stale." : null,
-      source.currency !== benchmark.currency || !source.currency
+      benchmarkUsable &&
+      (source.currency !== benchmark.currency || !source.currency)
         ? "Price currency does not match the benchmark."
         : null,
     ].filter((x): x is string => !!x);
@@ -246,34 +237,16 @@ export function buildRotation(
         ? ratio
         : null;
     });
-    const strengths = ratios.map((ratio, index) => {
-      const window = ratios.slice(Math.max(0, index - 12), index + 1);
-      if (
-        ratio == null ||
-        window.length !== 13 ||
-        window.some((value) => value == null)
-      )
-        return null;
-      const mean =
-        (window as number[]).reduce((sum, value) => sum + value, 0) / 13;
-      return (100 * ratio) / mean;
-    });
+    const series = rotationSeries(ratios);
     const history = weeks.map((week, index): RotationPoint => {
-      const strength = strengths[index] ?? null,
-        previous = index >= 4 ? (strengths[index - 4] ?? null) : null;
-      const contiguous =
-        index >= 4 &&
-        strengths.slice(index - 4, index + 1).every((value) => value != null);
+      const { strength, momentum } = series[index]!;
       const priorRatio = index >= 13 ? (ratios[index - 13] ?? null) : null,
         ratio = ratios[index] ?? null;
       return {
         date: weekly.get(week)?.date ?? week,
         week,
         strength,
-        momentum:
-          strength != null && previous != null && contiguous
-            ? (100 * strength) / previous
-            : null,
+        momentum,
         relativeReturn13w:
           ratio != null &&
           priorRatio != null &&
@@ -290,7 +263,10 @@ export function buildRotation(
       Number.isFinite(latest.strength) &&
       latest.momentum != null &&
       Number.isFinite(latest.momentum);
-    if (!latest || latest.strength == null || latest.momentum == null)
+    if (
+      benchmarkUsable &&
+      (!latest || latest.strength == null || latest.momentum == null)
+    )
       gaps.push(
         "At least 17 contiguous matched weekly closes are required; a missing week breaks the trail.",
       );

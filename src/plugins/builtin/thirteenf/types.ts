@@ -48,6 +48,12 @@ export interface ThirteenFHoldingRecord {
   votingAuthorityShared: number | null;
   votingAuthorityNone: number | null;
   putCall: string;
+  /**
+   * How the SEC's newest 13(f) securities list marks the CUSIP: added or
+   * deleted since the list before. An issuer's old CUSIP deleted and a new
+   * one added confirms its shares moved to the new one. Absent otherwise.
+   */
+  secListStatus?: "added" | "deleted";
 }
 
 export interface ThirteenFTickerInfo {
@@ -99,6 +105,26 @@ export interface FundDetailData {
   warnings?: string[];
   /** Set when the latest report predates the newest quarter past its deadline. */
   filingGap?: ThirteenFFilingGap | null;
+  /** A refresh failed and the oldest copy that answered instead was saved at this time (ms). */
+  savedAt?: number;
+  /** The parts still loading, while the fund fills in (loadFundDetail's `onProgress`); absent once whole. */
+  loading?: ThirteenFDetailLoading;
+  /**
+   * The prior quarter is on file but its holdings did not load: the header
+   * says so rather than "No prior quarter". `retryAfterSeconds` when the
+   * service said how long to wait.
+   */
+  comparisonFailed?: { retryAfterSeconds: number | null };
+}
+
+/** Parts of a fund's detail still loading. */
+export interface ThirteenFDetailLoading {
+  /** The latest report's holdings are a large filing's first rows. */
+  positions?: boolean;
+  /** The prior quarter's holdings, which the latest are compared with. */
+  comparison?: boolean;
+  /** EDGAR's filing list, for a fund behind on its filings. */
+  filingGap?: boolean;
 }
 
 /** A manager a 13F-NT names as reporting its holdings. */
@@ -175,6 +201,14 @@ export interface FundHoldingRow {
   splitRatio?: number;
   /** The line moved as across a split and its corporate actions could not be read to tell: Est P&L is left empty, not priced as a crash or a surge, and its share change stays as filed. */
   splitUnread?: boolean;
+  /** With `splitUnread`: the lookups' time ran out before its corporate actions were read. */
+  splitLate?: boolean;
+  /**
+   * A split gave the issuer's shares a new CUSIP between the filings: the prior line is `previousCusip`'s, carried
+   * across at `splitRatio`, and the row is one position held across it, labelled "new CUSIP, 1-for-10 split".
+   */
+  /** The line an exited one became across a split, and what confirms it: the SEC's 13(f) list, or the company's split record. */
+  cusipChange?: { previousCusip: string; label: string; confirmedBy: "sec-list" | "split" };
   sharesChange: number | null;
   sharesChangePercent: number | null;
   action: HoldingAction;

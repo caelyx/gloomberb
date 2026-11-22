@@ -86,13 +86,20 @@ const transcript = (ticker: string): CloudEarningsTranscriptPayload => ({
   riskFactors: null, notable: null, analystFocus: null, sentimentRationale: null,
   qaStartTurn: null, asrModel: null, updatedAt: "2026-08-02",
 });
+/**
+ * Whether the code calling `setTimeout` is the pane. The poll delays below are
+ * not the pane's alone: the data client waits 15 seconds between its outage
+ * probes, and `bun test` runs every file in one process, so a timer another
+ * file left behind would land in these spies and count as the pane's poll.
+ */
+const calledByPane = () => /earnings-calls[\\/]pane\.tsx/.test(new Error().stack ?? "");
 function manualPollTimers() {
   const originalSet = globalThis.setTimeout;
   const originalClear = globalThis.clearTimeout;
   let nextId = 900_000_000;
   const pending = new Map<number, () => void>();
   const set = spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
-    if (delay !== 20_000 && delay !== 15_000) return originalSet(callback, delay, ...args);
+    if ((delay !== 20_000 && delay !== 15_000) || !calledByPane()) return originalSet(callback, delay, ...args);
     const id = ++nextId;
     pending.set(id, () => callback(...args));
     return id;
@@ -263,13 +270,14 @@ for (const persisted of [false, true]) {
     fail = true;
     await press("r");
     expect(tui.frame()).toContain("FIRST CORP");
-    expect(tui.frame().includes("stale cache")).toBe(persisted);
-    expect(tui.frame()).toContain("Controlled outage");
+    // A saved copy says when it was saved, as every pane does; rows kept in memory say why the refresh failed.
+    expect(tui.frame().includes("saved copy from")).toBe(persisted);
+    expect(tui.frame().includes("Controlled outage")).toBe(!persisted);
     fail = false;
     await press("r");
     expect(tui.frame()).toContain("FIRST CORP");
     expect(tui.frame()).not.toContain("Controlled outage");
-    expect(tui.frame()).not.toContain("stale cache");
+    expect(tui.frame()).not.toContain("saved copy");
   });
 }
 
@@ -311,6 +319,55 @@ for (const width of [48, 80, 120]) {
   });
 }
 
+
+test("a call held in Chinese says it is translated, and g shows the machine transcript it was translated from", async () => {
+  signIn();
+  const said = "各位投资者大家好 欢迎参加中期业绩发布会 首先由财务总监介绍上半年的经营业绩";
+  // Transcribed from its recording: its turns carry start times.
+  const turns = [{ speaker: "Operator", text: "Welcome to the interim results.", isQa: false, startSeconds: 0 }];
+  setCloudApiFetchTransport(async (url) => new URL(String(url)).pathname.includes("FIRST-call")
+    ? Response.json({ ...transcript("FIRST"), turns, language: "chinese", isTranslated: true, originalText: said })
+    : Response.json({ calls: [call("FIRST")] }));
+  await mount(120);
+  await press("return");
+  await framesUntil(() => tui.frame().includes("FIRST CONTROLLED SUMMARY"));
+  expect(tui.frame()).toContain("translated from Chinese");
+  expect(tui.frame()).toContain("Original");
+  await press("g");
+  await framesUntil(() => tui.frame().includes("各位投资者大家好"));
+  const original = tui.frame();
+  expect(original).toContain("中期业绩发布会");
+  expect(original).toContain("machine transcript, in Chinese");
+  expect(original).not.toContain("FIRST CONTROLLED SUMMARY");
+});
+
+test("a dual-listed company's call opens from its other line, whose ticker the call carries", async () => {
+  signIn();
+  // CALLS 1088:HKEX lists China Shenhua's calls as 601088:SSE's: opening one read nothing.
+  setCloudApiFetchTransport(async (url) => new URL(String(url)).pathname.includes("HOME-call")
+    ? Response.json(transcript("HOME"))
+    : Response.json({ calls: [call("HOME")], companyFrom: { symbol: "HOME", exchange: "SSE" } }));
+  await mount(120, "1088:HKEX");
+  await framesUntil(() => tui.frame().includes("HOME CORP"));
+  await press("return");
+  await framesUntil(() => tui.frame().includes("HOME CONTROLLED SUMMARY"));
+  expect(tui.frame()).toContain("HOME CONTROLLED SUMMARY");
+});
+
+test("a call that is not translated has no original section", async () => {
+  signIn();
+  setCloudApiFetchTransport(async (url) => new URL(String(url)).pathname.includes("FIRST-call")
+    ? Response.json(transcript("FIRST"))
+    : Response.json({ calls: [call("FIRST")] }));
+  await mount(120);
+  await press("return");
+  await framesUntil(() => tui.frame().includes("FIRST CONTROLLED SUMMARY"));
+  await press("g");
+  const frame = tui.frame();
+  expect(frame).toContain("FIRST CONTROLLED SUMMARY");
+  expect(frame).not.toContain("Original");
+  expect(frame).not.toContain("translated");
+});
 
 test("opening another quarter never displays the previous quarter's transcript", async () => {
   signIn();
@@ -458,7 +515,7 @@ test("shelf refresh reloads the active company and a slower older lookup cannot 
   expect(tui.frame()).not.toContain("queued");
 });
 
-test("stale company fallback retains older quarters and its failure without replacing fresh global calls", async () => {
+test("a company lookup answered from its saved copy keeps older quarters and says when it was saved, without replacing fresh global calls", async () => {
   signIn();
   const q2 = call("FIRST");
   const q1 = { ...q2, id: "FIRST-q1", fiscalQuarter: 1, callAt: "2026-05-01T20:00:00Z" };
@@ -480,17 +537,17 @@ test("stale company fallback retains older quarters and its failure without repl
   const staleFrame = tui.frame();
   expect(staleFrame).not.toContain("queued");
   expect(staleFrame).toContain("FQ1 26");
-  expect(staleFrame).toContain("FIRST stale cache");
-  expect(staleFrame).toContain("Controlled company outage");
+  expect(staleFrame).toContain("saved copy from");
+  expect(staleFrame).not.toContain("Controlled company outage");
   fail = false;
   await press("r");
   const freshFrame = tui.frame();
   expect(freshFrame).toContain("FQ1 26");
-  expect(freshFrame).not.toContain("stale cache");
-  expect(freshFrame).not.toContain("Controlled company outage");
+  expect(freshFrame).not.toContain("saved copy");
 });
 
-for (const status of [503, 403]) {
+// A 404 is as final as a refusal: asking again will not bring the rows back.
+for (const status of [503, 404, 403]) {
   test(`company reload ${status} retains in-memory rows only for transient failures`, async () => {
     signIn();
     const q2 = call("FIRST");
@@ -510,7 +567,6 @@ for (const status of [503, 403]) {
     await press("r");
     const frame = tui.frame();
     expect(frame.includes("FQ1 26")).toBe(status === 503);
-    expect(frame.includes("stale cache")).toBe(status === 503);
     expect(frame).toContain("Controlled lookup failure");
   });
 }

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { getLanguage, setLanguage } from "../../i18n";
 import type { Quote } from "../../types/financials";
-import { formatQuoteAge, formatQuoteAgeWithSource, formatQuoteNavAsOf, getMostRecentQuoteUpdate } from "./time";
+import { formatQuoteAge, formatQuoteAgeWithSource, formatQuoteNavAsOf } from "./time";
 
 describe("quote-time", () => {
   test("formats sub-second quote age in milliseconds", () => {
@@ -24,7 +24,6 @@ describe("quote-time", () => {
     };
 
     expect(formatQuoteAgeWithSource(quote, now)).toBe("◷1s");
-    expect(getMostRecentQuoteUpdate([quote], now)).toBe(1_700_000_029_000);
   });
 
   test("counts whole seconds for a once-a-second clock, never below zero", () => {
@@ -46,8 +45,8 @@ test("NAV freshness labels keep the source session date after receipt and when l
   const language = getLanguage();
   try {
     setLanguage("en");
-    expect(formatQuoteNavAsOf(quote, now)).toBe("NAV · as of Oct 6");
-    expect(formatQuoteNavAsOf({ ...quote, stale: true }, now)).toBe("NAV · as of Oct 6");
+    expect(formatQuoteNavAsOf(quote, now)).toBe("NAV · as of 6 Oct");
+    expect(formatQuoteNavAsOf({ ...quote, stale: true }, now)).toBe("NAV · as of 6 Oct");
     setLanguage("ja");
     expect(formatQuoteNavAsOf(quote, now)).toBe("NAV · 10月6日時点");
   } finally {

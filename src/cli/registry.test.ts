@@ -90,6 +90,10 @@ describe("CLI registry", () => {
     expect(help).toContain("alias-example");
     expect(help).toContain("Synthetic Help");
     expect(help).toContain("Hello from the synthetic plugin.");
+    expect(help).toContain("--limit");
+    expect(help).toContain("first");
+    expect(help).toContain("--tail");
+    expect(help).toContain("export_notes");
   });
 
   test("rejects duplicate command names and aliases", () => {
@@ -156,6 +160,41 @@ describe("CLI registry", () => {
     expect(registry.lookup.get("core-only")?.ownerId).toBe("core");
     expect(registry.lookup.get("broken")).toBeUndefined();
     expect(registry.commands.some((entry) => entry.ownerId === "core")).toBe(true);
+  });
+
+  test("concurrent lazy loads share one request and update an already captured plugin list", async () => {
+    const pending = Promise.withResolvers<Array<{ plugin: GloomPlugin; path: string; error?: string; unsupportedTarget?: "cli" }>>();
+    let loads = 0;
+    const config = createDefaultConfig("/synthetic/lazy-cli");
+    config.disabledPlugins = ["disabled-cli"];
+    const registry = buildCliCommandRegistry({
+      coreCommands: [], config,
+      loadExternalPlugins: () => { loads += 1; return pending.promise; },
+    });
+    const captured = registry.plugins;
+    const first = registry.ensureExternalPlugins!();
+    const second = registry.ensureExternalPlugins!();
+    expect(loads).toBe(1);
+    pending.resolve([
+      { plugin: createSyntheticPlugin(), path: "/synthetic/enabled" },
+      { plugin: { ...createSyntheticPlugin("disabled-example"), id: "disabled-cli", cliCommands: [] }, path: "/synthetic/disabled" },
+      { plugin: { ...createSyntheticPlugin("broken-example"), id: "broken-cli" }, path: "/synthetic/broken", error: "Cannot load" },
+      // Built for the desktop app alone (Gloom Social): `catalog` listed its function, which the command line does not run.
+      { plugin: { ...createSyntheticPlugin(), id: "desktop-only", cliCommands: [], targets: ["desktop"] }, path: "/synthetic/desktop", unsupportedTarget: "cli" },
+    ]);
+    await Promise.all([first, second]);
+    await registry.ensureExternalPlugins!();
+    expect(loads).toBe(1);
+    expect(registry.plugins).toBe(captured);
+    expect(captured.map((plugin) => plugin.id)).toContain("synthetic-cli");
+    expect(captured.map((plugin) => plugin.id)).not.toContain("disabled-cli");
+    expect(captured.map((plugin) => plugin.id)).not.toContain("broken-cli");
+    expect(captured.map((plugin) => plugin.id)).not.toContain("desktop-only");
+    // Each one that does not run says why, for a code it owns.
+    expect(registry.idlePlugins.map(({ plugin, reason, directory }) => [plugin.id, reason, directory])).toEqual([
+      ["disabled-cli", "off", "disabled"], ["broken-cli", "failed", "broken"], ["desktop-only", "target", "desktop"],
+    ]);
+    expect(registry.lookup.get("alias-example")?.ownerId).toBe("synthetic-cli");
   });
 });
 

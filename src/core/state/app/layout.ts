@@ -1,5 +1,5 @@
-import { compactFloatingZ, getDockLeafLayouts, getDockedPaneIds } from "../../../layout/pane-manager";
-import { pinFollowingPane } from "../../../layout/pane-follow";
+import { compactFloatingZ, getDockLeafLayouts, getDockedPaneIds, removePane, showDockTab, withoutTransientPanes } from "../../../layout/pane-manager";
+import { pinOrphanedFollower } from "../../../layout/pane-follow";
 import {
   cloneLayout,
   findPaneInstance,
@@ -18,7 +18,7 @@ import {
 import type { DesktopSharedStateSnapshot } from "../../../types/desktop-window";
 import type { BrokerAccount } from "../../../types/trading";
 import { isBrokerPortfolioId } from "../../../utils/broker-instances";
-import type { AppState, LayoutHistoryEntry, PaneRuntimeState } from "./types";
+import type { AppState, LayoutHistoryEntry, OpeningPaneSettlement, PaneRuntimeState } from "./types";
 
 function getDefaultCollectionId(config: AppConfig): string {
   return config.portfolios[0]?.id || config.watchlists[0]?.id || "";
@@ -232,7 +232,8 @@ export function resolveTickerForPane(state: AppState, paneId: string, seen = new
   if (seen.has(paneId)) return null;
   seen.add(paneId);
   const instance = findPaneInstance(state.config.layout, paneId);
-  if (!instance) return null;
+  // A pane in another desktop window: the ticker that window shows in it ("" while it shows none).
+  if (!instance) return state.linkedTickers?.[paneId] || null;
   const cursorSymbol = getPaneState(state, paneId).cursorSymbol;
   if (typeof cursorSymbol === "string" && cursorSymbol.trim()) return cursorSymbol;
   return resolveTickerFromBinding(state, instance.binding, seen);
@@ -345,17 +346,25 @@ export function cloneSavedLayout(entry: SavedLayout): SavedLayout {
   return clone;
 }
 
+/**
+ * The active layout as its tab saves it, without the transient windows open
+ * over it (the Layouts browser, withoutTransientPanes): creating a layout
+ * from LAY saved the LAY window into the one it left, which then reopened
+ * with it on top.
+ */
 function buildSavedLayoutSnapshot(
   entry: SavedLayout | undefined,
   layout: LayoutConfig,
   paneState: Record<string, PaneRuntimeState>,
   focusedPaneId: string | null,
 ): SavedLayout {
+  const saved = withoutTransientPanes(layout);
+  const kept = saved === layout ? null : new Set(saved.instances.map((instance) => instance.instanceId));
   return {
     ...(entry ?? { name: "Default" }),
-    layout: cloneLayoutOnce(layout),
-    paneState: clonePaneStateMap(paneState),
-    focusedPaneId,
+    layout: cloneLayoutOnce(saved),
+    paneState: clonePaneStateMap(kept ? Object.fromEntries(Object.entries(paneState).filter(([id]) => kept.has(id))) : paneState),
+    focusedPaneId: kept && focusedPaneId && !kept.has(focusedPaneId) ? null : focusedPaneId,
   };
 }
 
@@ -509,6 +518,44 @@ export function moveHistoryIndex(
   return next;
 }
 
+/**
+ * The undo history once a research pane opened ahead of its ticker's lookup
+ * settles, `current` being the layout it settled into. One that found its
+ * listing has its binding and title in every step that holds it. One whose
+ * open came to nothing leaves no step: the history goes back to what it was
+ * before the open, redo steps included, or, when steps were taken since, those
+ * steps lose it and any that then repeats the step nearer the current layout goes.
+ */
+export function settleOpeningPaneHistory(
+  entry: LayoutHistoryEntry,
+  current: LayoutConfig,
+  { paneId, symbol, settled, before }: OpeningPaneSettlement,
+): LayoutHistoryEntry {
+  if (!settled && before) return before;
+  const settle = (layout: LayoutConfig): LayoutConfig => {
+    const pane = findPaneInstance(layout, paneId);
+    if (pane?.binding?.kind !== "fixed" || pane.binding.symbol !== symbol) return layout;
+    return settled
+      ? { ...layout, instances: layout.instances.map((instance) => instance.instanceId === paneId ? { ...instance, ...settled } : instance) }
+      : removePane(layout, paneId);
+  };
+  const past = entry.past.map(settle);
+  const future = entry.future.map(settle);
+  if (settled) return { past, future };
+  return { past: withoutRepeats(past.reverse(), current).reverse(), future: withoutRepeats(future, current) };
+}
+
+/** Steps leading away from `current`, less each that repeats the one nearer to it: undoing it would change nothing. */
+function withoutRepeats(steps: LayoutConfig[], current: LayoutConfig): LayoutConfig[] {
+  let nearer = JSON.stringify(current);
+  return steps.filter((step) => {
+    const key = JSON.stringify(step);
+    const repeats = key === nearer;
+    nearer = key;
+    return !repeats;
+  });
+}
+
 /** If paneId is a floating pane, bump its zIndex to the top, renumbering a stack that would climb past the shell's overlays. */
 export function bringFloatingToFront(layout: LayoutConfig, paneId: string): LayoutConfig {
   const entryIndex = layout.floating.findIndex((e) => e.instanceId === paneId);
@@ -537,13 +584,13 @@ export function materializeDetachedLayouts(config: AppConfig): AppConfig {
   };
 }
 
-export function focusPaneState(state: AppState, paneId: string): AppState {
-  const layout = bringFloatingToFront(state.config.layout, paneId);
+export function focusPaneState(state: AppState, paneId: string, trackTicker = true): AppState {
+  // A tab of a stack is shown when it takes focus.
+  const layout = showDockTab(bringFloatingToFront(state.config.layout, paneId), paneId);
   const config = layout !== state.config.layout ? { ...state.config, layout } : state.config;
-  const recentTickers = nextRecentTickers(
-    state.recentTickers,
-    resolveTickerForPane(state, paneId),
-  );
+  const recentTickers = trackTicker
+    ? nextRecentTickers(state.recentTickers, resolveTickerForPane(state, paneId))
+    : state.recentTickers;
   if (
     config === state.config &&
     state.focusedPaneId === paneId &&
@@ -562,18 +609,26 @@ export function focusPaneState(state: AppState, paneId: string): AppState {
   };
 }
 
+/** Panes in another desktop window that panes here follow: their links are not orphaned. */
+export function linkedSourceIds(state: Pick<AppState, "linkedTickers">): ReadonlySet<string> | undefined {
+  return state.linkedTickers ? new Set(Object.keys(state.linkedTickers)) : undefined;
+}
+
 export function withFocusedPane(
   state: AppState,
   config: AppConfig,
   options: {
     paneState?: Record<string, PaneRuntimeState>;
     focusedPaneId?: string | null;
+    /** Follow sources in another window; `state`'s own by default. */
+    externalSourceIds?: ReadonlySet<string>;
   } = {},
 ): AppState {
   const normalizedLayout = normalizePaneLayout(config.layout, {
     // Keep a follower alive on its last symbol when its source pane is gone.
     resolveOrphanSymbol: (instanceId) => resolveTickerForPane(state, instanceId),
-    pinOrphan: pinFollowingPane,
+    pinOrphan: pinOrphanedFollower(state.config.layout),
+    externalSourceIds: options.externalSourceIds ?? linkedSourceIds(state),
   });
   const nextConfig = normalizedLayout === config.layout
     ? config
@@ -586,7 +641,7 @@ export function withFocusedPane(
     ? (options.focusedPaneId ?? null)
     : state.focusedPaneId;
   const focusedPaneId = resolveFocusedPaneId(nextConfig.layout, requestedFocusedPaneId);
-  const focusedLayout = focusedPaneId ? bringFloatingToFront(nextConfig.layout, focusedPaneId) : nextConfig.layout;
+  const focusedLayout = focusedPaneId ? showDockTab(bringFloatingToFront(nextConfig.layout, focusedPaneId), focusedPaneId) : nextConfig.layout;
   const focusedConfig = focusedLayout === nextConfig.layout ? nextConfig : { ...nextConfig, layout: focusedLayout };
   const syncedConfig = syncConfigActiveLayoutState(focusedConfig, nextPaneState, focusedPaneId);
   return {
@@ -603,11 +658,17 @@ export function withFocusedPane(
 }
 
 export function hydrateDesktopSnapshot(state: AppState, snapshot: DesktopSharedStateSnapshot): AppState {
-  return withFocusedPane({
+  const linkedTickers = snapshot.linkedTickers && Object.keys(snapshot.linkedTickers).length > 0
+    ? snapshot.linkedTickers
+    : undefined;
+  const next = withFocusedPane({
     ...state,
     paneState: snapshot.paneState,
     brokerSyncErrors: snapshot.brokerSyncErrors ?? {},
     focusedPaneId: snapshot.focusedPaneId,
     statusBarVisible: snapshot.statusBarVisible,
-  }, snapshot.config);
+    // A follower whose source in another window just closed stays on the ticker it last had there.
+    linkedTickers: linkedTickers || state.linkedTickers ? { ...state.linkedTickers, ...linkedTickers } : undefined,
+  }, snapshot.config, { externalSourceIds: linkedSourceIds({ linkedTickers }) ?? new Set() });
+  return next.linkedTickers === linkedTickers ? next : { ...next, linkedTickers };
 }

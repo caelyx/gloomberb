@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import { act, useState } from "react";
 import { apiClient } from "../../../api-client";
@@ -5,10 +6,16 @@ import { setSharedMarketDataCoordinator, type MarketDataCoordinator } from "../.
 import type { ChartRequest } from "../../../market-data/request-types";
 import { createIdleEntry, type QueryEntry } from "../../../market-data/result-types";
 import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
+import { setAppVisible } from "../../../state/app/activity";
 import { appReducer, createInitialState } from "../../../state/app/context";
 import { createTestPaneConfig, TestPaneFrame } from "../../../test-support/pane";
 import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
 import type { PricePoint } from "../../../types/financials";
+import { DataServiceUnreachableError } from "../../../utils/network-failure";
+import { ApiRequestError } from "../../../api-client/errors";
+import { attachFredSeriesPersistence, resetFredSeriesPersistence } from "../../../sources/gloomberb-cloud/fred-series";
+import { outage } from "../../../test-support/outage";
+import { MemoryPluginPersistence } from "../../../test-support/plugin-persistence";
 import { VolatilityPane } from "./pane";
 
 const DAY_MS = 86_400_000;
@@ -36,15 +43,23 @@ function ready(data: PricePoint[]): QueryEntry<PricePoint[]> {
 
 const tui = createOpenTuiTestHarness();
 let spies: Array<{ mockRestore(): void }> = [];
+/** The live re-reads of index levels in session, which fail while `levelReadFails` is set. */
+let levelReads = 0;
+let levelReadFails = false;
 
 beforeEach(() => {
+  levelReads = 0;
+  levelReadFails = false;
   setSharedMarketDataCoordinator({
     subscribe: () => () => {},
     subscribeKeys: () => () => {},
     getVersion: () => 1,
     subscribeQuotes: () => () => {},
     getQuoteEntry: () => createIdleEntry(),
-    loadQuotesBatch: async () => {},
+    loadQuotesBatch: async () => {
+      levelReads += 1;
+      if (levelReadFails) throw new DataServiceUnreachableError(new Error("offline"));
+    },
     getChartEntry: () => createIdleEntry(),
     loadChart: async (request: ChartRequest) => ready(history(request.instrument.symbol)),
   } as unknown as MarketDataCoordinator);
@@ -55,7 +70,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetFredSeriesPersistence();
   setSystemTime();
+  setAppVisible(true);
   setSharedMarketDataCoordinator(null);
   for (const spy of spies) spy.mockRestore();
 });
@@ -106,7 +123,7 @@ test("the curve names IV and its look-backs, and the tenors show how far each mo
   expect(frame).toMatch(/TENOR +IV +1W CHG +1M CHG/);
   expect(frame).toMatch(/30D +14\.87 +\+0\.06 +-0\.58/);
   // One close of the 1Y index: no week or month back to compare with.
-  expect(frame).toMatch(/1Y +21\.60 +-- +--/);
+  expect(frame).toMatch(new RegExp(String.raw`1Y +21\.60 +${MISSING_VALUE} +${MISSING_VALUE}`));
   // The default selection is the VIX itself, so the curve's point is the 30D.
   expect(readout()).toBe("30D 14.87  1W ago +0.06  1M ago -0.58");
   expect(frame).not.toContain("yAxis");
@@ -171,4 +188,61 @@ test("a day still trading is no close: the session so far until Cboe settles it 
   setSystemTime(new Date("2026-09-25T20:16:00Z"));
   await renderPane(108, 32);
   expect(footer()).toMatch(/^close 2026-09-25 /);
+});
+
+// In session the index levels are re-read every 15 seconds; one that fails leaves the old levels on screen.
+test("a failed live re-read of the index levels is a data warning until one succeeds", async () => {
+  let now = Date.parse("2026-09-25T15:00:00Z");
+  setSystemTime(new Date(now));
+  await renderPane(108, 32);
+  const warnings = async () => {
+    await tui.emitKeypress({ name: "!", sequence: "!" });
+    await settle();
+    const frame = tui.frame();
+    await tui.emitKeypress({ name: "escape" });
+    await settle();
+    return frame;
+  };
+  // Back after a stretch longer than the interval, the cycle re-reads at once.
+  const reread = async () => {
+    now += 20_000;
+    setSystemTime(new Date(now));
+    await act(async () => setAppVisible(false));
+    await act(async () => setAppVisible(true));
+    await settle();
+  };
+  expect(await warnings()).not.toContain("Gloom couldn't reach its data service");
+  levelReadFails = true;
+  await reread();
+  expect(levelReads).toBe(1);
+  expect(await warnings()).toContain("Gloom couldn't reach its data service");
+  levelReadFails = false;
+  await reread();
+  expect(levelReads).toBe(2);
+  expect(await warnings()).not.toContain("Gloom couldn't reach its data service");
+});
+
+// The FRED closes the board falls back on said "saved copy from" whatever their refresh failed with, after
+// the pane's own status. They now lead the footer, as every pane's saved copy does, and a refusal is the error.
+test("FRED closes a failed refresh left lead the footer with when they were saved; a refusal says its error instead", async () => {
+  attachFredSeriesPersistence(new MemoryPluginPersistence());
+  let failure: unknown = null;
+  spies.push(spyOn(apiClient, "getCloudFredSeries").mockImplementation(async (id: string) => {
+    if (failure) throw failure;
+    return { info: null, observations: [{ date: "2026-09-24", value: id === "VIXCLS" ? 15 : 18 }] };
+  }));
+  setSystemTime(new Date("2026-09-25T13:05:00Z"));
+  await renderPane(108, 32);
+  expect(footer()).not.toContain("saved copy");
+
+  setSystemTime(new Date("2026-09-26T13:05:00Z"));
+  failure = outage();
+  await renderPane(108, 32);
+  // The fixture's indices with no closes keep their warning, after the saved copy.
+  expect(footer()).toMatch(/^saved copy from 25 Sep \d\d:\d\d \S*\[!\] +close 2026-09-25 /);
+
+  // The closes on screen stay, called stale, and the refusal is among the warnings (client.test.ts).
+  failure = new ApiRequestError("Series not found", 404);
+  await renderPane(108, 32);
+  expect(footer()).toMatch(/^stale · close 2026-09-25 /);
 });

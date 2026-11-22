@@ -2,7 +2,7 @@ import type { DataTableColumn, PaneFooterSegment } from "../../../components";
 import type { AnalystRatingRecord, AnalystResearchData, Quote } from "../../../types/financials";
 import { resolveCurrencyUnit } from "../../../utils/currency-units";
 import { formatRelativeTime } from "../../../utils/datetime-format";
-import { displayWidth, formatCurrency, formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, displayWidth, formatCurrency, formatNumber } from "../../../utils/format";
 import { compareSortValues, type SortDirection } from "../../../utils/sort-values";
 import { loadingErrorFooterInfo } from "../../../components/data-table/table-pane";
 import { delayedFooterSegment } from "../../../components/layout/pane/footer/model";
@@ -113,7 +113,7 @@ function analystReferenceWhen(reference: AnalystReferencePrice, now: number): st
  * retrieval Wed 21 Oct 21:30 UTC".
  */
 export function formatAnalystReference(reference: AnalystReferencePrice, currency: string | undefined, now = Date.now()): string {
-  if (reference.price == null || !Number.isFinite(reference.price)) return "-";
+  if (reference.price == null || !Number.isFinite(reference.price)) return MISSING_VALUE;
   const price = formatAnalystPrice(reference.price, currency);
   const when = analystReferenceWhen(reference, now);
   if (!reference.live) return `${price}, provider reference${when ? ` at retrieval ${when}` : ""}`;
@@ -168,15 +168,21 @@ export function ratingSplit(data: AnalystResearchData | null) {
   return { ...split, period: rec.period && !isCurrentMonthPeriod(rec.period) ? compactPeriod(rec.period) : null };
 }
 
+/**
+ * The latest mix with each rating named, as the pane's Buy/Hold/Sell split
+ * names them: "4 Strong Buy · 9 Buy · 9 Hold · 4 Sell", strong sells in Sell.
+ * A missing count reads "-", so a partial mix never reads as a whole one.
+ */
 export function formatRecommendationMix(data: AnalystResearchData | null): string {
   const rec = recommendationMix(data);
-  if (!rec) return "-";
+  if (!rec) return MISSING_VALUE;
   const sells = rec.sell != null && rec.strongSell != null ? rec.sell + rec.strongSell : null;
-  return `SB ${rec.strongBuy ?? "-"}  B ${rec.buy ?? "-"}  H ${rec.hold ?? "-"}  S ${sells ?? "-"}`;
+  return [[rec.strongBuy, "Strong Buy"], [rec.buy, "Buy"], [rec.hold, "Hold"], [sells, "Sell"]]
+    .map(([count, label]) => `${count ?? MISSING_VALUE} ${label}`).join(" · ");
 }
 
 export function formatRatingLabel(value: number | undefined): string {
-  return value == null || !Number.isFinite(value) ? "-" : `${formatNumber(value, 1)}/10`;
+  return value == null || !Number.isFinite(value) ? MISSING_VALUE : `${formatNumber(value, 1)}/10`;
 }
 
 export function analystTargetCurrency(data: AnalystResearchData | null): string | undefined {
@@ -184,7 +190,7 @@ export function analystTargetCurrency(data: AnalystResearchData | null): string 
 }
 
 export function formatAnalystPrice(value: number | undefined, currency: string | undefined): string {
-  if (value == null || !Number.isFinite(value)) return "-";
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
   if (!currency?.trim()) return `${formatNumber(value)} (ccy?)`;
   const unit = resolveCurrencyUnit(currency);
   return formatCurrency(value / unit.divisor, unit.currency);
@@ -219,7 +225,7 @@ export function formatRatingTarget(
 ): string {
   const current = row.currentPriceTarget;
   const prior = priorRatingTarget(row);
-  if (current == null && prior == null) return "-";
+  if (current == null && prior == null) return MISSING_VALUE;
   if (current == null) return ` ${formatPriceTarget(prior, currency)}`;
   if (prior == null) return ` ${formatPriceTarget(current, currency)}`;
 
@@ -235,7 +241,7 @@ export function ratingTargetDelta(row: AnalystResearchData["ratings"][number]): 
   return row.currentPriceTarget - prior;
 }
 
-export type RatingColumnId = "date" | "firm" | "action" | "current" | "target" | "prior";
+export type RatingColumnId = "date" | "firm" | "action" | "current" | "target" | "prior" | "reason";
 export type RatingColumn = DataTableColumn & { id: RatingColumnId } & Partial<RatingTargetColumnSizing>;
 
 export interface RatingSortPreference {
@@ -255,6 +261,7 @@ const DEFAULT_RATING_SORT_DIRECTIONS: Record<RatingColumnId, SortDirection> = {
   current: "asc",
   target: "desc",
   prior: "asc",
+  reason: "asc",
 };
 
 const BASE_RATING_COLUMNS: RatingColumn[] = [
@@ -265,6 +272,37 @@ const BASE_RATING_COLUMNS: RatingColumn[] = [
   { id: "target", label: "TARGET", width: 13, align: "left" },
   { id: "prior", label: "PRIOR", width: 13, align: "left" },
 ];
+
+/** The reason coverage gives for an action: last, taking the room the pane has left. */
+const REASON_COLUMN: RatingColumn = { id: "reason", label: "REASON", width: 28, align: "left", flexGrow: 1 };
+
+/** The line coverage of the action quotes, or null when none gives one. */
+export function ratingReason(row: AnalystRatingRecord): AnalystRatingRecord["reason"] | null {
+  const reason = row.reason;
+  return reason?.text?.trim() && reason.url?.trim() ? reason : null;
+}
+
+/**
+ * The status bar room the selected action's article takes: its `source`
+ * link, the `o` hint that opens it and their separators. The consensus
+ * context gives way to it rather than cut it.
+ */
+export function ratingReasonFooterWidth(reason: AnalystRatingRecord["reason"] | null): number {
+  if (!reason) return 0;
+  return displayWidth(`source ${ratingReasonSource(reason)}`) + displayWidth(" · ") + displayWidth("[o]pen") + 2;
+}
+
+/** Who published the reason: the publisher's name, else the article's site. */
+export function ratingReasonSource(reason: NonNullable<AnalystRatingRecord["reason"]>): string {
+  const named = reason.source?.trim();
+  if (named) return named;
+  try {
+    return new URL(reason.url).hostname.replace(/^www\./, "");
+  } catch {
+    // Intentional ignore: a malformed link has no site to name, so it reads as source.
+    return "source";
+  }
+}
 
 export function buildRatingColumns(
   rows: readonly AnalystRatingRecord[],
@@ -288,9 +326,11 @@ export function buildRatingColumns(
     BASE_RATING_COLUMNS.find((column) => column.id === "target")?.width ?? 13,
   );
 
-  return BASE_RATING_COLUMNS.map((column) => {
+  const columns = BASE_RATING_COLUMNS.map((column) => {
     return column.id === "target" ? { ...column, ...targetSizing, width: targetWidth } : column;
   });
+  // A history with no reason anywhere keeps the table it always had.
+  return rows.some((row) => ratingReason(row)) ? [...columns, REASON_COLUMN] : columns;
 }
 
 function normalizedText(value: string | undefined): string | null {
@@ -316,6 +356,8 @@ function ratingSortValue(row: AnalystRatingRecord, columnId: RatingColumnId): st
       return ratingTargetSortValue(row);
     case "prior":
       return normalizedText(row.prior);
+    case "reason":
+      return normalizedText(ratingReason(row)?.text);
   }
 }
 

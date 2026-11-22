@@ -1,8 +1,11 @@
 import type { ContextMenuItem } from "../../../../types/context-menu";
-import { t } from "../../../../i18n";
-import { clipToDisplayWidth, displayWidth } from "../../../../utils/format";
+import { t, tf } from "../../../../i18n";
+import { type CompanyFrom, companyFromLabel } from "../../../../types/company-from";
+import { displayWidth } from "../../../../utils/format";
 import { formatShortDate } from "../../../../utils/datetime-format";
+import { readableStatus } from "../../../../utils/reason-codes";
 import { getShortcutHintWidth } from "../../../ui/shortcut-hint";
+import { KEY_HINT_GAP_PX, keycapText, keyHintCells, keyHintTitle, keyHintWords } from "../../../ui/key-hint-words";
 
 export interface PaneFooterRegistration {
   order?: number;
@@ -44,11 +47,42 @@ export interface PaneFooterSegment {
    */
   quoteStatus?: boolean;
   /**
-   * The segment says what the rows leave out (releases a filter hides), which
-   * a picture of the rows cannot: a `gloom shot` keeps it, as it keeps a
+   * The segment says what the rows leave out (releases a filter hides), or
+   * whose they are (a receipt's company data from its home line), which a
+   * picture of the rows cannot: a `gloom shot` keeps it, as it keeps a
    * warning.
    */
   capture?: boolean;
+  /**
+   * The pane's figures cannot be read without the segment: the session OMON's
+   * open interest counts are from. A row too narrow shortens it to its last
+   * variant and leaves out the segments around it first, as it does beside a
+   * warning, so it never goes while those figures show.
+   */
+  holdsPlace?: boolean;
+  /**
+   * The notes behind a warning icon (usePaneNoticeFooter), each in full. The
+   * icon opens them in the app. A picture of the pane cannot, so it draws a
+   * segment carrying `notes` and no icon as its one note line
+   * ({@link noteLineParts}): the first note, cut after a whole word when the
+   * row is short, and how many more there are.
+   */
+  notes?: readonly string[];
+  /**
+   * The segment only says how long ago the pane's data loaded (`5m ago`,
+   * `fetched just now`), relative to the moment it is read: build it with
+   * {@link ageFooterSegment}. A row too narrow for every segment leaves it out
+   * first, whole, before anything else shortens or is cut, so the source and
+   * the date stay.
+   */
+  age?: boolean;
+  /**
+   * When the copy the pane shows was saved, on the saved-copy segment
+   * ({@link savedCopyFooterSegment}). The footer draws that segment first,
+   * wherever a pane registers it, and once: the oldest when several parts of
+   * the pane show a saved copy.
+   */
+  savedCopyAt?: number;
   /**
    * Shorter forms of `parts`, longest first. When the row is too narrow for
    * `parts` beside the hints, it shows the first that fits, or the last, and
@@ -67,9 +101,11 @@ const DELAYED_FOOTER_GLYPH = "◷";
 
 /**
  * The footer's one form for data a source delivers late: a yellow clock with
- * `detail` in its tooltip on the desktop, and the clock with the delay
- * (`◷15m`) in the terminal, which has no tooltip, so it takes a few cells
- * rather than a phrase. `onPress` makes it a button, such as an upgrade.
+ * `detail` in its tooltip on the desktop and the web, and the clock with the
+ * delay (`◷15m`) in the terminal, which has no tooltip, so it takes a few
+ * cells rather than a phrase. The clock alone keeps the delay from repeating
+ * in every pane: the status bar's delayed note spells out the account's
+ * (`◷ 15m delayed`). `onPress` makes it a button, such as an upgrade.
  */
 export function delayedFooterSegment({
   id,
@@ -111,9 +147,53 @@ export function savedCopyFooterSegment(id: string, savedAt: number, now = Date.n
   return {
     id,
     quoteStatus: true,
+    savedCopyAt: savedAt,
     title: `${t("Couldn't refresh")}: ${text}`,
     parts: [{ text, tone: "warning" }],
     variants: [[{ text: t("saved copy"), tone: "warning" }]],
+  };
+}
+
+/**
+ * The footer's one form for how long ago the pane's data loaded: `5m ago`,
+ * or `fetched 5m ago` with a `verb`. A narrow row leaves it out first (`age`).
+ */
+export function ageFooterSegment(ago: string, { id = "updated", verb, tone = "muted" }: {
+  id?: string;
+  /** Said before the age: `fetched`, `checked`, `updated`. */
+  verb?: string;
+  tone?: PaneFooterPart["tone"];
+} = {}): PaneFooterSegment {
+  return { id, age: true, parts: [{ text: verb ? `${verb} ${ago}` : ago, tone }] };
+}
+
+/**
+ * The saved-copy segment of a pane showing several answers (a list and the
+ * report it opens): the oldest of the copies among `savedAts` (ms), or no
+ * segment when none of them is one.
+ */
+export function savedCopyFooterInfo(savedAts: readonly (number | null | undefined)[], id = "saved-copy"): PaneFooterSegment[] {
+  const times = savedAts.filter((at): at is number => typeof at === "number" && Number.isFinite(at));
+  return times.length > 0 ? [savedCopyFooterSegment(id, Math.min(...times))] : [];
+}
+
+/**
+ * The footer's one form for company data a pane shows from another listing
+ * of the company: a receipt or a foreign line (SKHY, HY9H in Frankfurt) reads
+ * its home line's news, filings or holders, `company data from 000660 KRX`.
+ * Null when the data is the listing's own.
+ */
+export function companyDataFooterSegment(from: CompanyFrom | null | undefined): PaneFooterSegment | null {
+  if (!from) return null;
+  const listing = companyFromLabel(from);
+  const text = tf("company data from {listing}", { listing });
+  return {
+    id: "company-data",
+    title: from.name ? `${text} (${from.name})` : text,
+    // A capture of the rows keeps it: the picture cannot say whose they are.
+    capture: true,
+    parts: [{ text, tone: "muted" }],
+    variants: [[{ text: tf("from {listing}", { listing }), tone: "muted" }]],
   };
 }
 
@@ -166,10 +246,20 @@ export interface PaneFooterPart {
 export interface PaneHint {
   id: string;
   key: string;
+  /**
+   * What the terminal writes after `[key]`: the rest of the word when a letter
+   * key starts it (`"dd"`, `[a]dd`), a space and the words when it does not
+   * (`" remove"`, `[x] remove`), and the words after any other key (`"pick"`
+   * after `Enter`). The desktop and the web show the key in a keycap before
+   * the whole words, read from this (keyHintWords).
+   */
   label: string;
   /**
    * The action's full name in the pane menu. Defaults to the hint read as one
-   * word (`[a]dd` is "Add"); set it when the key is not the first letter.
+   * word (`[a]dd` is "Add"); set it when the key is not the first letter, and
+   * when the label is a whole word right after a letter key (`[m]re-arm`), so
+   * the desktop reads "re-arm", not "mre-arm". An `id` that names the label
+   * (`id: "rearm"`) does the same for the desktop.
    */
   title?: string;
   onPress?: (event?: PaneFooterPressEvent) => void;
@@ -181,6 +271,19 @@ export interface PaneHint {
    * listed in the pane menu without a key.
    */
   yieldsKey?: boolean;
+  /**
+   * For a hint a shared component adds to every pane that nests it, such as
+   * `{}` for a nested strip's views: drawn only beside the pane's own hints.
+   * With none, the pane keeps the footer it had (none, or its status alone);
+   * the component's `keys` stay bound.
+   */
+  besideOthers?: boolean;
+  /**
+   * The surface the hint answers for, as `metadata.scope` on its semantic UI
+   * node, like a kit button inside RemoteUiScope: the footer is drawn outside
+   * the pane's own tree, so it cannot inherit one.
+   */
+  remoteScope?: string;
 }
 
 export interface CombinedPaneFooter {
@@ -202,29 +305,79 @@ const INFO_FLOOR_CHARS = 10;
 const WARNING_FLOOR_CHARS = 24;
 const HINT_GAP = 1;
 
-function paneHintWidth(hint: Pick<PaneHint, "key" | "label">, prefix = ""): number {
-  return getShortcutHintWidth(hint.key, hint.label, prefix);
+/**
+ * What the footer draws between two info segments, muted, as a status draws
+ * between its own parts ("Newest story Mon 14:23 · 12h delayed"): two
+ * segments side by side never read as one sentence ("company data from PBR ·
+ * as of 2026-06-30"). An icon (`⚠[!]`, `◷15m`) is a mark, not a phrase: a
+ * column sets it apart.
+ */
+export const PANE_FOOTER_SEPARATOR = " · ";
+const SEPARATOR_WIDTH = displayWidth(PANE_FOOTER_SEPARATOR);
+
+/** Whether the footer draws {@link PANE_FOOTER_SEPARATOR} between two adjacent segments, else a one-column gap. */
+export function separatesPaneFooterSegments(before: Pick<PaneFooterSegment, "icon">, after: Pick<PaneFooterSegment, "icon">): boolean {
+  return !before.icon && !after.icon;
 }
 
-export function totalHintsWidth(hints: readonly Pick<PaneHint, "key" | "label">[]): number {
-  return hints.reduce((total, hint, index) => total + paneHintWidth(hint, index > 0 ? " " : ""), 0);
+function segmentGapWidth(before: PaneFooterSegment, after: PaneFooterSegment): number {
+  return separatesPaneFooterSegments(before, after) ? SEPARATOR_WIDTH : 1;
+}
+
+/** A hint's key as the host shows it (useShortcutLabel): `Ctrl+S` is `⌃S` on a Mac. */
+type PaneHintKeyLabel = (key: string) => string;
+
+const KEY_AS_WRITTEN: PaneHintKeyLabel = (key) => key;
+
+/** How much room hints take on a host, in cells: each hint, and the gap between two. */
+export interface PaneHintMetrics {
+  width(hint: Pick<PaneHint, "key" | "label" | "title" | "id">): number;
+  gap: number;
+}
+
+/** The terminal's hints: `[s]eries`, a column apart. `keyLabel` writes the key as the host shows it. */
+export function terminalHintMetrics(keyLabel: PaneHintKeyLabel = KEY_AS_WRITTEN): PaneHintMetrics {
+  return { width: (hint) => getShortcutHintWidth(keyLabel(hint.key), hint.label), gap: HINT_GAP };
+}
+
+/**
+ * The desktop's and the web's hints: a keycap and the whole words (KeyHint),
+ * farther apart, on a grid of `cellPx` cells. The text scales with the cell
+ * and the spacing does not, so pass the live cell (useUiCapabilities().cellWidthPx).
+ */
+export function desktopHintMetrics(cellPx: number): PaneHintMetrics {
+  return {
+    width: (hint) => keyHintCells(keycapText(hint.key), keyHintWords(hint), cellPx),
+    gap: KEY_HINT_GAP_PX / cellPx,
+  };
+}
+
+const TERMINAL_HINT_METRICS = terminalHintMetrics();
+
+/** Cells `hints` take side by side, rounded up to a whole cell. */
+export function totalHintsWidth(hints: readonly Pick<PaneHint, "key" | "label" | "title" | "id">[], metrics: PaneHintMetrics = TERMINAL_HINT_METRICS): number {
+  return Math.ceil(hints.reduce((total, hint, index) => total + (index > 0 ? metrics.gap : 0) + metrics.width(hint), 0) - 1e-9);
+}
+
+/** Cells `segments` take side by side, separators and gaps included, the terminal's keys aside. */
+export function paneFooterInfoWidth(segments: readonly PaneFooterSegment[]): number {
+  return infoTextWidth(segments);
+}
+
+/** Cells a segment's parts take, a column between two as the footer draws them. */
+function partsWidth(parts: readonly PaneFooterPart[]): number {
+  return parts.reduce((sum, part, partIndex) => sum + (partIndex > 0 ? 1 : 0) + displayWidth(part.text), 0);
 }
 
 function infoTextWidth(segments: readonly PaneFooterSegment[]): number {
   if (segments.length === 0) return 0;
-  return segments.reduce((total, segment, index) => {
-    const text = segment.parts.reduce((sum, part, partIndex) => (
-      sum + (partIndex > 0 ? 1 : 0) + displayWidth(part.text)
-    ), 0);
-    return total + (index > 0 ? 1 : 0) + text;
-  }, 0);
+  return segments.reduce((total, segment, index) => (
+    total + (index > 0 ? segmentGapWidth(segments[index - 1]!, segment) : 0) + partsWidth(segment.parts)
+  ), 0);
 }
 
-/**
- * The info segments as they fit `width`: segments with `variants` step down
- * together, one variant at a time, until the row fits or none is left.
- */
-export function fitPaneFooterInfo(info: PaneFooterSegment[], width: number, { besideHints = true }: { besideHints?: boolean } = {}): PaneFooterSegment[] {
+/** Segments with `variants` step down together, one variant at a time, until they fit or none is left. */
+function stepDownTogether(info: PaneFooterSegment[], width: number): PaneFooterSegment[] {
   const stages = Math.max(0, ...info.map((segment) => segment.variants?.length ?? 0));
   let fitted = info;
   for (let stage = 0; stage < stages && infoTextWidth(fitted) > width; stage += 1) {
@@ -237,24 +390,159 @@ export function fitPaneFooterInfo(info: PaneFooterSegment[], width: number, { be
       } : segment;
     });
   }
-  // A trailing status cut mid-word reads as part of the hints beside it ("quote 12h t[x] put"): one that does not
-  // fit ends in an ellipsis a column short of them, or is left out when less than half of it would show. A
-  // warning, an icon or a pressable segment stays as it is, clipped by the row if it must be. With no hints beside it
-  // (a pane picture's footer), the row clips it, so a frame that fits its own status line sees it overflow.
-  while (besideHints && fitted.length > 1 && infoTextWidth(fitted) > width) {
-    const last = fitted.at(-1)!;
-    if (last.icon || last.onPress || last.parts.some((part) => part.tone === "warning" || part.tone === "negative")) break;
-    const room = width - infoTextWidth(fitted.slice(0, -1)) - 2;
-    if (room * 2 >= infoTextWidth([last])) return [...fitted.slice(0, -1), clipSegment(last, room)];
-    fitted = fitted.slice(0, -1);
+  return fitted;
+}
+
+/** A warning, an icon, a pressable segment or one marked `holdsPlace`, which a row too narrow never cuts or leaves out. */
+function holdsItsPlace(segment: PaneFooterSegment): boolean {
+  return !!segment.icon || !!segment.onPress || !!segment.holdsPlace || segment.parts.some((part) => part.tone === "warning" || part.tone === "negative");
+}
+
+/**
+ * A trailing status cut mid-word reads as part of the hints beside it ("quote
+ * 12h t[x] put"): the last segment that does not fit ends in an ellipsis (a
+ * column short of the hints when it ends the row), or is left out when less
+ * than half of it would show, until the row fits or only the first `keep`
+ * segments are left to give way. A warning, an icon or a pressable segment
+ * holds its place, clipped by the row if it must be; in the terminal
+ * (`pastHeld`) the text before it gives way instead (a delay clock after the
+ * count it qualifies), where the desktop stops there.
+ */
+function trimTrailing(info: PaneFooterSegment[], width: number, keep: number, pastHeld: boolean): PaneFooterSegment[] {
+  let fitted = info;
+  while (infoTextWidth(fitted) > width) {
+    const index = pastHeld
+      ? fitted.findLastIndex((segment) => !holdsItsPlace(segment))
+      : holdsItsPlace(fitted.at(-1)!) ? -1 : fitted.length - 1;
+    if (index < keep) break;
+    const segment = fitted[index]!;
+    const own = infoTextWidth([segment]);
+    const room = width - (infoTextWidth(fitted) - own) - (index === fitted.length - 1 ? 1 : 0);
+    const clipped = room * 2 >= own ? clipSegment(segment, room) : null;
+    if (clipped) return [...fitted.slice(0, index), clipped, ...fitted.slice(index + 1)];
+    fitted = [...fitted.slice(0, index), ...fitted.slice(index + 1)];
   }
   return fitted;
 }
 
-/** A segment cut to `width` behind an ellipsis, each part keeping its tone; the full text stays as its title. */
-function clipSegment(segment: PaneFooterSegment, width: number): PaneFooterSegment {
+/** A note line: a pane's notes said in words where nothing can open them (a pane picture), not behind its icon. */
+function isNoteLine(segment: PaneFooterSegment): boolean {
+  return !segment.icon && !!segment.notes?.length;
+}
+
+/**
+ * The most of a row a note line takes from the status beside it: the rest is
+ * the status's, so a capture's status line still says what its data is as of.
+ */
+const NOTE_LINE_SHARE = 0.6;
+
+/** Punctuation a cut note does not end on before its ellipsis: "unreconciled,…" reads "unreconciled…", "depth 1.…" "depth 1…". */
+const TRAILING_PUNCTUATION = /[\s,.;:·\-–—(]+$/u;
+
+/**
+ * `text` cut after its last whole word that fits `width` with an ellipsis,
+ * never inside a word; empty when not even its first word fits.
+ */
+export function cutAtWord(text: string, width: number): string {
+  if (displayWidth(text) <= width) return text;
+  const ellipsis = "…";
+  let best = "";
+  for (const match of text.matchAll(/\s+/g)) {
+    const head = text.slice(0, match.index).replace(TRAILING_PUNCTUATION, "");
+    if (!head) continue;
+    if (displayWidth(head) + displayWidth(ellipsis) > width) break;
+    best = head;
+  }
+  return best ? `${best}${ellipsis}` : "";
+}
+
+/**
+ * A pane's notes as one line `width` cells wide: the first note whole, or cut
+ * after a whole word with an ellipsis, then how many more there are (`+3
+ * more`), which the app opens from the footer's ⚠ (`!`). Where not even a
+ * word of it fits, the count of notes alone.
+ */
+export function noteLineParts(notes: readonly string[], width: number): PaneFooterPart[] {
+  const [first = "", ...rest] = notes;
+  const more = rest.length ? tf("+{count} more", { count: rest.length }) : "";
+  const tail: PaneFooterPart[] = more ? [{ text: more, tone: "label" }] : [];
+  const room = width - (more ? displayWidth(more) + 1 : 0);
+  const shown = cutAtWord(first, room);
+  if (shown) return [{ text: shown, tone: "warning" }, ...tail];
+  return [{ text: notes.length === 1 ? t("1 note") : tf("{count} notes", { count: notes.length }), tone: "warning" }];
+}
+
+/**
+ * Each note line in `info` at the room `width` leaves it: what the status
+ * beside it does not take, and at least NOTE_LINE_SHARE of the row while its
+ * first note needs that much, so a long status line gives way to its shorter
+ * forms before the note is cut.
+ */
+function fitNoteLines(info: PaneFooterSegment[], width: number): PaneFooterSegment[] {
+  if (!info.some(isNoteLine)) return info;
+  return info.map((segment, index) => {
+    if (!isNoteLine(segment)) return segment;
+    const notes = segment.notes!;
+    const others = infoTextWidth(info.map((other, at) => (at === index ? { ...other, parts: [] } : other)));
+    const room = Math.max(width - others, Math.floor(width * NOTE_LINE_SHARE));
+    return { ...segment, title: segment.title ?? notes.join("\n"), parts: noteLineParts(notes, room) };
+  });
+}
+
+/**
+ * The info segments as they fit `width`: an `age` (`5m ago`) is left out
+ * first, so the source and the date outlast it; then segments with `variants` step down
+ * together, one variant at a time, until the row fits or none is left; beside
+ * the hints, the trailing status that still does not fit is then cut or left
+ * out (trimTrailing). A status after every segment with shorter forms gives
+ * way first, before any of them shortens: a pane puts what goes first last
+ * (an update time after a note that explains the row in hand). A note line
+ * takes the room the rest leaves it (fitNoteLines).
+ *
+ * With no hints beside it, a pane picture's footer clips the rest, so a
+ * frame that fits its own status line sees it overflow; the terminal's (a
+ * pane not focused) cuts or leaves out the trailing status as it does beside
+ * the hints, so no segment ends mid-word.
+ */
+export function fitPaneFooterInfo(
+  info: PaneFooterSegment[],
+  width: number,
+  { besideHints = true, terminal = false }: { besideHints?: boolean; terminal?: boolean } = {},
+): PaneFooterSegment[] {
+  // How long ago the data loaded goes first, whole: a cut age (`fetched just`) says nothing.
+  if (infoTextWidth(info) > width && info.some((segment) => segment.age)) {
+    return fitPaneFooterInfo(info.filter((segment) => !segment.age), width, { besideHints, terminal });
+  }
+  if (info.some(isNoteLine)) {
+    // The rest fits beside the share a note line keeps; the note line then takes what they leave.
+    const held = info.map((segment): PaneFooterSegment => isNoteLine(segment) ? {
+      ...segment,
+      notes: undefined,
+      parts: [{ text: " ".repeat(Math.min(partsWidth(noteLineParts(segment.notes!, Number.POSITIVE_INFINITY)), Math.floor(width * NOTE_LINE_SHARE))),
+        tone: "warning" }],
+    } : segment);
+    const notesOf = new Map(info.filter(isNoteLine).map((segment) => [segment.id, segment.notes!]));
+    return fitNoteLines(fitPaneFooterInfo(held, width, { besideHints, terminal })
+      .map((segment) => notesOf.has(segment.id) ? { ...segment, notes: notesOf.get(segment.id) } : segment), width);
+  }
+  if (!besideHints && !terminal) return stepDownTogether(info, width);
+  const lastWithVariants = info.findLastIndex((segment) => (segment.variants?.length ?? 0) > 0);
+  if (lastWithVariants >= 0 && lastWithVariants < info.length - 1 && infoTextWidth(info) > width) {
+    const trimmed = trimTrailing(info, width, lastWithVariants + 1, terminal);
+    if (infoTextWidth(trimmed) <= width) return trimmed;
+  }
+  return trimTrailing(stepDownTogether(info, width), width, 1, terminal);
+}
+
+/**
+ * A segment cut after its last whole word that fits `width`, behind an
+ * ellipsis, each part keeping its tone; the full text stays as its title.
+ * Null when not even its first word fits: a word is never cut.
+ */
+function clipSegment(segment: PaneFooterSegment, width: number): PaneFooterSegment | null {
   const full = segment.parts.map((part) => part.text).join(" ");
-  const clipped = clipToDisplayWidth(full, width);
+  const clipped = cutAtWord(full, width);
+  if (!clipped) return null;
   if (clipped === full) return segment;
   const body = clipped.slice(0, -1);
   const parts: PaneFooterPart[] = [];
@@ -287,30 +575,55 @@ export interface PaneFooterHintRow {
   infoWidth: number;
 }
 
-/** Hints that fit this footer row, and the rest, which a More control owns. */
+export interface PaneFooterHintRowOptions {
+  /** The terminal's row (layoutPaneFooterHintRow); the desktop's leaves it out. */
+  terminal?: boolean;
+  /** What the terminal draws besides the status's own text (`[!]` after an icon). */
+  keysWidth?: number;
+}
+
+/**
+ * Hints that fit this footer row, and the rest, which a More control owns.
+ * The status gives way to the hints down to its floor (INFO_FLOOR_CHARS,
+ * WARNING_FLOOR_CHARS, or `iconReserve`, the cells its icons take). In the
+ * terminal the status is kept whole while the first hint and More still fit
+ * beside it, hints going under More from the right first, and the status and
+ * the hints keep a column between them, so they never read as one
+ * ("777 matchesU◷1[m]etric").
+ */
 export function layoutPaneFooterHintRow(
   footer: CombinedPaneFooter,
   contentWidth: number,
   iconReserve = 0,
+  metrics: PaneHintMetrics = TERMINAL_HINT_METRICS,
+  { terminal = false, keysWidth = 0 }: PaneFooterHintRowOptions = {},
 ): PaneFooterHintRow {
   const width = Math.max(0, Math.floor(contentWidth));
   const hints = footer.hints.filter((hint) => !hint.disabled);
-  const warning = footer.info.some((segment) => segment.parts.some((part) => part.tone === "warning" || part.tone === "negative"));
+  // A warning icon keeps its room after it has been read and turned muted.
+  const warning = footer.info.some((segment) => segment.icon === "warning"
+    || segment.parts.some((part) => part.tone === "warning" || part.tone === "negative"));
   const infoChars = infoTextWidth(footer.info);
   const textFloor = footer.info.length === 0 ? 0
     : warning || infoChars <= WARNING_FLOOR_CHARS ? Math.min(WARNING_FLOOR_CHARS, infoChars)
     : INFO_FLOOR_CHARS;
-  const infoFloor = Math.min(width, Math.max(iconReserve, textFloor));
-  const hintBudget = Math.max(0, width - infoFloor - (infoFloor > 0 && hints.length > 0 ? 1 : 0));
+  const status = footer.info.length === 0 ? 0 : infoChars + keysWidth;
+  const leastHints = hints.length === 0 ? 0 : Math.min(
+    totalHintsWidth(hints, metrics),
+    Math.ceil(metrics.width(hints[0]!) + metrics.gap + moreControl(Number.POSITIVE_INFINITY).width),
+  );
+  const wholeStatus = terminal && status > 0 && status + (leastHints > 0 ? HINT_GAP + leastHints : 0) <= width;
+  const infoFloor = Math.min(width, wholeStatus ? status : Math.max(iconReserve, textFloor));
+  const hintBudget = Math.max(0, width - infoFloor - (infoFloor > 0 && hints.length > 0 ? HINT_GAP : 0));
   const more = moreControl(hintBudget);
   let visible = hints;
   let overflow: PaneHint[] = [];
-  if (totalHintsWidth(hints) > hintBudget) {
-    const room = Math.max(0, hintBudget - more.width - (more.width > 0 ? HINT_GAP : 0));
+  if (totalHintsWidth(hints, metrics) > hintBudget) {
+    const room = Math.max(0, hintBudget - more.width - (more.width > 0 ? metrics.gap : 0));
     visible = [];
     let used = 0;
     for (const hint of hints) {
-      const next = used + (visible.length > 0 ? HINT_GAP : 0) + paneHintWidth(hint);
+      const next = used + (visible.length > 0 ? metrics.gap : 0) + metrics.width(hint);
       if (next > room) break;
       visible.push(hint);
       used = next;
@@ -318,28 +631,21 @@ export function layoutPaneFooterHintRow(
     overflow = hints.slice(visible.length);
   }
   const hintsWidth = overflow.length > 0
-    ? totalHintsWidth(visible) + (visible.length > 0 ? HINT_GAP : 0) + more.width
-    : totalHintsWidth(visible);
+    ? Math.ceil(totalHintsWidth(visible, metrics) + (visible.length > 0 ? metrics.gap : 0) + more.width)
+    : totalHintsWidth(visible, metrics);
   return {
     hints: visible,
     overflow,
     moreLabel: more.label,
     moreWidth: more.width,
     hintsWidth,
-    infoWidth: Math.max(0, width - hintsWidth),
+    infoWidth: Math.max(0, width - hintsWidth - (terminal && footer.info.length > 0 && hintsWidth > 0 ? HINT_GAP : 0)),
   };
 }
 
 /** The name a hint goes by in the pane menu: `[a]dd` is "Add", `[r]efresh` is "Refresh". */
-export function paneHintTitle(hint: Pick<PaneHint, "key" | "label" | "title">): string {
-  if (hint.title) return hint.title;
-  const label = hint.label.trim();
-  const key = hint.key;
-  const joined = key.length === 1 && /^[a-z]$/i.test(key) && /^[a-z]/.test(hint.label)
-    && !label.toLowerCase().startsWith(key.toLowerCase())
-    ? `${key}${label}`
-    : label;
-  return joined.charAt(0).toUpperCase() + joined.slice(1);
+export function paneHintTitle(hint: Pick<PaneHint, "key" | "label" | "title" | "id">): string {
+  return keyHintTitle(hint);
 }
 
 export function hasPaneFooterContent(footer?: CombinedPaneFooter | null): boolean {
@@ -379,10 +685,48 @@ export function combinePaneFooterRegistrations(registrations: Map<string, PaneFo
       if (!hint.disabled && onPress) menu.push({ id: `pane-hint:${hint.id}`, label: paneHintTitle(hint), onSelect: () => onPress() });
     }
   }
-  const shown = yielded.length > 0 ? hints.filter((hint) => !yielded.includes(hint)) : hints;
+  const kept = yielded.length > 0 ? hints.filter((hint) => !yielded.includes(hint)) : hints;
+  const shown = kept.some((hint) => !hint.besideOthers && !hint.disabled) ? kept : kept.filter((hint) => !hint.besideOthers);
 
   if (info.length === 0 && shown.length === 0 && menu.length === 0 && keys.length === 0) return EMPTY_FOOTER;
-  return { info, hints: shown, menu, keys };
+  return { info: savedCopyFirst(info.map(readableFailure)), hints: shown, menu, keys };
+}
+
+const failureTone = (part: PaneFooterPart) => part.tone === "warning" || part.tone === "negative";
+
+/**
+ * A failure a pane put in its footer itself, in words: a bare reason code
+ * (UPSTREAM_ERROR) reads as what happened, as `loadingErrorFooterInfo` says
+ * it. Only warning and negative parts, so a symbol shown as data stays.
+ */
+function readableFailure(segment: PaneFooterSegment): PaneFooterSegment {
+  const read = (parts: PaneFooterPart[]) => {
+    let changed = false;
+    const next = parts.map((part) => {
+      const text = failureTone(part) ? readableStatus(part.text) : part.text;
+      if (text === part.text) return part;
+      changed = true;
+      return { ...part, text };
+    });
+    return changed ? next : parts;
+  };
+  const parts = read(segment.parts);
+  const variants = segment.variants?.map(read);
+  const same = parts === segment.parts && (variants ?? []).every((variant, index) => variant === segment.variants![index]);
+  return same ? segment : { ...segment, parts, ...(variants ? { variants } : {}) };
+}
+
+/**
+ * The saved-copy segment in its one place: first, so it reads the same in
+ * every pane and is the last a narrow row cuts, and once, the oldest copy,
+ * when a list and the report it opens each register one.
+ */
+function savedCopyFirst(info: PaneFooterSegment[]): PaneFooterSegment[] {
+  let oldest: PaneFooterSegment | undefined;
+  for (const segment of info) {
+    if (segment.savedCopyAt != null && (oldest?.savedCopyAt == null || segment.savedCopyAt < oldest.savedCopyAt)) oldest = segment;
+  }
+  return oldest ? [oldest, ...info.filter((segment) => segment.savedCopyAt == null)] : info;
 }
 
 function sameFooterParts(left: PaneFooterPart[], right: PaneFooterPart[]): boolean {
@@ -439,6 +783,12 @@ export function samePaneFooterRegistration(
         && segment.shortcut === other.shortcut
         && !!segment.onPress === !!other.onPress
         && segment.disabled === other.disabled
+        && segment.savedCopyAt === other.savedCopyAt
+        && segment.age === other.age
+        && !!segment.capture === !!other.capture && !!segment.holdsPlace === !!other.holdsPlace
+        // The icon reads the same whatever its notes say; a picture of the pane prints them.
+        && (segment.notes ?? []).length === (other.notes ?? []).length
+        && (segment.notes ?? []).every((note, noteIndex) => note === other.notes![noteIndex])
         && sameFooterParts(segment.parts, other.parts)
         && (segment.variants?.length ?? 0) === (other.variants?.length ?? 0)
         && (segment.variants ?? []).every((variant, variantIndex) => sameFooterParts(variant, other.variants![variantIndex]!));

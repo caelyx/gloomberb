@@ -86,12 +86,19 @@ export interface SeriesLoadRequest {
 export interface SeriesAttribution {
   source: string;
   publisher?: string;
+  /** When its newest observation was published, an ISO instant, when the source says. */
+  publishedAt?: string;
 }
 
 export interface SeriesLoadResult {
   points: readonly SeriesPoint[];
   /** A note the chart shows above the plot, such as "cached data is stale". */
   warning?: string;
+  /**
+   * When the copy the points came from was saved (ms), when its refresh failed
+   * and that copy answered: the chart's footer says "saved copy from …".
+   */
+  savedAt?: number;
   /** What a report of this series cites in place of Gloom Cloud. */
   attribution?: SeriesAttribution;
 }
@@ -123,6 +130,13 @@ interface SeriesDefinitionBase {
   group?: string;
   /** Extra words the catalog search matches, such as a ticker the series is often read against. */
   tags?: readonly string[];
+  /**
+   * Words `fn G` charts the series by where a ticker goes (`hashrate`), each
+   * in lower case: only when no listing answers to the word, the quote source
+   * says it is not a ticker, and no other series has the word. A series with
+   * an `input` takes none.
+   */
+  aliases?: readonly string[];
   /** One sentence for the catalog search and for `gloomberb` automation. */
   description?: string;
   /**
@@ -133,6 +147,11 @@ interface SeriesDefinitionBase {
   publisher?: string;
   /** The publisher's page for the series. */
   url?: string;
+  /**
+   * A limit on the data the publisher sets, such as a cap on how far back its
+   * history goes. One sentence: the catalog lists it beside the series.
+   */
+  limitation?: string;
   /** Ask for a ticker, an option or a crypto pair before charting. */
   input?: SeriesInput;
   /**
@@ -165,6 +184,7 @@ export interface LoadedSeriesDefinition extends SeriesDefinitionBase {
    */
   lines?: readonly SeriesLine[];
   expression?: never;
+  rollsWith?: never;
 }
 
 /**
@@ -174,6 +194,13 @@ export interface LoadedSeriesDefinition extends SeriesDefinitionBase {
  */
 export interface ExpressionSeriesDefinition extends SeriesDefinitionBase {
   expression: string;
+  /**
+   * For a formula of continuous futures (`(2*42*RB=F + 42*HO=F - 3*CL=F)/3`):
+   * the leg, as the formula writes it (`CL=F`), whose delivery month every
+   * other leg is priced in, all rolling together on its roll day. Without it
+   * each leg is its own front month.
+   */
+  rollsWith?: string;
   load?: never;
   refreshMs?: never;
   style?: never;
@@ -203,6 +230,7 @@ export interface SeriesCatalogEntry {
   description?: string;
   publisher?: string;
   url?: string;
+  limitation?: string;
   input?: SeriesInput;
   placement?: SeriesPlacement;
   /** The lines of a series that draws several, each with the expression that charts it alone. */
@@ -210,5 +238,7 @@ export interface SeriesCatalogEntry {
   lines?: Array<{ id: string; name: string; style?: SeriesDrawStyle | "band"; expression: string }>;
   /** The chart expression; `{ticker}` stands for the input. */
   expression: string;
+  /** A futures formula's leg the others take their delivery month from (`CL=F`). */
+  rollsWith?: string;
   pluginId: string;
 }

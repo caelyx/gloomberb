@@ -37,6 +37,7 @@ export const filingEventsModule: PluginModule = {
       component: FilingEventsPane,
       instruments: ["equity"],
       isVisible: ({ ticker }) => !isKnownNonUsListing(ticker),
+      proOnly: true,
     });
   },
 
@@ -50,6 +51,7 @@ export const filingEventsModule: PluginModule = {
       icon: "K",
       component: FilingEventsPane,
       defaultPosition: "right",
+      shareItem: { ticker: true },
       tickerFollower: true,
       instruments: ["equity"],
       defaultMode: "floating",

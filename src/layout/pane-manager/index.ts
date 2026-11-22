@@ -3,25 +3,29 @@ export {
   FLOATING_PANE_MAX_Z,
   MIN_FLOAT_HEIGHT,
   MIN_FLOAT_WIDTH,
+  SHELL_DRAG_Z,
   type FloatingRect,
 } from "./floating";
 
 export {
+  dockStackTabIds,
   findDockLeaf,
   getDockDividerLayouts,
   getDockedPaneIds,
   getDockLeafLayouts,
   getDockResizeTargets,
   getDockSplitGeometry,
+  hiddenDockTabIds,
+  showDockTab,
   type DockDividerLayout,
   type DockGeometryOptions,
   type DockLeafLayout,
   type DockResizeTarget,
+  type DockTarget,
   type LayoutBounds,
 } from "./dock-tree";
 
 export {
-  findPaneLocation,
   getLayoutPreview,
   getLeafRect,
   isPaneDetached,
@@ -53,7 +57,19 @@ export {
   swapPanes,
 } from "./docking";
 
+export {
+  floatingSplitRects,
+  floatingStackMembers,
+  floatingStacks,
+  hiddenFloatingTabIds,
+  splitFloating,
+  stackFloatingOnto,
+  unstackFloating,
+  type FloatingSplitSide,
+} from "./floating-stack";
+
 export { restoreHiddenPanes } from "./hidden-panes";
+export { layoutWindowCounts, withoutTransientPanes } from "./transient";
 export {
   removeFloatingPanes,
   removePane,

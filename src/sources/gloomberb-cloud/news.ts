@@ -1,7 +1,9 @@
 import { normalizeNewsFeed } from "../../news/news-model";
 import { readableNewsSource } from "../../news/source-label";
 import { collectNewsDisplayTickers } from "../../news/ticker-symbols";
-import type { NewsArticle, NewsQuery, NewsStoryItem } from "../../types/news-source";
+import type { NewsAccess, NewsArticle, NewsQuery, NewsStoryItem } from "../../types/news-source";
+import type { NewsInsiderFiling } from "../../news/types";
+import { CLOUD_NEWS_DELAY_HOURS } from "../../api-client/plan-rules";
 import type {
   apiClient,
   CloudNewsListResponse,
@@ -11,6 +13,9 @@ import type {
 import type { CloudNewsParams } from "../../api-client/paths";
 import { parsePublicTickerKey, publicExchange } from "../../utils/exchanges";
 import { coinSearchName } from "../../utils/crypto-pair";
+import { currencyPairCode, isCurrencyCode } from "../../utils/currency-pair";
+import { commoditySearchName } from "../../market-data/commodity-names";
+import { futuresBoardContractForTicker } from "../../market-data/futures-board";
 import { logFailure } from "../../utils/log-failure";
 import { getListingSymbol, tickerHasListingSuffix } from "../listing-symbols";
 
@@ -27,13 +32,34 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
 
+type CloudNewsTickerLink = CloudNewsPayload["tickerLinks"][number];
+
+const statesMarketCap = (link: CloudNewsTickerLink) => typeof link.marketCap === "number" && link.marketCap > 0;
+
+/**
+ * One link a company: a symbol a story tags on several venues (ASML on
+ * Euronext Amsterdam and on NASDAQ) keeps its home listing, the line Gloom
+ * Cloud states the company's market cap on, else the venue tagged first. The
+ * tag stays where the company was first tagged.
+ */
+function homeListingLinks(links: readonly CloudNewsTickerLink[]): CloudNewsTickerLink[] {
+  const companies = new Map<string, CloudNewsTickerLink>();
+  links.forEach((link, index) => {
+    const symbol = link.symbol?.trim().toUpperCase() || `#${index}`;
+    const kept = companies.get(symbol);
+    if (!kept || (!statesMarketCap(kept) && statesMarketCap(link))) companies.set(symbol, link);
+  });
+  return [...companies.values()];
+}
+
 function mapCloudNewsTickers(
   item: CloudNewsPayload,
   fallbackTicker?: string,
 ): string[] {
-  const tickers = collectNewsDisplayTickers(
-    item.tickerLinks.flatMap((link) => [link.symbol, link.canonicalTicker]),
-  );
+  // Each company's listing: its canonical key, or its symbol on its venue.
+  const tickers = collectNewsDisplayTickers(homeListingLinks(item.tickerLinks).map((link) => (
+    link.canonicalTicker || (link.symbol && link.exchange ? `${link.symbol}:${link.exchange}` : link.symbol)
+  )));
   const fallbackTickers = collectNewsDisplayTickers([fallbackTicker]);
   if (tickers.length === 0) tickers.push(...fallbackTickers);
   return tickers;
@@ -55,6 +81,47 @@ function mapCloudNewsStoryItem(
       : publishedAt,
     hasArticleText: item.hasArticleText,
   };
+}
+
+const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+const ACCESSION = /^\d{10}-\d{2}-\d{6}$/;
+const positive = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value > 0;
+
+/** The Form 4s a story reports, each one whole: a filing a field of which does not read is left out. */
+function insiderFilings(payload: CloudNewsPayload["insiderFilings"]): NewsInsiderFiling[] {
+  if (!Array.isArray(payload)) return [];
+  return payload.flatMap((filing): NewsInsiderFiling[] => {
+    if (!filing || !ACCESSION.test(filing.accession) || !filing.insider?.trim()) return [];
+    if (!ISO_DAY.test(filing.firstTradeDate) || !ISO_DAY.test(filing.lastTradeDate) || !ISO_DAY.test(filing.filedOn)) return [];
+    if (!positive(filing.shares) || !positive(filing.value) || !positive(filing.weightedPrice) || !Number.isInteger(filing.lines)) return [];
+    if (filing.side !== "sale" && filing.side !== "purchase") return [];
+    return [{
+      accession: filing.accession,
+      form: filing.form || "4",
+      filedOn: filing.filedOn,
+      issuerName: filing.issuerName?.trim() || null,
+      ticker: filing.ticker?.trim().toUpperCase() || null,
+      insider: filing.insider.trim(),
+      title: filing.title?.trim() || null,
+      side: filing.side,
+      firstTradeDate: filing.firstTradeDate,
+      lastTradeDate: filing.lastTradeDate,
+      lines: filing.lines,
+      shares: filing.shares,
+      value: filing.value,
+      weightedPrice: filing.weightedPrice,
+      rule10b51: typeof filing.rule10b51 === "boolean" ? filing.rule10b51 : null,
+      url: /^https:\/\/www\.sec\.gov\//.test(filing.url) ? filing.url : "",
+    }];
+  });
+}
+
+/** A folded row's notices, when the service says how many (two or more) and since when. */
+function routineNotices(payload: CloudNewsPayload["routine"]): NewsArticle["routine"] | null {
+  if (!payload || !Number.isInteger(payload.notices) || payload.notices < 2) return null;
+  const since = new Date(payload.since);
+  if (Number.isNaN(since.getTime())) return null;
+  return { kind: payload.kind, notices: payload.notices, since, programme: payload.programme ?? null };
 }
 
 export function mapCloudNewsArticle(
@@ -99,6 +166,8 @@ export function mapCloudNewsArticle(
     isDeveloping: !!item.flags?.developing,
     sourceCount: item.sourceCount,
     items: item.items?.map(mapCloudNewsStoryItem) ?? [],
+    ...(routineNotices(item.routine) ? { routine: routineNotices(item.routine)! } : {}),
+    ...(item.insiderFilings ? { insiderFilings: insiderFilings(item.insiderFilings) } : {}),
   };
 }
 
@@ -134,29 +203,96 @@ export function cloudNewsParams(query: NewsQuery): CloudNewsParams {
   };
 }
 
-/** A page of Gloom Cloud stories, with the text searched for when a coin pair's feed had none filed under it. */
-export type CloudNewsRead = CloudNewsListResponse & { searchedFor?: string };
+/**
+ * A page of Gloom Cloud stories, with the text searched for when a coin pair's
+ * feed had none filed under it, and which news the service answered with.
+ */
+export type CloudNewsRead = Omit<CloudNewsListResponse, "access"> & { searchedFor?: string; access?: NewsAccess | null };
 
-type CloudNewsClient = Pick<typeof apiClient, "getCloudNews" | "searchCloudNews">;
+/**
+ * How recently the service must have seen a story for the answer to be the
+ * live wire. It holds a story back from an account without real-time news
+ * until it last saw it {@link CLOUD_NEWS_DELAY_HOURS} hours ago; the hour
+ * less leaves room for this clock and the service's to disagree.
+ */
+const LIVE_STORY_WINDOW_MS = (CLOUD_NEWS_DELAY_HOURS - 1) * 60 * 60 * 1000;
+
+/**
+ * Which news a Gloom Cloud answer is, from the answer: what the service says
+ * when it says it; held back when the request carried no session, since the
+ * service holds news back for anyone it cannot name; live when it holds a
+ * story seen too recently to have been held back. Otherwise null: a quiet
+ * feed read live looks the same as a held-back one.
+ */
+export function cloudNewsAccess(
+  response: Pick<CloudNewsListResponse, "items" | "access">,
+  sentSession: boolean,
+  now = Date.now(),
+): NewsAccess | null {
+  if (response.access === "realtime" || response.access === "delayed") return response.access;
+  if (!sentSession) return "delayed";
+  const live = response.items.some((item) => {
+    const seenAt = Date.parse(item.lastSeenAt);
+    return Number.isFinite(seenAt) && now - seenAt < LIVE_STORY_WINDOW_MS;
+  });
+  return live ? "realtime" : null;
+}
+
+/** A client that cannot say whether a session goes with its requests (a test double) is taken to send one. */
+type CloudNewsClient = Pick<typeof apiClient, "getCloudNews" | "searchCloudNews">
+  & Partial<Pick<typeof apiClient, "hasSessionCredential">>;
+
+/** The NI code of the metal markets: prices, futures, bullion and the trusts that hold it, not a miner's releases. */
+export const METALS_NEWS_TOPIC = "metals";
+/** The topic the service tags oil, gas and power market stories with. */
+export const ENERGY_NEWS_TOPIC = "energy";
+
+/**
+ * What a ticker no story is filed under is searched by: a coin pair's coin
+ * ("bitcoin" for BTC-USD), a currency pair as markets write it ("EUR/USD" for
+ * EURUSD=X), or a futures board symbol's commodity ("cocoa" for CC=F), as
+ * `news` searches them. A metal's future (GC=F, SI=F, HG=F, PL=F, PA=F,
+ * ALI=F) searches the metals stories only, as `news GC=F` does: the stories
+ * that merely name gold are mostly miners' releases. Null for anything else,
+ * and for a future with no commodity name (ES=F, ZN=F).
+ */
+function newsFallbackSearch(query: Pick<NewsQuery, "ticker" | "exchange" | "listingName">): { text: string; topics?: string[] } | null {
+  const coin = coinSearchName(query.ticker, query.exchange, query.listingName);
+  if (coin) return { text: coin };
+  // FX stories write the pair with its slash ("EUR/USD rebounds"); spot gold (XAUUSD=X) is no currency pair.
+  const pair = query.ticker ? currencyPairCode(query.ticker, query.exchange) : null;
+  if (pair && isCurrencyCode(pair.slice(0, 3)) && isCurrencyCode(pair.slice(3))) return { text: `${pair.slice(0, 3)}/${pair.slice(3)}` };
+  const future = query.ticker ? futuresBoardContractForTicker(parsePublicTickerKey(query.ticker).symbol) : null;
+  const text = future ? commoditySearchName(future) : null;
+  if (!future || !text) return null;
+  return future.sector === "metals" ? { text, topics: [METALS_NEWS_TOPIC] } : { text };
+}
 
 /**
  * A news query's first page from Gloom Cloud. Stories are filed under company
- * tickers, and a coin pair (BTC-USD) rarely has any filed under it, so its
- * empty feed falls back to the stories that mention the coin ("bitcoin"),
- * marked with what was searched. A later page, a failed search or a coin with
- * no name to search keeps the empty answer.
+ * tickers, and a coin pair (BTC-USD), a currency pair (EURUSD=X) or a future
+ * (CC=F) rarely has any filed under it, so its empty feed falls back to the
+ * stories that mention the coin, the pair or the commodity ("bitcoin",
+ * "EUR/USD", "cocoa"), marked with what was searched. A
+ * later page, a failed search or a ticker with no name to search keeps the
+ * empty answer.
  */
 export async function readCloudNews(client: CloudNewsClient, query: NewsQuery): Promise<CloudNewsRead> {
+  // Asked in the tick the request goes out in, which is when its headers take the session.
+  const sentSession = client.hasSessionCredential?.() ?? true;
   const response = await client.getCloudNews(cloudNewsParams(query));
-  if (response.items.length > 0 || query.cursor || normalizeNewsFeed(query) !== "ticker") return response;
-  const text = coinSearchName(query.ticker, query.exchange, query.listingName);
-  if (!text) return response;
-  const found = await client.searchCloudNews(text, query.limit)
-    .catch(logFailure("sources.gloomberb-cloud.news", "Search a coin's stories failed", null));
-  return found && found.items.length > 0 ? { items: found.items, nextCursor: null, searchedFor: text } : response;
+  const read: CloudNewsRead = { ...response, access: cloudNewsAccess(response, sentSession) };
+  if (response.items.length > 0 || query.cursor || normalizeNewsFeed(query) !== "ticker") return read;
+  const search = newsFallbackSearch(query);
+  if (!search) return read;
+  const found = await client.searchCloudNews(search.text, query.limit, search.topics)
+    .catch(logFailure("sources.gloomberb-cloud.news", "Search the stories that mention a ticker's coin, pair or commodity failed", null));
+  return found && found.items.length > 0
+    ? { items: found.items, nextCursor: null, searchedFor: search.text, access: cloudNewsAccess(found, sentSession) }
+    : read;
 }
 
-/** A read's stories as articles, each marked with the text a coin's fallback searched for. */
+/** A read's stories as articles, each marked with the text a coin's or a future's fallback searched for. */
 export function cloudNewsReadArticles(read: CloudNewsRead, ticker?: string): NewsArticle[] {
   return read.items.map((item) => {
     const article = mapCloudNewsArticle(item, read.searchedFor ? undefined : ticker);
@@ -164,7 +300,7 @@ export function cloudNewsReadArticles(read: CloudNewsRead, ticker?: string): New
   });
 }
 
-/** What a pane or report says above the stories a coin's fallback found: "No stories are filed under BTC-USD; these mention bitcoin." */
-export function coinNewsFallbackNotice(ticker: string, searchedFor: string): string {
+/** What a pane or report says above the stories a fallback found: "No stories are filed under CC=F; these mention cocoa." */
+export function newsFallbackNotice(ticker: string, searchedFor: string): string {
   return `No stories are filed under ${ticker}; these mention ${searchedFor}.`;
 }

@@ -49,6 +49,7 @@ function formatFullCurrencyValue(
   options: MarketFormatOptions = {},
 ): string | null {
   if (unit.trim() === INDEX_POINTS_UNIT) return formatMarketPrice(value, { ...options, assetCategory, priceBasis: "points" });
+  if (unit.trim() === "32nds") return formatMarketPrice(value, { ...options, assetCategory, priceBasis: "thirty-seconds" });
   const currency = unitCurrencyCode(unit);
   return currency ? formatMarketPriceWithCurrency(value, currency, { ...options, assetCategory }) : null;
 }
@@ -190,13 +191,34 @@ function ticksFitRows(domain: CompositeAxisDomain, values: number[]): boolean {
   return true;
 }
 
-/** Round values inside a linear domain, so every gridline carries a readable
- * value. A log axis, or a short terminal panel no round step fits, keeps its
+// Every label on an axis reads its ticks again (see `compactAxisNumber`).
+const tickValues = new WeakMap<CompositeAxisDomain, readonly number[]>();
+
+/** Round values inside the domain, so every gridline carries a readable
+ * value: steps of 1, 2 or 5 on a linear axis, powers of ten and their 2 and 5
+ * steps on a log one. A short terminal panel no round value fits keeps its
  * top, middle and bottom values. */
-function axisTickValues(domain: CompositeAxisDomain): number[] {
+function axisTickValues(domain: CompositeAxisDomain): readonly number[] {
+  let values = tickValues.get(domain);
+  if (!values) {
+    values = computeAxisTickValues(domain);
+    tickValues.set(domain, values);
+  }
+  return values;
+}
+
+function computeAxisTickValues(domain: CompositeAxisDomain): number[] {
   const span = domain.max - domain.min;
-  if (domain.scale === "log" || !Number.isFinite(span) || span <= 0) return edgeTickValues(domain);
+  if (!Number.isFinite(span) || span <= 0) return edgeTickValues(domain);
   const maxTicks = Math.max(2, domain.maxTicks ?? DEFAULT_AXIS_MAX_TICKS);
+  if (domain.scale === "log") {
+    const round = logAxisTickValues(domain, maxTicks);
+    if (round) return round;
+    // Narrower than its ladder (a log panel over one price range): round
+    // linear steps, where the log axis puts them, about a row apart.
+  }
+  const grid = axisTickGrid(domain);
+  if (grid) return gridAxisTickValues(domain, grid, span, maxTicks);
   // Walk the 1-2-5 ladder around the target spacing and keep the step whose
   // tick count lands nearest the target, one extra tick allowed.
   let step = adjacentNiceStep(adjacentNiceStep(niceCeilStep(span / (maxTicks - 1)), -1), -1);
@@ -205,7 +227,7 @@ function axisTickValues(domain: CompositeAxisDomain): number[] {
     const values = stepMultiples(domain.min, domain.max, step);
     if (values.length >= 2 && values.length <= maxTicks + 1
       && (best.length === 0 || Math.abs(values.length - maxTicks) < Math.abs(best.length - maxTicks))
-      && ticksFitRows(domain, values)) {
+      && ticksFitRows(domain, values) && ticksClearOnLogAxis(domain, values, maxTicks)) {
       best = values;
     }
     step = adjacentNiceStep(step, 1);
@@ -213,6 +235,143 @@ function axisTickValues(domain: CompositeAxisDomain): number[] {
   // Round labels win only where they are at least as many as the exact ones.
   const edges = edgeTickValues(domain);
   return best.length >= Math.max(2, edges.length) ? best : edges;
+}
+
+/**
+ * Whether even steps placed at exact heights on a log axis stay about a row
+ * apart: a log axis crowds them towards its top, and a short panel ran $80 to
+ * $30 down consecutive rows. `maxTicks` gives a label two rows, so half its
+ * even spacing is about a row. A terminal axis has `ticksFitRows` instead.
+ */
+function ticksClearOnLogAxis(domain: CompositeAxisDomain, values: readonly number[], maxTicks: number): boolean {
+  if (domain.scale !== "log" || domain.tickRows !== undefined) return true;
+  const row = 1 / (2 * (maxTicks - 1));
+  const ratios = values.map((value) => axisTickRatio(domain, value)).sort((left, right) => left - right);
+  return ratios.every((ratio, index) => index === 0 || ratio - ratios[index - 1]! >= row * (1 - 1e-9));
+}
+
+/** What a log axis labels in each decade: its power of ten, then the 2 and 5 steps where there is room. */
+const LOG_TICK_MANTISSAS: readonly number[] = [1, 2, 5];
+
+/** The 1, 2 or 5 a value is that many powers of ten of, or null for any other value. */
+function logTickMantissa(value: number): number | null {
+  if (!(value > 0) || !Number.isFinite(value)) return null;
+  const mantissa = Number((value / 10 ** Math.floor(Math.log10(value) + 1e-9)).toPrecision(9));
+  return LOG_TICK_MANTISSAS.find((candidate) => candidate === mantissa) ?? null;
+}
+
+/** `mantissas` times each power of ten from `min` to `max`, top first; with a `stride`, every so many powers alone. */
+function logLadderValues(min: number, max: number, mantissas: readonly number[], stride = 1): number[] {
+  const values: number[] = [];
+  for (let power = Math.floor(Math.log10(max) + 1e-9); power >= Math.floor(Math.log10(min)) - 1 && values.length <= 50; power -= 1) {
+    if (power % stride !== 0) continue;
+    for (const mantissa of [...mantissas].reverse()) {
+      const value = Number((mantissa * 10 ** power).toPrecision(12));
+      if (value <= max * (1 + 1e-9) && value >= min * (1 - 1e-9)) values.push(value);
+    }
+  }
+  return values;
+}
+
+/**
+ * Round values on a log axis: powers of ten and their 2 and 5 steps where the
+ * panel has room for them all, else the powers alone, else every second,
+ * third or later power. A terminal panel puts each on the row nearest it, a row clear
+ * of the next, powers first: a row of a log axis spans a factor, and its
+ * labels are uneven anyway, so no row's value comes closer to a round one.
+ * Null when fewer than two are left, as on a range inside one decade.
+ */
+function logAxisTickValues(domain: CompositeAxisDomain, maxTicks: number): number[] | null {
+  if (!(domain.min > 0) || !(domain.max > domain.min)) return null;
+  const powers = logLadderValues(domain.min, domain.max, [1]);
+  const ladders = [logLadderValues(domain.min, domain.max, LOG_TICK_MANTISSAS), powers];
+  for (let stride = 2; stride <= powers.length && stride <= 50; stride += 1) ladders.push(logLadderValues(domain.min, domain.max, [1], stride));
+  for (const values of ladders) {
+    if (values.length > maxTicks) continue;
+    const placed = logTicksOnRows(domain, values);
+    if (placed.length >= 2) return placed;
+  }
+  return null;
+}
+
+function logTicksOnRows(domain: CompositeAxisDomain, values: readonly number[]): number[] {
+  const rows = domain.tickRows;
+  if (rows === undefined) return [...values];
+  const lastRow = rows - 1;
+  if (lastRow < 1) return [];
+  const rank = (value: number) => LOG_TICK_MANTISSAS.indexOf(logTickMantissa(value) ?? 5);
+  const kept: Array<{ value: number; row: number }> = [];
+  for (const value of [...values].sort((left, right) => rank(left) - rank(right))) {
+    const row = Math.round(axisTickRatio(domain, value) * lastRow);
+    if (kept.some((tick) => Math.abs(tick.row - row) < 2)) continue;
+    kept.push({ value, row });
+  }
+  return kept.map(({ value }) => value).sort((left, right) => right - left);
+}
+
+/** Whether a log axis labels its powers of ten and their steps, each of which reads as itself. */
+function labelsLogLadder(domain: CompositeAxisDomain): boolean {
+  return domain.scale === "log" && axisTickValues(domain).every((value) => logTickMantissa(value) !== null);
+}
+
+// Half a 32nd: the finest step a 32nds axis ticks on when its series name no grid of their own.
+const HALF_THIRTY_SECOND = 1 / 64;
+
+/**
+ * The grid a linear axis's ticks fall on: its series' own (a Treasury
+ * future's fraction of a 32nd), else half a 32nd on an axis quoted in 32nds.
+ * None on a decimal axis.
+ */
+function axisTickGrid(domain: CompositeAxisDomain): number | undefined {
+  if (domain.scale === "log") return undefined;
+  const grid = domain.tickGrid ?? (domain.unit.trim() === "32nds" ? HALF_THIRTY_SECOND : undefined);
+  return grid !== undefined && Number.isFinite(grid) && grid > 0 ? grid : undefined;
+}
+
+// Steps a 32nds axis takes, in 32nds, between its finest grid and a whole point.
+const THIRTY_SECONDS_STEPS = [1, 2, 3, 4, 6, 8, 12, 16];
+
+/**
+ * Steps on a fractional grid, as a Treasury price reads: the grid doubled up
+ * to a 32nd, then 1, 2, 3, 4, 6, 8, 12 and 16 32nds, then whole points on the
+ * 1-2-5 ladder. Each is a multiple of the grid and no wider than the axis.
+ */
+function gridSteps(grid: number, span: number): number[] {
+  const steps: number[] = [];
+  for (let step = grid; step < 1 / 32 - 1e-12; step *= 2) steps.push(step);
+  steps.push(...THIRTY_SECONDS_STEPS.map((count) => count / 32));
+  for (let step = 1; step <= span * (1 + 1e-9); step = adjacentNiceStep(step, 1)) steps.push(step);
+  return steps.filter((step) => step >= grid * (1 - 1e-9) && step <= span * (1 + 1e-9)
+    && Math.abs(step / grid - Math.round(step / grid)) < 1e-9);
+}
+
+/**
+ * Ticks on a fractional grid (`gridSteps`), keeping the step whose count
+ * lands nearest the target, as the decimal ladder does. Where no step gives
+ * as many as the top, middle and bottom, those are kept instead, each moved
+ * onto the grid: no label reads 104-25.60.
+ */
+function gridAxisTickValues(domain: CompositeAxisDomain, grid: number, span: number, maxTicks: number): number[] {
+  let best: number[] = [];
+  for (const step of gridSteps(grid, span)) {
+    const values = stepMultiples(domain.min, domain.max, step);
+    if (values.length >= 2 && values.length <= maxTicks + 1
+      && (best.length === 0 || Math.abs(values.length - maxTicks) < Math.abs(best.length - maxTicks))
+      && ticksFitRows(domain, values)) {
+      best = values;
+    }
+  }
+  const edges = edgeTickValues(domain);
+  if (best.length >= Math.max(2, edges.length)) return best;
+  const onGrid = edges.map((value, index) => {
+    // The top rounds down and the bottom up, so neither leaves the axis.
+    const units = value / grid;
+    const whole = index === 0 ? Math.floor(units + 1e-9) : index === edges.length - 1 ? Math.ceil(units - 1e-9) : Math.round(units);
+    return Number((whole * grid).toPrecision(12));
+  }).filter((value) => value >= domain.min - grid * 1e-9 && value <= domain.max + grid * 1e-9);
+  const snapped = [...new Set(onGrid)];
+  return snapped.length >= best.length && snapped.length > 0 ? snapped
+    : best.length > 0 ? best : [Number((Math.round((domain.min + domain.max) / 2 / grid) * grid).toPrecision(12))];
 }
 
 /** The narrowest distance between neighbouring ticks. A log axis bunches its
@@ -306,7 +465,8 @@ export function formatChartLegendValue(
       ...(referencePrice === undefined ? {} : stablePriceOptions("USD", assetCategory, referencePrice)) });
   }
   if (group.startsWith("derived-unit:")) return `${compact} ${trimmed}`;
-  if (group.split(":")[0] === "currency-total") {
+  // A total in a currency reads at its scale ($223.4B), as a coin's volume, the value it traded, does too.
+  if (group.split(":")[0] === "currency-total" || (group === "volume" && unitCurrencyCode(trimmed))) {
     const scale = ([[1e12, "T"], [1e9, "B"], [1e6, "M"], [1e3, "K"]] as const)
       .find(([divisor]) => Math.abs(value) >= divisor);
     if (scale) {
@@ -344,9 +504,10 @@ function trimmedDecimals(label: string): number {
  * to the digits the finest tick needs, so the column reads $0 / $50 / $100. */
 function compactAxisNumber(value: number, domain: CompositeAxisDomain): string {
   const compact = compactNumber(value);
-  if (domain.scale === "log") return compact;
   const ticks = axisTickValues(domain);
   if (!ticks.some((tick) => Math.abs(tick - value) <= Math.abs(tick) * 1e-9)) return compact;
+  // A log axis's powers of ten and their steps each read as themselves: $0.1, $1, $10.
+  if (labelsLogLadder(domain)) return compact.replace(/(\.\d*?)0+([KMBT]?)$/, "$1$2").replace(/\.([KMBT]?)$/, "$1");
   const decimals = Math.max(...ticks.map((tick) => trimmedDecimals(compactNumber(tick))));
   const match = COMPACT_LABEL.exec(compact);
   if (!match || !Number.isFinite(decimals)) return compact;
@@ -362,11 +523,13 @@ export function formatCompositeAxisValue(value: number, domain: CompositeAxisDom
   // Derived dimensions are included in the legend value. Axis labels stay
   // numeric so a narrow gutter cannot truncate USD/JPY into a false USD label.
   if (group.startsWith("derived-unit:")) return compact;
+  // Treasury prices keep their whole points and 32nds at every zoom level.
+  if (domain.unit.trim() === "32nds") return formatAxisPriceValue(value, domain);
   // Compact labels suit a wide view, but a zoomed one can hold several ticks
   // inside a single rounding step and print one repeated price down the gutter.
   // Where that happens the axis spends the digits needed to tell them apart,
   // shared across every tick so the column reads as one scale.
-  const gap = narrowestAxisTickGap(domain);
+  const gap = labelsLogLadder(domain) ? null : narrowestAxisTickGap(domain);
   const prefix = currencyPrefix(domain.unit);
   if (gap !== null && gap < compactResolution(value)) {
     const resolved = formatAxisPriceValue(value, domain, {
@@ -394,7 +557,27 @@ export function formatCompositeCursorValue(value: number, domain: CompositeAxisD
   return formatCompositeAxisValue(value, domain);
 }
 
-export type CompositeAxisValueFormatter = (value: number, domain: CompositeAxisDomain) => string;
+/**
+ * An axis label for a value. It must read only the value and the axis: the
+ * ticks and gutter widths it labels are kept per formatter and axis (see
+ * `axisResultCache`), so one that reads anything else (a currency, a setting)
+ * is a new function whenever that changes.
+ */
+export interface CompositeAxisValueFormatter {
+  (value: number, domain: CompositeAxisDomain): string;
+  /**
+   * A value tag on the axis (the last value, the prior close, a level, the
+   * cursor) at the value's own precision, where the ticks round to the
+   * plotted range: 3.75% beside ticks of 3.5% and 4.0%. Same rule as the
+   * ticks: the value and the axis only.
+   */
+  readonly tag?: (value: number, domain: CompositeAxisDomain) => string;
+}
+
+/** How a value tag reads on an axis labeled by `format`: its own tag precision, else its tick label, else the cursor's full price. */
+export function compositeAxisTagFormatter(format: CompositeAxisValueFormatter | undefined): CompositeAxisValueFormatter {
+  return format?.tag ?? format ?? formatCompositeCursorValue;
+}
 
 type LabeledTick = { value: number; label: string };
 
@@ -406,10 +589,12 @@ function repeatsLabel(ticks: LabeledTick[]): boolean {
  * (2k 2k 1.9k). The axis then climbs the 1-2-5 ladder until its labels
  * differ, and failing that keeps its top and bottom, or the top alone. */
 function distinctAxisTicks(domain: CompositeAxisDomain, format: CompositeAxisValueFormatter): LabeledTick[] {
-  const label = (values: number[]) => values.map((value) => ({ value, label: format(value, domain) }));
+  const label = (values: readonly number[]) => values.map((value) => ({ value, label: format(value, domain) }));
   const ticks = label(axisTickValues(domain));
   if (ticks.length < 2 || !repeatsLabel(ticks)) return ticks;
-  if (domain.scale !== "log") {
+  // A grid's ticks are already its coarsest that fit; a coarser decimal step would leave the grid.
+  // A log axis's powers of ten have no coarser step either.
+  if (!labelsLogLadder(domain) && !axisTickGrid(domain)) {
     const gap = Math.abs(ticks[0]!.value - ticks[1]!.value);
     let step = niceCeilStep(gap);
     if (step <= gap * (1 + 1e-9)) step = adjacentNiceStep(step, 1);
@@ -426,15 +611,96 @@ function distinctAxisTicks(domain: CompositeAxisDomain, format: CompositeAxisVal
   return top.label !== bottom.label ? [top, bottom] : [top];
 }
 
+/** Whether two records hold equal values under every key either has; a key set to undefined reads as absent. */
+function sameFields(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+  same: (left: unknown, right: unknown) => boolean,
+): boolean {
+  for (const key of Object.keys(left)) {
+    if (!same(left[key], right[key])) return false;
+  }
+  for (const key of Object.keys(right)) {
+    if (!Object.hasOwn(left, key) && !same(undefined, right[key])) return false;
+  }
+  return true;
+}
+
+function sameAxisDomainValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return left.length === right.length && left.every((value, index) => Object.is(value, right[index]));
+  }
+  if (!left || !right || typeof left !== "object" || typeof right !== "object") return false;
+  if (Array.isArray(left) || Array.isArray(right)) return false;
+  return sameFields(left as Record<string, unknown>, right as Record<string, unknown>, Object.is);
+}
+
+/**
+ * Whether two axes read the same: every field either has equal, its lists
+ * and records one level down. A chart builds its axes again on every tick,
+ * and they come out the same until the price leaves the range.
+ */
+export function sameCompositeAxisDomain(left: CompositeAxisDomain, right: CompositeAxisDomain): boolean {
+  if (left === right) return true;
+  return sameFields(
+    left as unknown as Record<string, unknown>,
+    right as unknown as Record<string, unknown>,
+    sameAxisDomainValue,
+  );
+}
+
+export type CompositeAxisTick = { ratio: number; value: number; label: string };
+
+/**
+ * The last results worked out for an axis under each formatter, kept for the
+ * next scene's equal axes. They hold while the formatter reads only the value
+ * and the axis (see `CompositeAxisValueFormatter`). Each hit labels the axis's
+ * top once more and works the result out again when that label changed, so a
+ * formatter that reads something else and kept its identity cannot keep
+ * stale labels past a change that moves its top label.
+ */
+export function axisResultCache<Value>(size = 8): (
+  domain: CompositeAxisDomain,
+  format: CompositeAxisValueFormatter,
+  key: string,
+  compute: () => Value,
+) => Value {
+  type Entry = { domain: CompositeAxisDomain; key: string; probe: string; value: Value };
+  const byFormat = new WeakMap<CompositeAxisValueFormatter, Entry[]>();
+  return (domain, format, key, compute) => {
+    let entries = byFormat.get(format);
+    if (!entries) {
+      entries = [];
+      byFormat.set(format, entries);
+    }
+    const probe = format(domain.max, domain);
+    const index = entries.findIndex((entry) => entry.key === key && sameCompositeAxisDomain(entry.domain, domain));
+    if (index >= 0) {
+      const [entry] = entries.splice(index, 1);
+      if (entry!.probe === probe) {
+        entries.unshift(entry!);
+        return entry!.value;
+      }
+    }
+    const value = compute();
+    entries.unshift({ domain, key, probe, value });
+    if (entries.length > size) entries.length = size;
+    return value;
+  };
+}
+
+const cachedAxisTicks = axisResultCache<readonly CompositeAxisTick[]>();
+
 export function compositeAxisTicks(
   domain: CompositeAxisDomain,
   format: CompositeAxisValueFormatter = formatCompositeAxisValue,
-): Array<{ ratio: number; value: number; label: string }> {
-  return distinctAxisTicks(domain, format).map(({ value, label }) => ({
+): readonly CompositeAxisTick[] {
+  return cachedAxisTicks(domain, format, "", () => distinctAxisTicks(domain, format).map(({ value, label }) => ({
     ratio: axisTickRatio(domain, value),
     value,
     label,
-  }));
+  })));
 }
 
 /** Gridlines follow the ticks of the panel's labeled axis, left first. The
@@ -468,7 +734,7 @@ function utcTime(date: Date): string {
 function onClock(date: Date, timeZone: string | undefined): { wall: Date; zone: string } {
   if (!timeZone || timeZone === "UTC") return { wall: date, zone: "UTC" };
   try {
-    return { wall: new Date(zonedWallClockMs(date.getTime(), timeZone)), zone: timeZoneLabel(timeZone) };
+    return { wall: new Date(zonedWallClockMs(date.getTime(), timeZone)), zone: timeZoneLabel(timeZone, date.getTime()) };
   } catch {
     return { wall: date, zone: "UTC" };
   }
@@ -517,6 +783,7 @@ export function formatCompositePointDetails(point: TimeSeriesPoint | null | unde
     details.push(`${isFiscalPeriod ? "Period ended" : "Observed"} ${observedAt}`);
   }
   if (availableAt && availableAt !== observedAt) details.push(`Available ${availableAt}`);
+  if (point.nativeAmount) details.push(`Native ${compactNumber(point.nativeAmount.value)} ${point.nativeAmount.currency}`);
 
   const quality = point.provenance?.quality;
   if (quality) details.push(`${quality[0]!.toUpperCase()}${quality.slice(1)}`);
@@ -541,10 +808,16 @@ export function formatCompositeTimeAxisDate(date: Date, startTime: number, endTi
  * The crosshair's place on the time axis. Intraday bars keep their time of
  * day however wide the chart is: a three-month chart of 30-minute bars has
  * thirteen under each date, and the cursor sits on one of them.
+ *
+ * A day with no time of day reads as the axis's own end labels do (`3 Nov
+ * 2026`) when `words` is set, as the desktop and the web set it: their tag is
+ * a badge apart from the ticks. In cells the tag has no other mark, so it
+ * keeps the ISO date no tick is written in.
  */
 export function formatCompositeCursorAxisDate(
-  date: Date, startTime: number, endTime: number, timeZone: string | undefined, intradayBars: boolean,
+  date: Date, startTime: number, endTime: number, timeZone: string | undefined, intradayBars: boolean, words = false,
 ): string {
+  if (words && !intradayBars && !isIntradaySpan(startTime, endTime)) return formatCompositeAxisDay(onClock(date, timeZone).wall);
   if (!intradayBars || isIntradaySpan(startTime, endTime)) return formatCompositeTimeAxisDate(date, startTime, endTime, timeZone);
   const { wall, zone } = onClock(date, timeZone);
   return `${utcDate(wall)} ${utcTime(wall)} ${zone}`;
@@ -552,16 +825,25 @@ export function formatCompositeCursorAxisDate(
 
 const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
 
-/** A dataset observation's day as the axis words it, `Oct 4`, with the year when the chart ends in another. */
+/**
+ * A day as the time axis words its end labels, `3 Nov 2026`, so the tag the
+ * crosshair puts on the axis reads like the ticks beside it. `wall` is
+ * already on the chart's clock.
+ */
+function formatCompositeAxisDay(wall: Date): string {
+  return `${wall.getUTCDate()} ${MONTH_NAMES[wall.getUTCMonth()]} ${wall.getUTCFullYear()}`;
+}
+
+/** A dataset observation's day as the axis words it, `4 Oct`, with the year when the chart ends in another. */
 export function formatCompositeDatasetDate(date: Date, endTime: number | undefined): string {
-  const text = `${MONTH_NAMES[date.getUTCMonth()]} ${date.getUTCDate()}`;
+  const text = `${date.getUTCDate()} ${MONTH_NAMES[date.getUTCMonth()]}`;
   const endYear = endTime === undefined ? null : new Date(endTime).getUTCFullYear();
   return endYear === null || endYear === date.getUTCFullYear() ? text : `${text} ${date.getUTCFullYear()}`;
 }
 
 /**
  * When a value carried under the cursor was observed: its time when it is
- * from the cursor's own day, else its date (`Sep 2`, with the year when that
+ * from the cursor's own day, else its date (`2 Sep`, with the year when that
  * differs), and the time too for an intraday bar.
  */
 export function formatCompositeCarriedStamp(observed: Date, cursor: Date, timeZone?: string): string {
@@ -569,6 +851,6 @@ export function formatCompositeCarriedStamp(observed: Date, cursor: Date, timeZo
   const at = onClock(cursor, timeZone).wall;
   const time = utcTime(seen);
   if (utcDate(seen) === utcDate(at)) return time;
-  const date = `${MONTH_NAMES[seen.getUTCMonth()]} ${seen.getUTCDate()}${seen.getUTCFullYear() === at.getUTCFullYear() ? "" : ` ${seen.getUTCFullYear()}`}`;
+  const date = `${seen.getUTCDate()} ${MONTH_NAMES[seen.getUTCMonth()]}${seen.getUTCFullYear() === at.getUTCFullYear() ? "" : ` ${seen.getUTCFullYear()}`}`;
   return time === "00:00" ? date : `${date} ${time}`;
 }

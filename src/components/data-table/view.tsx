@@ -11,8 +11,11 @@ import {
 import type { ScrollBoxRenderable } from "../../ui";
 import { useBeforeShortcut, useShortcut } from "../../react/input";
 import { isPlainKey, isPlainKeyboardEvent } from "../../utils/keyboard";
-import { DataTable, PaneStatusBody, type DataTableColumn, type DataTableProps, type PaneStatusBodyProps } from "../ui";
+import { DataTable, PaneStatusBody, RowNote, type DataTableColumn, type DataTableProps, type NoticeProps, type PaneStatusBodyProps } from "../ui";
 import { useDataTableSortMenu } from "./sort-menu";
+import { useDataTableColumnMenuItems } from "./column-menu";
+import { drawnTableColumns, tableFreezesFirstColumn, tableRevealLeft, tableScrollStep } from "../ui/table-layout";
+import { useDataTableColumnOrder } from "../ui/data-table/use-column-order";
 import {
   TableViewFrame,
   useResetTableScroll,
@@ -135,8 +138,22 @@ export interface DataTableViewProps<
     reason: DataTableSelectionChangeReason,
   ) => void;
   isNavigable?: (item: T, index: number) => boolean;
+  /**
+   * A row that goes on from the row above it, as a wrapped description's
+   * second line does: pressing it selects (or activates, or opens the menu
+   * of) the row it belongs to, as pressing that row's first line does.
+   */
+  continuesRowAbove?: (item: T, index: number) => boolean;
   rootBefore?: ReactNode;
   rootAfter?: ReactNode;
+  /**
+   * What concerns one row, said under the table while that row is selected
+   * (`RowNote`): the whole reason behind the few words the row shows, such as
+   * a name a screen could not price or a peer whose figures are stale. Null
+   * for a row with nothing to say. A note about one row never goes in the
+   * footer, whose notes are the pane's (docs/pane-conventions.md, Row messages).
+   */
+  rowNote?: (item: T, index: number) => string | { text: string; tone: NonNullable<NoticeProps["tone"]> } | null | undefined;
   /**
    * Replaces the table (header and rows) with a loading, error or empty
    * state while `rootBefore` stays. Precedence is the caller's, as with
@@ -169,6 +186,12 @@ export interface DataTableViewProps<
     context: DataTableRootKeyContext,
   ) => boolean | void;
   resetScrollKey?: unknown;
+  /**
+   * A column to bring to the middle of a table too wide for its pane: on
+   * first draw and whenever it changes. A grid whose reading is in its middle
+   * (OVDV's ATM column) opens on it rather than on its left edge.
+   */
+  revealColumnId?: string | null;
 }
 
 function ignoreHeaderClick(): void {}
@@ -182,8 +205,10 @@ export function DataTableView<
   onActivate,
   onCursorChange,
   isNavigable,
+  continuesRowAbove,
   rootBefore,
   rootAfter,
+  rowNote,
   status,
   rootWidth,
   rootHeight,
@@ -198,18 +223,37 @@ export function DataTableView<
   onSortChange,
   onRootKeyDown,
   resetScrollKey,
+  revealColumnId,
   scrollToIndex,
   scrollToIndexVersion = 0,
   ...tableProps
 }: DataTableViewProps<T, C>) {
   const onHeaderClick = tableProps.onHeaderClick;
+  // Ordered here, so a sideways step and a revealed column count the columns as they are drawn.
+  const columnOrder = useDataTableColumnOrder(
+    tableProps.columns,
+    tableProps.onColumnMove ? false : tableProps.columnReorder,
+    { menu: false },
+  );
+  const columns = columnOrder.columns;
+  const onColumnMove = tableProps.onColumnMove ?? columnOrder.onColumnMove;
+  const anchoredColumns = tableProps.onColumnMove ? tableProps.anchoredColumns ?? 1 : columnOrder.anchoredColumns;
+  const columnItems = useDataTableColumnMenuItems({
+    enabled: focused && keyboardNavigation,
+    columns,
+    anchoredColumns,
+    onColumnMove,
+    customized: columnOrder.customized,
+    reset: columnOrder.reset,
+  });
   useDataTableSortMenu({
     enabled: focused && keyboardNavigation && !!onHeaderClick && (sortable ?? true),
-    columns: isColumnSortable ? tableProps.columns.filter(isColumnSortable) : tableProps.columns,
+    columns: isColumnSortable ? columns.filter(isColumnSortable) : columns,
     sortColumnId: tableProps.sortColumnId ?? null,
     sortDirection: tableProps.sortDirection ?? "asc",
     onHeaderClick: onHeaderClick ?? ignoreHeaderClick,
     onSortChange,
+    columnItems,
   });
   const {
     effectiveHeaderScrollRef,
@@ -636,40 +680,56 @@ export function DataTableView<
   // identity survives a parent render. Most callers build `selection` inline,
   // which used to give every handler a new identity on each render and made
   // every visible row re-render its cells, even when nothing in it changed.
+  // The row a pressed line belongs to: itself, or for a line that goes on from
+  // the row above, the first line of that row.
+  const ownerIndex = (index: number) => {
+    let owner = index;
+    while (continuesRowAbove && owner > 0 && owner < tableProps.items.length
+      && continuesRowAbove(tableProps.items[owner]!, owner)) owner -= 1;
+    return owner;
+  };
   const rowHandlerStateRef = useRef({
     activateIndex,
     onRowContextMenu: tableProps.onRowContextMenu,
     onRowMouseDown: tableProps.onRowMouseDown,
+    ownerIndex,
+    items: tableProps.items,
     updateCursorIndex,
   });
   rowHandlerStateRef.current = {
     activateIndex,
     onRowContextMenu: tableProps.onRowContextMenu,
     onRowMouseDown: tableProps.onRowMouseDown,
+    ownerIndex,
+    items: tableProps.items,
     updateCursorIndex,
   };
 
   const handleTableSelect = useCallback((_item: T, index: number) => {
-    rowHandlerStateRef.current.updateCursorIndex(index, { commit: "immediate" });
+    const latest = rowHandlerStateRef.current;
+    latest.updateCursorIndex(latest.ownerIndex(index), { commit: "immediate" });
   }, []);
 
   const handleTableActivate = useCallback((_item: T, index: number) => {
-    rowHandlerStateRef.current.activateIndex(index);
+    const latest = rowHandlerStateRef.current;
+    latest.activateIndex(latest.ownerIndex(index));
   }, []);
 
   const handleRowMouseDown = useCallback((item: T, index: number, event: any) => {
     const latest = rowHandlerStateRef.current;
-    const handled = latest.onRowMouseDown?.(item, index, event);
+    const owner = latest.ownerIndex(index);
+    const handled = latest.onRowMouseDown?.(latest.items[owner] ?? item, owner, event);
     if (handled === true) {
-      latest.updateCursorIndex(index, { commit: "immediate" });
+      latest.updateCursorIndex(owner, { commit: "immediate" });
     }
     return handled;
   }, []);
 
   const handleRowContextMenu = useCallback((item: T, index: number, event: any) => {
     const latest = rowHandlerStateRef.current;
-    latest.updateCursorIndex(index, { commit: "immediate" });
-    latest.onRowContextMenu?.(item, index, event);
+    const owner = latest.ownerIndex(index);
+    latest.updateCursorIndex(owner, { commit: "immediate" });
+    latest.onRowContextMenu?.(latest.items[owner] ?? item, owner, event);
   }, []);
 
   // Wide tables scroll their columns on Shift+Left/Right, the way a chart pans,
@@ -689,8 +749,25 @@ export function DataTableView<
     // At either edge the key is still the table's, so it never falls through
     // to switch a tab.
     stopTableKey(event);
-    const nextLeft = Math.max(0, Math.min(maxLeft,
-      currentLeft + direction * Math.max(1, Math.floor(viewportWidth / 2))));
+    // The columns in their order, at the widths the terminal's fit drew them.
+    const drawn = drawnTableColumns.get(body) ?? columns;
+    const nextLeft = tableScrollStep({
+      columns: drawn,
+      columnGap: tableProps.columnGap,
+      horizontalPadding: tableProps.horizontalPadding,
+      frozenFirstColumn: tableFreezesFirstColumn({
+        freezeFirstColumn: tableProps.freezeFirstColumn,
+        columns: drawn,
+        columnGap: tableProps.columnGap,
+        horizontalPadding: tableProps.horizontalPadding,
+        viewportWidth,
+        overflows: true,
+      }),
+      scrollLeft: currentLeft,
+      direction,
+      viewportWidth,
+      maxLeft,
+    });
     if (nextLeft === currentLeft) return;
     body.scrollLeft = nextLeft;
     effectiveSyncHeaderScroll();
@@ -698,6 +775,45 @@ export function DataTableView<
     enabled: focused && keyboardNavigation && tableProps.showHorizontalScrollbar !== false,
     scope: horizontalScrollScope,
   });
+
+  // The column asked for, in the middle of the scrolled columns once the body has its width. Keyed on the
+  // column and the pane's width only: a refresh that resizes a column to its new figures, or a scroll the
+  // reader made with Shift+arrows, stays where it is. An empty table waits for its rows.
+  const revealColumnIndex = revealColumnId == null ? -1 : columns.findIndex((column) => column.id === revealColumnId);
+  const revealKey = revealColumnIndex < 0 ? null : `${revealColumnIndex}:${rootWidth ?? ""}`;
+  const revealedKeyRef = useRef<string | null>(null);
+  const hasRows = tableProps.items.length > 0;
+  useEffect(() => {
+    if (revealKey == null || !hasRows || revealedKeyRef.current === revealKey) return;
+    /** True once the body is measured and placed, or there is nothing to scroll. */
+    const reveal = () => {
+      const body = effectiveScrollRef.current;
+      const viewportWidth = body?.viewport?.width ?? 0;
+      if (!body || viewportWidth <= 0) return false;
+      const scrollWidth = body.scrollWidth ?? 0;
+      const maxLeft = Math.max(0, scrollWidth - viewportWidth);
+      if (maxLeft <= 0) {
+        if (scrollWidth > 0) revealedKeyRef.current = revealKey;
+        return scrollWidth > 0;
+      }
+      // The columns in their order, at the widths the terminal's fit drew them.
+      const shared = { columns: drawnTableColumns.get(body) ?? columns, columnGap: tableProps.columnGap, horizontalPadding: tableProps.horizontalPadding };
+      const nextLeft = tableRevealLeft({ ...shared, columnIndex: revealColumnIndex, viewportWidth, maxLeft,
+        frozenFirstColumn: tableFreezesFirstColumn({ ...shared, freezeFirstColumn: tableProps.freezeFirstColumn, viewportWidth, overflows: true }) });
+      if (nextLeft !== body.scrollLeft) {
+        body.scrollLeft = nextLeft;
+        effectiveSyncHeaderScroll();
+      }
+      revealedKeyRef.current = revealKey;
+      return true;
+    };
+    // The body measures its width a frame or more after it mounts; a few tries, then it stays where it is.
+    if (reveal()) return;
+    const timers = [0, 50, 150, 400].map((delay) => setTimeout(() => {
+      if (reveal()) timers.forEach(clearTimeout);
+    }, delay));
+    return () => timers.forEach(clearTimeout);
+  }, [revealKey, hasRows]);
 
   useShortcut((event) => {
     if (event.defaultPrevented || event.propagationStopped) return;
@@ -739,6 +855,10 @@ export function DataTableView<
     }
   });
 
+  // The selected row's note follows the cursor, as the row's highlight does.
+  const selectedItem = rowNote && effectiveSelectedIndex >= 0 && !bodyStatusShown(status) ? tableProps.items[effectiveSelectedIndex] : undefined;
+  const note = selectedItem !== undefined ? rowNote!(selectedItem, effectiveSelectedIndex) : null;
+  const noteView = note ? typeof note === "string" ? <RowNote>{note}</RowNote> : <RowNote tone={note.tone}>{note.text}</RowNote> : null;
   return (
     <TableViewFrame
       width={rootWidth}
@@ -746,10 +866,14 @@ export function DataTableView<
       fit={tableProps.fitRows}
       backgroundColor={rootBackgroundColor}
       before={rootBefore}
-      after={rootAfter}
+      after={noteView ? <>{rootAfter}{noteView}</> : rootAfter}
     >
       {bodyStatusShown(status) ? <PaneStatusBody {...status} /> : <DataTable<T, C>
         {...tableProps}
+        columns={columns}
+        columnReorder={false}
+        onColumnMove={onColumnMove}
+        anchoredColumns={anchoredColumns}
         headerScrollRef={effectiveHeaderScrollRef}
         scrollRef={effectiveScrollRef}
         syncHeaderScroll={effectiveSyncHeaderScroll}

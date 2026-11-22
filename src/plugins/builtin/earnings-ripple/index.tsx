@@ -1,17 +1,23 @@
 import type { PluginModule } from "../plugin-module";
 import { formatTickerListInput, parseTickerListInput } from "../../../tickers/list";
 import { earningsRippleHeadless } from "./headless";
-import { EarningsRipplePane } from "./pane";
 
+/**
+ * The tickers a typed argument names. A list the command bar refuses (more than
+ * ten) throws its message rather than opening the pane on the person's holdings.
+ * `fn` and `shot` pass their own list as `symbols` and never get here.
+ */
 function namedSymbols(arg: string | undefined): string[] {
-  try { return arg?.trim() ? parseTickerListInput(arg) : []; } catch { return []; }
+  return arg?.trim() ? parseTickerListInput(arg) : [];
 }
 
 export const earningsRippleModule: PluginModule = {
   panes: [{
-    id: "earnings-ripple", name: "Earnings Ripple", icon: "E", component: EarningsRipplePane,
+    id: "earnings-ripple", name: "Earnings Ripple", icon: "E", get component(): typeof import("./pane").EarningsRipplePane { const { EarningsRipplePane } = require("./pane"); return EarningsRipplePane; },
     defaultPosition: "right", defaultMode: "floating", defaultFloatingSize: { width: 96, height: 20 },
     tableExport: true,
+    // Customers and suppliers are companies': a future, an index or a fund has none, and is left out before any request.
+    instruments: ["equity"],
     // Without named tickers it lists what is in the person's portfolios.
     personalData: (context) => (typeof context.settings.symbols === "string" && context.settings.symbols.trim() ? null : "holdings"),
     settings: { title: "Earnings Ripple Settings", fields: [

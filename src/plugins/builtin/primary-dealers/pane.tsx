@@ -19,7 +19,7 @@ import { useAsyncResource } from "../../../react/async-resource";
 import { colors } from "../../../theme/colors";
 import type { PaneProps } from "../../../types/plugin";
 import { Box, TextAttributes } from "../../../ui";
-import { formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, formatNumber } from "../../../utils/format";
 import { isPlainKeyboardEvent } from "../../../utils/keyboard";
 import { usePluginPaneState } from "../../runtime";
 import { cachedDealerHistory, fetchPrimaryDealers, hasDealerHistory, loadDealerHistory } from "./client";
@@ -48,7 +48,7 @@ const RANGE_OPTIONS = DEALER_RANGES.map(({ value, label, hint }) => ({ value, la
 /** How long the selection rests before its history is read, so holding a key down the board reads one row, not all it passes. */
 const CHART_SETTLE_MS = 150;
 /** Ticks in the table's own figures (whole $mn), with decimals only where the plotted range is narrow. */
-const formatLevelAxis = spanAxisFormatter((value, digits) => formatNumber(value, digits));
+const formatLevelAxis = spanAxisFormatter((value, digits) => formatNumber(value, digits), 0);
 
 function changeColor(value: number | null): string {
   if (value == null || value === 0) return colors.textMuted;
@@ -132,8 +132,8 @@ export function PrimaryDealersPane({ focused, width, height }: PaneProps) {
 
   const { reload: reloadHistory } = historyResource;
   const refresh = useCallback(() => {
-    void load();
-    void reloadHistory();
+    load();
+    reloadHistory();
   }, [load, reloadHistory]);
   const selectTab = useCallback((value: string) => setTab(value === "fails" ? "fails" : "positions"), [setTab]);
   const selectRange = useCallback((value: DealerRange) => setStoredRange(value), [setStoredRange]);
@@ -175,27 +175,25 @@ export function PrimaryDealersPane({ focused, width, height }: PaneProps) {
   const renderCell = useCallback((
     row: DealerRow,
     column: DealerColumn,
-    _index: number,
-    rowState: { selected: boolean },
   ): DataTableCell => {
-    const selectedColor = rowState.selected ? colors.selectedText : undefined;
+    // The table draws the selected row in the selection's text colour; a change keeps its up or down tone.
     switch (column.id) {
       case "position":
         // A breakdown reads under its total, in plain weight.
         return {
           text: dealerRowLabel(row),
           value: row.label,
-          color: selectedColor ?? (row.depth === 0 ? colors.textBright : colors.text),
+          color: row.depth === 0 ? colors.textBright : colors.text,
           attributes: row.depth === 0 ? TextAttributes.BOLD : undefined,
         };
       case "asOf":
-        return { text: row.asOf ?? "—", color: selectedColor ?? colors.textMuted };
+        return { text: row.asOf ?? MISSING_VALUE, color: colors.textMuted };
       case "latest":
-        return { text: formatLevel(row.latest), value: row.latest, color: selectedColor ?? colors.text };
+        return { text: formatLevel(row.latest), value: row.latest, color: colors.text };
       case "previous":
-        return { text: formatLevel(row.previous), value: row.previous, color: selectedColor ?? colors.textDim };
+        return { text: formatLevel(row.previous), value: row.previous, color: colors.textDim };
       case "change":
-        return { text: formatChange(row.change), value: row.change, color: selectedColor ?? changeColor(row.change) };
+        return { text: formatChange(row.change), value: row.change, color: changeColor(row.change) };
     }
   }, []);
 
@@ -261,6 +259,7 @@ export function PrimaryDealersPane({ focused, width, height }: PaneProps) {
         sortDirection="asc"
         getItemKey={(row) => row.id}
         renderCell={renderCell}
+        selectedTextOverridesCellColor
         resetScrollKey={tab}
         emptyStateTitle={tab === "fails" ? "No fails in this release." : "No positions in this release."}
       />

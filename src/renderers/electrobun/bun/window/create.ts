@@ -1,5 +1,10 @@
 import { BrowserWindow } from "electrobun/bun";
+import { readFileSync } from "fs";
+import { resolve } from "path";
+import { measurePerf } from "../../../../utils/perf-marks";
+import { trackWindowAttention } from "./attention";
 import {
+  applyNativeWindowFrame,
   applyWindowMoveEvent,
   applyWindowResizeEvent,
   updateWindowFrameCache,
@@ -7,8 +12,10 @@ import {
   type WindowResizeEvent,
 } from "./events";
 import type { WindowFrame, WindowMinimumSize } from "./frame";
+import { applyNativeMinimumSize } from "./native-min-size";
 import { applyWindowsCustomChrome } from "./windows-custom-chrome";
 import { applyWindowsWindowIcon } from "./windows-icons";
+import { fitPageToClientArea } from "./windows-native";
 
 type DesktopTitleBarStyle = "default" | "hidden" | "hiddenInset";
 type DesktopWindowRenderer = "native" | "cef";
@@ -20,14 +27,34 @@ type DesktopWindowStyleMask = {
   FullSizeContentView?: boolean;
 };
 
+/**
+ * No native title bar: the header is the title bar. On Windows "hidden" is a
+ * bare popup with no frame to resize by, which Windows also takes for
+ * fullscreen; "hiddenInset" keeps the sizing frame and cuts out the caption.
+ */
 function desktopTitleBarStyle(): DesktopTitleBarStyle {
-  return process.platform === "darwin" ? "hiddenInset" : "hidden";
+  return process.platform === "linux" ? "hidden" : "hiddenInset";
+}
+
+let chromiumShipped: boolean | undefined;
+
+/** Whether this build ships Chromium (Resources/build.json); a build that does not say is taken to. */
+function shipsChromium(): boolean {
+  if (chromiumShipped !== undefined) return chromiumShipped;
+  try {
+    const build = JSON.parse(readFileSync(resolve("../Resources/build.json"), "utf8")) as { availableRenderers?: unknown };
+    chromiumShipped = !Array.isArray(build.availableRenderers) || build.availableRenderers.includes("cef");
+  } catch {
+    // Intentional ignore: a build that does not say is taken to ship Chromium, as above.
+    chromiumShipped = true;
+  }
+  return chromiumShipped;
 }
 
 function desktopWindowRenderer(): DesktopWindowRenderer {
   if (process.platform === "win32") {
     const hostArchitecture = process.env.PROCESSOR_ARCHITEW6432 ?? process.env.PROCESSOR_ARCHITECTURE;
-    return hostArchitecture?.toLowerCase() === "arm64" ? "native" : "cef";
+    return hostArchitecture?.toLowerCase() === "arm64" || !shipsChromium() ? "native" : "cef";
   }
   return "native";
 }
@@ -41,6 +68,22 @@ function desktopWindowStyleMask(): DesktopWindowStyleMask {
     Titled: false,
     FullSizeContentView: true,
   };
+}
+
+const APP_VIEW_URL = "views://mainview/index.html";
+
+/**
+ * Electrobun's Windows webview takes a page load that starts while Ctrl is
+ * down for a Ctrl+click on a link: it cancels the load and asks for a new
+ * window instead. A window opened from a Ctrl chord, as Ctrl+Shift+O pops a
+ * pane out, stayed blank. Its page is loaded again, which Electrobun lets
+ * through within half a second of the one it cancelled.
+ */
+function loadAgainWhenTakenForCtrlClick(window: BrowserWindow): void {
+  (window.webview as { on: (name: string, handler: (event: unknown) => void) => void }).on("new-window-open", (event) => {
+    const detail = (event as { data?: { detail?: { url?: unknown } } }).data?.detail;
+    if (detail?.url === APP_VIEW_URL) window.webview.loadURL(APP_VIEW_URL);
+  });
 }
 
 interface AppWindowOptions {
@@ -57,13 +100,15 @@ interface AppWindowOptions {
 
 /**
  * Opens a window on the app view with this platform's chrome and icon, keeps
- * its cached frame current as it moves, and holds it to `minSize` on resize.
+ * its cached frame current as it moves, and holds it to `minSize`: the system
+ * does while it is resized, and a resize that still ends under it is undone.
  */
 export function createAppWindow({ title, frame, rpc, minSize, onFrameChange, preload }: AppWindowOptions): BrowserWindow {
-  const window = new BrowserWindow({
+  // Opening a window waits on the native layer, the webview's creation included.
+  const window = measurePerf("native.window.create", () => new BrowserWindow({
     title,
     frame,
-    url: "views://mainview/index.html",
+    url: APP_VIEW_URL,
     ...(preload ? { preload } : {}),
     renderer: desktopWindowRenderer(),
     rpc,
@@ -71,16 +116,35 @@ export function createAppWindow({ title, frame, rpc, minSize, onFrameChange, pre
     titleBarStyle: desktopTitleBarStyle(),
     navigationRules: JSON.stringify(["views://*"]),
     sandbox: false,
-  });
+  }));
   applyWindowsWindowIcon(title);
   applyWindowsCustomChrome(title);
+  applyNativeMinimumSize(window, minSize);
+  if (process.platform === "win32") {
+    loadAgainWhenTakenForCtrlClick(window);
+    // The page exists once it has loaded; until then there is nothing to fit.
+    window.webview.on("dom-ready", () => {
+      const handle = window.ptr;
+      if (handle) fitPageToClientArea(handle);
+    });
+  }
   updateWindowFrameCache(window, frame, minSize);
+  trackWindowAttention(window);
+  const readsNativeFrame = process.platform === "win32";
   (window as any).on?.("move", (event: WindowMoveEvent) => {
-    applyWindowMoveEvent(window, event);
+    if (readsNativeFrame) {
+      if (!applyNativeWindowFrame(window, minSize)) return;
+    } else {
+      applyWindowMoveEvent(window, event);
+    }
     onFrameChange?.();
   });
   (window as any).on?.("resize", (event: WindowResizeEvent) => {
-    applyWindowResizeEvent(window, event, minSize);
+    if (readsNativeFrame) {
+      if (!applyNativeWindowFrame(window, minSize)) return;
+    } else {
+      applyWindowResizeEvent(window, event, minSize);
+    }
     onFrameChange?.();
   });
   return window;

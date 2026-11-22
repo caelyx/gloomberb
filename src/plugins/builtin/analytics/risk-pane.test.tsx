@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import { act, useState } from "react";
 import { apiClient } from "../../../api-client";
+import type { CombinedPaneFooter } from "../../../components/layout/pane/footer";
 import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
 import { appReducer, createInitialState, type AppAction, type AppState } from "../../../state/app/context";
 import { createTestPaneConfig, TestPaneFrame } from "../../../test-support/pane";
@@ -69,13 +70,12 @@ async function renderPane(
   width: number,
   height: number,
   settings: Record<string, unknown> = {},
-  { portfolio = MAIN, tickers = mainTickers() }: { portfolio?: Portfolio; tickers?: TickerRecord[] } = {},
+  { portfolio = MAIN, tickers = mainTickers(), runtime = createTestPluginRuntime(), onFooter }: { portfolio?: Portfolio; tickers?: TickerRecord[]; runtime?: ReturnType<typeof createTestPluginRuntime>; onFooter?: (footer: CombinedPaneFooter) => void } = {},
 ) {
   const config = createTestPaneConfig("/tmp/gloomberb-risk-pane-test", {
     paneId: "analytics", instanceId: PANE_ID, params: { portfolioId: portfolio.id }, settings: { analyticsView: "risk", ...settings },
   });
   config.portfolios = [portfolio];
-  const runtime = createTestPluginRuntime();
   function Harness() {
     const [paneState, setPaneState] = useState<AppState["paneState"]>({});
     const state = createInitialState(config);
@@ -84,7 +84,10 @@ async function renderPane(
     const dispatch = (action: AppAction) => setPaneState((current) => appReducer({ ...state, paneState: current }, action).paneState);
     return (
       <TestPaneFrame width={width} height={height} state={state} dispatch={dispatch} paneId={PANE_ID} pluginId="analytics" runtime={runtime}>
-        {(body) => <PortfolioRiskPane paneId={PANE_ID} paneType="analytics" focused width={body.width} height={body.height} />}
+        {(body, footer) => {
+          onFooter?.(footer);
+          return <PortfolioRiskPane paneId={PANE_ID} paneType="analytics" focused width={body.width} height={body.height} />;
+        }}
       </TestPaneFrame>
     );
   }
@@ -94,6 +97,19 @@ async function renderPane(
   await settle();
   return () => tui.frame().trimEnd().split("\n");
 }
+
+test("a portfolio with no holdings says so with where holdings come from and a button to the Portfolio pane, as the other panes' empty states do", async () => {
+  const shown: string[] = [];
+  const runtime = createTestPluginRuntime({ showPane: (paneId) => { shown.push(paneId); } });
+  const frame = (await renderPane(100, 20, {}, { tickers: [], runtime }))().join("\n");
+  expect(frame).toContain("No holdings in this portfolio.");
+  expect(frame).toContain("Add holdings from the Portfolio pane (PF), or connect a broker in BR to sync them.");
+  // Not a table of dashes.
+  expect(frame).not.toContain("60D basket return");
+  await tui.clickFrameText("Open Portfolio");
+  await settle();
+  expect(shown).toEqual(["portfolio-list"]);
+});
 
 /** The value a table row shows, read from its line below the table header. */
 function rowValue(lines: string[], label: string): string {
@@ -152,6 +168,30 @@ test("the performance tab charts the account TWR over its metrics", async () => 
   expect(lines.findIndex((line) => line.includes("METRIC"))).toBeGreaterThan(legend + 6);
 });
 
+test("manual Performance charts an estimated value rather than labelling it account returns", async () => {
+  const lines = (await renderPane(100, 28, { riskView: "performance" }))();
+  const frame = lines.join("\n");
+  expect(frame).toContain("● Estimated value $");
+  expect(frame).not.toContain("Performance needs this account");
+  expect(frame).not.toContain("● TWR");
+  expect(lines.findIndex((line) => line.includes("METRIC"))).toBeGreaterThan(lines.findIndex((line) => line.includes("● Estimated value")) + 6);
+});
+
+test("missing estimate closes remain warnings in captured Performance views", async () => {
+  cloud = {
+    ...usListings,
+    getCloudHistory: async (symbol: string, exchange: string) => {
+      const history = sessionHistory(symbol, exchange);
+      return { ...history, data: history.data!.filter((point) => symbol !== "AAPL" || !point.date.startsWith("2026-09-17")) };
+    },
+  };
+  let notes: readonly string[] = [];
+  await renderPane(100, 28, { riskView: "performance" }, {
+    onFooter: (footer) => { notes = footer.info.flatMap((segment) => segment.notes ?? []); },
+  });
+  expect(notes).toContain("Estimated value has gaps where daily closes or FX are missing.");
+});
+
 test("a broker account the basket only partly covers states its coverage, its tail method and source, and lists what is left out", async () => {
   cloud = brokerRiskClient(now);
   const coverage = "basket 365,500 USD = 78% of book; left out: EUR2 4%, TWD1 4%, 7 more 14%";
@@ -194,6 +234,21 @@ test("below the coverage minimum Stress keeps its currency and price shocks, whi
   // The Taiwan dollar line and the book total, and none of the basket scenarios, which have nothing to show.
   expect(labels).toEqual(["TWD1", "Book total"]);
   expect(lines.find((line) => line.trimStart().startsWith("TWD1"))).toContain("-20.00%");
-  expect(lines.at(-1)).toContain("Index, 10Y and VIX scenarios: qualifying holdings cover 5% of the holdings' value; basket estimates need 50%");
+  expect(lines.at(-1)).toContain("Index, 10Y, VIX and episode scenarios: qualifying holdings cover 5% of the holdings' value; basket estimates need 50%");
   expect(lines.at(-1)).not.toContain("daily closes");
+});
+
+// MARS showed METRIC, VALUE and PCTL 1Y beside an empty gap, its rows' date only in a footer a narrow pane cut, and the
+// footer's coverage and method ran into one segment a narrow row left out whole.
+test("every row keeps its date where the pane has room, and a narrow footer keeps what the numbers leave out", async () => {
+  cloud = brokerRiskClient(now);
+  const wide = (await renderPane(78, 28, {}, { portfolio: BROKER_PORTFOLIO, tickers: brokerFixtureTickers() }))();
+  const header = wide.find((line) => line.includes("METRIC"))!;
+  expect(header).toContain("AS OF");
+  expect(wide.find((line) => line.trimStart().startsWith("1D VaR 95% (60D)"))).toContain("2026-09-21");
+  // The default floating size: the coverage in its shortest form, whole, before the hints.
+  expect(wide.at(-1)).toContain("78% of book; EUR2, TWD1, 7 more left out");
+  // Too narrow for the date beside the figures, the rows leave it out.
+  const narrow = (await renderPane(56, 20, {}, { portfolio: BROKER_PORTFOLIO, tickers: brokerFixtureTickers() }))();
+  expect(narrow.find((line) => line.includes("METRIC"))).not.toContain("AS OF");
 });

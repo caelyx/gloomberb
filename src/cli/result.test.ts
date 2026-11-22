@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { printCliResult, serializeCliError, serializeCliResult, type CliResultRenderOptions } from "./result";
 import { printCliError } from "./errors";
 import { captureConsole } from "../test-support/console";
-import { setCliColorEnabledOverride, setCliPlainOverride } from "../utils/cli-output";
+import { setCliColorEnabledOverride, setCliPlainOverride, setCliWidthOverride } from "../utils/cli-output";
 import type { CliGlobalOptions } from "./options";
 import type { ReportFreshness } from "./pane-functions/freshness";
 
@@ -78,7 +78,7 @@ describe("serializeCliResult", () => {
     expect(output).toBe('Symbol,Name\nAAPL,"Apple, Inc."');
   });
 
-  test("prints one record as aligned label/value lines while CSV keeps raw keys and values", () => {
+  test("prints one record as aligned label/value lines while CSV and JSON keep raw keys and every real digit, float noise dropped", () => {
     const data = { dataDir: "/tmp/gloom", changePercent: 0.9499999999999886, enabled: true, tags: [] };
 
     const text = serializeCliResult({ data }, baseOptions);
@@ -89,7 +89,11 @@ describe("serializeCliResult", () => {
       "Tags            none",
     ]);
     expect(serializeCliResult({ data }, { ...baseOptions, format: "csv" }))
-      .toBe("dataDir,changePercent,enabled,tags\n/tmp/gloom,0.9499999999999886,true,[]");
+      .toBe("dataDir,changePercent,enabled,tags\n/tmp/gloom,0.95,true,[]");
+    // A change from a subtraction loses its noise; a sub-penny price, an FX rate and a coin holding keep every digit.
+    const figures = { change: 342.37 - 344.17, price: 0.00001234, rate: 1.083456, holding: 12345.67890123, cap: 4974636099999.9995 };
+    expect(JSON.parse(serializeCliResult({ data: figures }, { ...baseOptions, format: "json" })).data)
+      .toEqual({ change: -1.8, price: 0.00001234, rate: 1.083456, holding: 12345.67890123, cap: 4974636100000 });
   });
 
   test("text-only columns reshape the table but leave CSV on the data keys", () => {
@@ -178,20 +182,21 @@ describe("serializeCliResult", () => {
     expect(json.source).toEqual(source);
     // Every row ends with what it is: the symbol it carries, and the source and as-of the footer cites.
     expect(serializeCliResult(result, { ...baseOptions, format: "csv" }).split("\n")).toEqual([
-      "symbol,symbol_or_series,currency_or_unit,interval,source,as_of",
-      "AAPL,AAPL,,,Gloom Cloud,2026-10-09T13:22:00.000Z",
+      "symbol,symbol_or_series,currency_or_unit,interval,source,as_of,retrieved_at",
+      "AAPL,AAPL,,,Gloom Cloud,2026-10-09T13:22:00.000Z,2026-10-09T13:30:00.000Z",
       "", `# ${line}`, "# Publisher: not published", "# Observation date: 2026-10-09T13:22:00.000Z",
       "# Publication time: not published", "# Retrieval time: 2026-10-09T13:30:00.000Z",
     ]);
     expect(JSON.parse(serializeCliResult(result, { ...baseOptions, format: "ndjson" }))).toEqual({
       symbol: "AAPL", symbol_or_series: "AAPL", currency_or_unit: null, interval: null, source: "Gloom Cloud", as_of: "2026-10-09T13:22:00.000Z",
+      retrieved_at: "2026-10-09T13:30:00.000Z",
     });
     // A command's own identity wins over the row's fields, and its notes close the CSV.
     const declared = serializeCliResult(result, { ...baseOptions, format: "csv" }, {
       exportIdentity: { symbolOrSeries: "DEXSFUS", currencyOrUnit: "bp", interval: "daily" },
       exportNotes: ["Series begins 1980-01-02."],
     }).split("\n");
-    expect(declared[1]).toBe("AAPL,DEXSFUS,bp,daily,Gloom Cloud,2026-10-09T13:22:00.000Z");
+    expect(declared[1]).toBe("AAPL,DEXSFUS,bp,daily,Gloom Cloud,2026-10-09T13:22:00.000Z,2026-10-09T13:30:00.000Z");
     expect(declared.at(-1)).toBe("# note: Series begins 1980-01-02.");
     // Data that states its own freshness (an `fn` report) is cited in JSON without a second copy in metadata or text.
     const cited = { data: { rows: [] }, exportFreshness: freshness };
@@ -259,6 +264,26 @@ test("a CSV or NDJSON export a --limit cut says so: CSV in a closing note line, 
   expect(quiet.stderr).toBe("");
 });
 
+test("a printed CSV retains source and truncation notes in a rectangular export and on stderr", async () => {
+  const rows = [{ date: "2026-10-05" }, { date: "2026-10-06" }, { date: "2026-10-07" }];
+  const freshness = { source: "Gloom Cloud", asOf: "2026-10-23T15:48:00Z", status: "not-a-feed", basis: "calendar" } as ReportFreshness;
+  const printed = await captureConsole(() => printCliResult({ data: rows, freshness }, { ...baseOptions, format: "csv", limit: 2 }, { dateKey: "date" }));
+  expect(printed.stdout.split("\n")[0]).toBe("date,symbol_or_series,currency_or_unit,interval,source,as_of,export_notes");
+  expect(printed.stdout).toContain('2026-10-05,,,,Gloom Cloud,2026-10-23T15:48:00Z,Source: Gloom Cloud');
+  expect(printed.stdout).toContain('2026-10-06,,,,Gloom Cloud,2026-10-23T15:48:00Z,Source: Gloom Cloud');
+  expect(printed.stdout.split("\n")).toHaveLength(3);
+  expect(printed.stdout).toContain("note: showing the oldest 2 of 3 rows; --tail 2 for the latest");
+  const notes = printed.stderr.split("\n");
+  expect(notes[0]).toStartWith("Source: Gloom Cloud");
+  expect(notes.at(-1)).toBe("note: showing the oldest 2 of 3 rows; --tail 2 for the latest");
+  expect(notes.some((line) => line.startsWith("#"))).toBe(false);
+  const sections = await captureConsole(() => printCliResult({ data: rows }, { ...baseOptions, format: "csv" }, {
+    tables: { tables: [{ title: "A", columns: ["x"], rows: [[1]] }, { title: "B", columns: ["y"], rows: [[2]] }], footer: ["note: two tables"] },
+  }));
+  expect(sections.stdout).toBe("x,y,section,export_notes\n1,,A,note: two tables\n,2,B,note: two tables");
+  expect(sections.stderr).toBe("note: two tables");
+});
+
 test("plain output words the arrows of its tables and nothing else: a note, an answer or an error prints as written", async () => {
   setCliPlainOverride(true);
   setCliColorEnabledOverride(false);
@@ -273,6 +298,32 @@ test("plain output words the arrows of its tables and nothing else: a note, an a
     expect(stderr).toBe("warning: Read as typed: a ↓ b\nerror: Not found: x → y");
   } finally {
     setCliPlainOverride(null);
+    setCliColorEnabledOverride(null);
+  }
+});
+
+test("a warning, an export note and a command's own text print without the terminal commands in them, and keep their colours", async () => {
+  const hostile = "late\u001b]0;renamed\u0007 data\u001b[2J\u009b31m.";
+  const clean = "late]0;renamed data[2J31m.";
+  setCliColorEnabledOverride(true);
+  try {
+    const text = await captureConsole(() => printCliResult(
+      { data: { text: `${hostile} \u001b[31mred\u001b[0m` }, warnings: [hostile] },
+      baseOptions,
+      { text: (data) => data.text },
+    ));
+    expect(text.stdout).toBe(`${clean} \u001b[31mred\u001b[0m`);
+    expect(text.stderr).toBe(`\u001b[33mwarning:\u001b[0m ${clean}`);
+
+    const csv = await captureConsole(() => printCliResult(
+      { data: [], warnings: [hostile] },
+      { ...baseOptions, format: "csv" },
+      { tables: { tables: [{ title: "A", columns: ["x"], rows: [[1]] }], footer: [`note: ${hostile}`] } },
+    ));
+    expect(csv.stderr.split("\n")).toEqual([`\u001b[33mwarning:\u001b[0m ${clean}`, `note: ${clean}`]);
+    expect(csv.stdout).toBe(`x,export_notes\n1,note: ${clean} | warning: ${clean}`);
+    expect(csv.stdout).not.toContain("\u001b");
+  } finally {
     setCliColorEnabledOverride(null);
   }
 });
@@ -306,4 +357,67 @@ test("large research reports remain complete through a pipe after stdout initial
   const report = JSON.parse(stdout);
   expect(report.data.rows).toHaveLength(6000);
   expect(report.data.rows.at(-1)).toEqual({ id: 5999, name: "東京 — research report" });
+});
+
+test("a narrow --width wraps a report's heading, summary, notes and warnings, keeping the gaps between its facts", async () => {
+  const data = [{ date: "2026-10-29", close: 28.89 }, { date: "2026-10-30", close: 28.36 }];
+  const heading = "Star Bulk Carriers Corp.  ·  NASDAQ\nCurrency USD  ·  daily bars  ·  2026-09-30 to 2026-10-30  ·  23 bars";
+  const drawdown = "Max drawdown -9.9% (daily closes): peak 30.84 on 2026-10-05, trough 27.79 on 2026-10-16, not back to the peak by 2026-10-30";
+  const warning = "GOGL = Corgi GOOGL 2x Daily ETF, Cboe BZX (a different company on the Warsaw Stock Exchange)";
+  const render: CliResultRenderOptions = { heading: `${heading}\n${drawdown}`, footnote: drawdown, dateKey: "date" };
+  setCliColorEnabledOverride(false);
+  try {
+    setCliWidthOverride(56);
+    const { stderr } = await captureConsole(() => printCliResult({ data, warnings: [warning] }, baseOptions, render));
+    const text = serializeCliResult({ data }, baseOptions, render);
+    expect(text.split("\n").slice(0, 5)).toEqual([
+      "Star Bulk Carriers Corp.  ·  NASDAQ",
+      "Currency USD  ·  daily bars  ·  2026-09-30 to",
+      "2026-10-30  ·  23 bars",
+      "Max drawdown -9.9% (daily closes): peak 30.84 on",
+      "2026-10-05, trough 27.79 on 2026-10-16, not back to the",
+    ]);
+    expect([...text.split("\n"), ...stderr.split("\n")].filter((line) => line.length > 56)).toEqual([]);
+    expect(stderr.split("\n")).toEqual(["warning: GOGL = Corgi GOOGL 2x Daily ETF, Cboe BZX (a", "different company on the Warsaw Stock Exchange)"]);
+    expect(serializeCliResult({ data }, { ...baseOptions, format: "json" }, render)).not.toContain("\\n2026-10-30");
+    // Unfitted, every line prints whole.
+    setCliWidthOverride(null);
+    expect(serializeCliResult({ data }, baseOptions, render).split("\n").slice(0, 3)).toEqual(`${heading}\n${drawdown}`.split("\n"));
+  } finally {
+    setCliWidthOverride(null);
+    setCliColorEnabledOverride(null);
+  }
+});
+
+test("COLUMNS fits piped text to its width and never changes JSON, CSV or NDJSON", () => {
+  const data = [
+    { headline: "A long headline that runs well past the fifty-six columns of a narrow pager", source: "Wire", volume: 1200 },
+    { headline: "Another story", source: "Filing", volume: 35 },
+  ];
+  const footer = "Source: Gloom Cloud · a closing line long enough to wrap at fifty-six columns if anything wrapped it";
+  const tables = { tables: [{ title: "Stories", columns: ["Headline", "Source", "Volume"], rows: data.map((row) => [row.headline, row.source, row.volume]) }], footer: [footer] };
+  const render = (format: CliGlobalOptions["format"]) => [
+    serializeCliResult({ data }, { ...baseOptions, format }),
+    ...format === "csv" || format === "ndjson" ? [serializeCliResult({ data }, { ...baseOptions, format }, { tables })] : [],
+  ];
+  const stdout = process.stdout as { isTTY?: boolean };
+  const saved = { columns: process.env.COLUMNS, tty: stdout.isTTY };
+  setCliColorEnabledOverride(false);
+  try {
+    // Piped, as `gloom ... | less` is.
+    stdout.isTTY = false;
+    delete process.env.COLUMNS;
+    const whole = { json: render("json"), csv: render("csv"), ndjson: render("ndjson"), text: render("text") };
+    process.env.COLUMNS = "56";
+    const fitted = { json: render("json"), csv: render("csv"), ndjson: render("ndjson"), text: render("text") };
+    expect(fitted.json).toEqual(whole.json);
+    expect(fitted.csv).toEqual(whole.csv);
+    expect(fitted.ndjson).toEqual(whole.ndjson);
+    expect(fitted.text).not.toEqual(whole.text);
+  } finally {
+    stdout.isTTY = saved.tty;
+    if (saved.columns === undefined) delete process.env.COLUMNS;
+    else process.env.COLUMNS = saved.columns;
+    setCliColorEnabledOverride(null);
+  }
 });

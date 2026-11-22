@@ -1,9 +1,9 @@
 import type { PaneTemplateContext, PaneTemplateDef } from "../../../types/plugin";
 import type { PluginModule } from "../plugin-module";
 import { createTickerSurfacePaneTemplate, type TickerSurfacePaneTemplateOptions } from "../shared/ticker-surface";
+import { gammaCache, openInterestCache } from "./client";
 import { optionsPositioningHeadless } from "./headless";
 import { isPositioningTab, type PositioningTab } from "./model";
-import { OptionsPositioningPane } from "./pane";
 
 /** The underlying OPX opens on when no ticker is active. */
 const DEFAULT_UNDERLYING = "SPY";
@@ -41,12 +41,22 @@ function positioningTemplate(
 }
 
 export const optionsPositioningModule: PluginModule = {
+  // The last answers are kept on the device, for when the service cannot be reached.
+  setup(ctx) {
+    openInterestCache.attach(ctx.persistence);
+    gammaCache.attach(ctx.persistence);
+  },
+  dispose() {
+    openInterestCache.reset();
+    gammaCache.reset();
+  },
   panes: [{
     id: "options-positioning",
     name: "Options Positioning",
     icon: "O",
-    component: OptionsPositioningPane,
+    get component(): typeof import("./pane").OptionsPositioningPane { const { OptionsPositioningPane } = require("./pane"); return OptionsPositioningPane; },
     defaultPosition: "right",
+    shareItem: { ticker: true },
     tickerFollower: true,
     defaultMode: "floating",
     defaultFloatingSize: { width: 104, height: 34 },
@@ -65,7 +75,7 @@ export const optionsPositioningModule: PluginModule = {
       id: "options-positioning-gex",
       label: "Dealer Gamma",
       description: "Net dealer gamma by strike, its total, flip level, call and put walls and the range for the dealer assumption.",
-      keywords: ["gex", "gamma", "dealer gamma", "gamma exposure", "gamma flip", "call wall", "put wall"],
+      keywords: ["gex", "gamma", "dealer gamma", "gamma exposure", "gamma flip", "zero gamma", "gamma level", "call wall", "put wall", "0dte"],
       shortcut: "GEX",
     }, "gex"),
   ],

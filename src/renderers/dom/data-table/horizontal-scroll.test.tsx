@@ -1,5 +1,7 @@
 /** @jsxImportSource react */
 import { expect, test } from "bun:test";
+import { readFileSync } from "fs";
+import { join } from "path";
 import { act, createRef, useState } from "react";
 import { DataTableView, type DataTableViewProps } from "../../../components/data-table/view";
 import { AppContext, createInitialState } from "../../../state/app/context";
@@ -14,7 +16,7 @@ import { WebDataTable } from ".";
 
 const { window: testWindow, render } = createDomTestHarness();
 
-interface LiveOptions { focused: boolean; frozen: boolean }
+interface LiveOptions { focused: boolean; frozen: boolean | undefined }
 let setOptions: (patch: Partial<LiveOptions>) => void = () => {};
 
 /** Mount DataTableView on the web DataTable; `setOptions` flips focus or the frozen column afterwards. */
@@ -123,9 +125,13 @@ test("DOM fixed axis fits covered values with ellipses and preserves selection, 
     };
   });
   const scroll = async () => { await act(async () => { body.dispatchEvent(new testWindow.Event("scroll") as unknown as Event); }); };
+  // Ctrl+Right steps to a column's edge beside the axis (GBP at 22), not half the viewport into one.
   await act(async () => { body.dispatchEvent(new testWindow.KeyboardEvent("keydown", { key: "ArrowRight", ctrlKey: true, bubbles: true, cancelable: true }) as unknown as Event); });
   await scroll();
-  expect(bodyRef.current?.scrollLeft).toBe(24);
+  expect(bodyRef.current?.scrollLeft).toBe(22);
+  expect(headerRef.current?.scrollLeft).toBe(22);
+  // Scrolled by hand into a column, what the axis covers fits with an ellipsis.
+  body.scrollLeft = 24 * WEB_CELL_WIDTH; await scroll();
   expect(headerRef.current?.scrollLeft).toBe(24);
   for (const row of rows) {
     const cells = Array.from(row.children) as HTMLElement[];
@@ -140,9 +146,65 @@ test("DOM fixed axis fits covered values with ellipses and preserves selection, 
   body.scrollLeft = 48 * WEB_CELL_WIDTH; await scroll();
   expect(bodyRef.current?.scrollLeft).toBe(48);
   expect(rows[1]!.textContent).toContain("JPY");
+  // Back at the left edge nothing is under the frozen column: no inset, and a resize there measures nothing.
   body.scrollLeft = 0; await scroll();
-  expect((rows[1]!.children[3] as HTMLElement).style.paddingLeft).toBe("0px");
+  expect((rows[1]!.children[3] as HTMLElement).style.paddingLeft).toBe("");
   await act(async () => setOptions({ frozen: false }));
   expect((rows[1]!.children[0] as HTMLElement).style.position).toBe("");
   expect((rows[1]!.children[3] as HTMLElement).style.paddingLeft).toBe("");
+});
+
+test("a table wider than its pane keeps its scrollbar drawn at rest, and one that fits keeps it clear", async () => {
+  // macOS WebKit reads scrollbar-color since Safari 26.2: a clear thumb at rest
+  // left an empty strip where the bar was, and no sign of the columns past it.
+  const style = testWindow.document.createElement("style");
+  style.textContent = readFileSync(join(import.meta.dir, "..", "styles.css"), "utf8");
+  testWindow.document.head.appendChild(style);
+  const prototype = testWindow.HTMLElement.prototype;
+  const own = Object.getOwnPropertyDescriptor(prototype, "clientWidth");
+  Object.defineProperty(prototype, "clientWidth", { configurable: true, get: () => 40 * WEB_CELL_WIDTH });
+  const thumb = (body: HTMLElement) => testWindow.getComputedStyle(body as never).getPropertyValue("scrollbar-color").trim().replace(/\s+\S+$/, "");
+  const table = (widths: number[]) => renderDataTableView({
+    items: ["NVDA"],
+    columns: widths.map((width, index) => ({ id: `c${index}`, label: `C${index}`, width })),
+    getItemKey: (row) => row,
+    renderCell: (row) => ({ text: row }),
+  });
+  try {
+    const wide = await table([6, 10, 10, 10, 10, 10]);
+    expect(wide.body.getAttribute("data-gloom-scrollbar-x")).toBe("visible");
+    expect(thumb(wide.body)).not.toBe("transparent");
+    const fits = await table([6, 10, 10]);
+    expect(fits.body.getAttribute("data-gloom-scrollbar-x")).toBe("hidden");
+    expect(thumb(fits.body)).toBe("transparent");
+  } finally {
+    style.remove();
+    if (own) Object.defineProperty(prototype, "clientWidth", own);
+    else delete (prototype as { clientWidth?: number }).clientWidth;
+  }
+});
+
+test("DOM table that pins by default pins once scrolled, and draws as before at rest", async () => {
+  // The body's width is read on mount; happy-dom has no layout engine.
+  const prototype = testWindow.HTMLElement.prototype;
+  const own = Object.getOwnPropertyDescriptor(prototype, "clientWidth");
+  Object.defineProperty(prototype, "clientWidth", { configurable: true, get: () => 40 * WEB_CELL_WIDTH });
+  try {
+    const { container, body } = await renderDataTableView({
+      items: ["NVDA"],
+      columns: [{ id: "symbol", label: "TICKER", width: 6 }, ...["PE", "EV", "PS", "PB", "GM"].map(id => ({ id, label: id, width: 10, align: "right" as const }))],
+      getItemKey: (row) => row,
+      renderCell: (row, column) => ({ text: column.id === "symbol" ? row : "12.3" }),
+    }, { frozen: undefined });
+    setScrollExtent(body, 40, 62);
+    const first = () => container.querySelector('[data-gloom-role="data-table-row"]')!.children[0] as HTMLElement;
+    // Unscrolled nothing is under it: no sticky cell for a drag or resize to carry.
+    expect(first().style.position).toBe("");
+    body.scrollLeft = 12 * WEB_CELL_WIDTH;
+    await act(async () => { body.dispatchEvent(new testWindow.Event("scroll") as unknown as Event); });
+    expect(first().style.position).toBe("sticky");
+  } finally {
+    if (own) Object.defineProperty(prototype, "clientWidth", own);
+    else delete (prototype as { clientWidth?: number }).clientWidth;
+  }
 });

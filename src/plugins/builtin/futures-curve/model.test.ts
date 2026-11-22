@@ -1,10 +1,12 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { describe, expect, test } from "bun:test";
 import { ApiRequestError } from "../../../api-client/errors";
 import type { FuturesContract, FuturesCurveAsOfPayload, FuturesCurvePayload } from "../../../api-client/futures-curve";
 import { fetchFuturesCurve, validateFuturesCurve } from "./client";
 import { FUTURES_CONTRACTS } from "../../../market-data/futures-board";
 import type { CompositeAxisDomain } from "../../../components/chart/composite/types";
-import { annualisedBasisPct, archivedFuturesCurve, basisSpotSymbol, blankBasisNote, contractBasis, CURVE_ROOTS, curveAsOfDate, curveAxisPrice, curveBasisPercent, curveBasisRows, curveChangeText, curveContractChanges, curveContractMonth, curvePrice, curveRank, curveRootForTicker, curveSpot, curveSpotLabel, curveSpotSource, curveSpreadBasis, curveSpreadLabel, curveUnitLabel, daysToExpiry, futuresCurveSeries, newestQuote, normalizeCurveRoot, shortDatedBasis, shortDatedBasisNote, sortCurveContracts, spotBarsFromHistory, thinSpreadNotice, unpairedContractCount, vsSpotPct } from "./model";
+import { compositeAxisMaxTicks, compositeAxisTicks } from "../../../components/chart/composite/format";
+import { annualisedBasisPct, archivedFuturesCurve, basisSpotSymbol, blankBasisNote, contractBasis, CURVE_ROOTS, curveAsOfDate, curveAxisGrid, curveAxisPrice, curveBasisPercent, curveBasisRows, curveChangeText, curveContractChanges, curveContractMonth, curvePrice, curveRank, curveRoundedPrice, curveRootForTicker, curveSpot, curveSpotLabel, curveSpotSource, curveSpreadBasis, curveSpreadLabel, curveUnitLabel, daysToExpiry, curveReportFreshness, curveSessionNote, curveStandIn, futuresCurveSeries, newestQuote, curveRootNamed, normalizeCurveRoot, shortDatedBasis, shortDatedBasisNote, sortCurveContracts, spotBarsFromHistory, thinSpreadNotice, unpairedContractCount, vsSpotPct } from "./model";
 import { futuresCurveModule } from "./index";
 
 const first: FuturesContract = { symbol: "CLX26.NYM", label: "Nov 2026", expiration: "2026-10-20",
@@ -56,6 +58,14 @@ test("normalizes FUT aliases before cloud request and handles missing endpoints 
   expect(requested).toEqual(["CL"]);
   await expect(fetchFuturesCurve("BAD", { getCloudFuturesCurve: async () => { throw new Error("should not request"); } })).rejects.toThrow("No futures curve for BAD");
   expect(normalizeCurveRoot("ttf=f")).toBe("TTF");
+  // A root asked for by name, as a question says it; GOLD stays no root, since under the cursor it is a security.
+  expect(["gold", "Natural Gas futures", "crude oil", "Brent", "10-year t-note futures curve", "copper"].map(curveRootNamed)).toEqual(["GC", "NG", "CL", "BZ", "ZN", "HG"]);
+  expect([normalizeCurveRoot("gold"), curveRootNamed("goldman"), curveRootNamed("")]).toEqual([null, null, null]);
+  // ICE's Brent is not carried: B and "ICE Brent" open CME's BZ, saying which contract it is; BZ itself needs no line.
+  expect(["B", "ice brent", "ICE Brent crude oil futures"].map((value) => curveStandIn(value)?.root)).toEqual(["BZ", "BZ", "BZ"]);
+  expect(curveStandIn("b")?.note).toBe("ICE Brent (B) is not carried; showing CME's Brent Crude Oil Last Day Financial (BZ), "
+    + "cash-settled to the ICE Brent futures settlement.");
+  expect([curveStandIn("BZ"), curveStandIn("Brent"), curveRootNamed("Brent crude")]).toEqual([null, null, "BZ"]);
   await expect(fetchFuturesCurve("CL", { getCloudFuturesCurve: async () => { throw new ApiRequestError("Not found", 404); } })).rejects.toThrow("not available yet");
   const denied = new ApiRequestError("Forbidden", 403);
   await expect(fetchFuturesCurve("CL", { getCloudFuturesCurve: async () => { throw denied; } })).rejects.toBe(denied);
@@ -82,12 +92,17 @@ test("charts the strip within the horizon and dates it by its freshest quote, no
   expect(newestQuote([])).toBeNull();
 });
 
-test("Treasury prices keep one decimal count per root on their 32nd tick grid and contracts read by delivery month", () => {
-  expect(curvePrice(105.265625, "ZN")).toBe("105.265625");
-  expect(curvePrice(105.5, "ZN")).toBe("105.500000");
-  expect(curvePrice(101.6796875, "ZT")).toBe("101.67968750");
-  expect(curvePrice(108, "ZB")).toBe("108.00000");
-  expect(curvePrice(-0.1875, "ZN")).toBe("-0.187500");
+test("Treasury prices read in 32nds, as quote and FUT write them, and contracts read by delivery month", () => {
+  expect(curvePrice(106.640625, "ZN")).toBe("106-20\u00bd");
+  expect(curvePrice(105.5, "ZN")).toBe("105-16");
+  expect(curvePrice(101.6796875, "ZT")).toBe("101-21\u00be");
+  expect(curvePrice(108, "ZB")).toBe("108-00");
+  // The M2-M1 spread and a move are signed 32nds; one that is flat is unsigned.
+  expect(curvePrice(-0.171875, "ZN")).toBe("-0-05\u00bd");
+  expect(curveChangeText(0.453125, "ZN")).toBe("+0-14\u00bd");
+  expect(curveChangeText(0, "ZN")).toBe("0-00");
+  // Each number a report exports keeps its decimals.
+  expect(curveRoundedPrice(106.6406250001, "ZN")).toBe(106.640625);
   expect(curvePrice(-0.001, "CL")).toBe("0.00");
   expect(curvePrice(0.00635, "6J")).toBe("0.0063500");
   // Crude's November contract expires in October.
@@ -121,7 +136,9 @@ test("Dutch TTF gas is a curve root that reads in euros per MWh at its 0.001 tic
   // The server sends no contract terms for the euro contract, so the catalogue says what a price counts.
   expect(curveUnitLabel(ttf)).toBe("EUR / MWh");
   // A root with neither terms nor a catalogue unit reads its quote unit, and the server's terms win.
-  expect(curveUnitLabel({ ...payload(), spec: null })).toBe("USD");
+  expect(curveUnitLabel({ ...payload(), root: "VX", spec: null })).toBe("USD");
+  // Crude whose terms are missing reads per barrel, from the catalogue.
+  expect(curveUnitLabel({ ...payload(), spec: null })).toBe("USD / barrel");
   expect(curveUnitLabel({ ...ttf, spec: { unit: "EUR / MWh", size: "1 MW", pointValue: 1, tick: 0.001, tickValue: 0.001, settlement: "cash" } })).toBe("EUR / MWh");
   // A past TTF curve keeps the archive's euro rather than defaulting to dollars.
   const past = archivedFuturesCurve("TTF", { root: "TTF", name: "Dutch TTF Natural Gas", date: "2026-10-02", asOf: "2026-10-02", currency: "EUR", quoteUnit: "EUR",
@@ -141,9 +158,10 @@ test("every FUT board root opens a curve, as a typed code or an =F symbol; the c
   }
   expect(requested).toEqual(FUTURES_CONTRACTS.map((row) => row.code));
   // Zoom, KC wheat's, live cattle's, lean hogs' and aluminum's codes are listed securities too, as are those of a sector ETF
-  // (XAR), Goldmoney (XAU), Sensient (SXT) and the micros listed abroad: under the cursor they open the curve only as the
-  // future's symbol, while a typed argument always means the future.
-  const securities = ["ZM", "KE", "LE", "HE", "ALI", "EMD", "RS1", "MES", "MYM", "M2K", "SXT", "SXI", "SOX", "XAU", "XAR", "RX", "MCL", "MNG", "HH"];
+  // (XAR), Goldmoney (XAU), Sensient (SXT), the micros listed abroad and the micro metals' ETFs (MGC, SIL): under the cursor
+  // they open the curve only as the future's symbol, while a typed argument always means the future.
+  const securities = ["ZM", "KE", "LE", "HE", "ALI", "EMD", "RS1", "MES", "MYM", "M2K", "SXT", "SXI", "SOX", "XAU", "XAR", "RX", "MCL", "MNG", "HH",
+    "MGC", "SIL", "MHG"];
   for (const row of FUTURES_CONTRACTS) {
     expect(curveRootForTicker(row.symbol)).toBe(row.code);
     expect(curveRootForTicker(row.code.toLowerCase())).toBe(securities.includes(row.code) ? null : row.code);
@@ -202,7 +220,7 @@ test("each contract's move since the look-back curves, with missing legs left em
   expect(curveChangeText(5, "CL")).toBe("+5.00");
   expect(curveChangeText(-2.5, "CL")).toBe("-2.50");
   expect(curveChangeText(0.001, "CL")).toBe("0.00");
-  expect(curveChangeText(null, "CL")).toBe("--");
+  expect(curveChangeText(null, "CL")).toBe(MISSING_VALUE);
   // The change columns sort like any other, with gaps last.
   const rows = [first, { ...first, symbol: "CLZ26.NYM", price: null }, { ...first, symbol: "CLF27.NYM" }];
   const moves = new Map([["CLX26.NYM", { "1W": 5, "1M": null }], ["CLZ26.NYM", { "1W": null, "1M": null }], ["CLF27.NYM", { "1W": -1, "1M": null }]]);
@@ -298,7 +316,7 @@ describe("basis against spot", () => {
     expect(curveBasisPercent(0.4213, 2)).toBe("+0.42%");
     expect(curveBasisPercent(-0.4213, 2)).toBe("-0.42%");
     expect(curveBasisPercent(-0.001, 2)).toBe("0.00%");
-    expect(curveBasisPercent(null, 1)).toBe("--");
+    expect(curveBasisPercent(null, 1)).toBe(MISSING_VALUE);
     const spot = curveSpot("BTC-USD", btc, SPOT_AT);
     expect(curveSpotLabel(spot, "BTC", SPOT_AT)).toBe("spot BTC-USD 67,250.10 · 07:25 UTC");
     // A quote from an earlier UTC day carries its date.
@@ -355,8 +373,33 @@ test("axis labels take their decimals from the plotted range, never the contract
   expect(curveAxisPrice(7803.75, domain(7690, 8080), "ES")).toBe("7804");
   // A VIX strip spans a few points: one decimal, not the settlement's four.
   expect(curveAxisPrice(18, domain(17.4, 22.3), "VX")).toBe("18.0");
-  // A narrow Treasury range keeps the 1/4 ticks exact.
-  expect(curveAxisPrice(104.75, domain(104.4, 105.1), "ZN")).toBe("104.75");
+  // A Treasury axis reads in 32nds, as its prices do.
+  expect(curveAxisPrice(104.75, domain(104.4, 105.1), "ZN")).toBe("104-24");
+});
+
+test("a Treasury curve's axis steps on its 32nds grid, whatever range it plots", () => {
+  const ticks = (root: string, min: number, max: number, rows?: number) => {
+    const grid = curveAxisGrid(root);
+    const domain: CompositeAxisDomain = { side: "right", min, max, scale: "linear", unit: "", unitGroup: "", seriesIds: [],
+      maxTicks: rows ? compositeAxisMaxTicks(rows) : undefined, tickRows: rows, ...(grid ? { tickGrid: grid } : {}) };
+    return compositeAxisTicks(domain, (value, axis) => curveAxisPrice(value, axis, root));
+  };
+  const onGrid = (values: readonly { value: number }[], grid: number) => values.every(({ value }) => Number.isInteger(value / grid));
+  // ZN over an off-grid range: whole and half 32nds, never 104-25.60 or 104-19.20.
+  for (const rows of [undefined, 12, 7, 3]) {
+    const zn = ticks("ZN", 104.37, 105.13, rows);
+    expect(zn.length).toBeGreaterThanOrEqual(rows === 3 ? 1 : 2);
+    expect(onGrid(zn, 1 / 64)).toBe(true);
+    expect(zn.every(({ label }) => /^\d+-\d{2}½?$/.test(label))).toBe(true);
+  }
+  expect(ticks("ZN", 104.37, 105.13, 12).map(({ label }) => label)).toEqual(["105-00", "104-26", "104-20", "104-14"]);
+  // ZT's flat curve steps in quarter 32nds; ZB in whole ones.
+  const zt = ticks("ZT", 103.391, 103.437, 12);
+  expect(onGrid(zt, 1 / 128)).toBe(true);
+  expect(zt.every(({ label }) => !label.includes("."))).toBe(true);
+  expect(onGrid(ticks("ZB", 112.11, 113.93, 12), 1 / 32)).toBe(true);
+  // A decimal root keeps its 1-2-5 steps.
+  expect(ticks("CL", 61.37, 64.81).map(({ value }) => value)).toEqual([64, 63, 62]);
 });
 
 
@@ -395,6 +438,33 @@ describe("past curves", () => {
       ["VX/H0", "2020-03-13", false], ["VX/J0", "2020-03-13", false], ["VX/K0", "2020-03-11", true], ["VX/M0", "2020-03-11", true],
     ]);
     expect(curve.slope).toMatchObject({ frontSymbol: "VX/H0", nextSymbol: "VX/J0", state: "backwardation" });
+  });
+
+  test("a weekend's or today's curve is dated by the session it shows, and says which day it shows instead", () => {
+    const monday = new Date("2026-11-09T18:00:00Z");
+    expect(curveSessionNote("2026-11-08", "2026-11-06", "CL", monday)).toBe("No settle for Sun 8 Nov; showing Fri 6 Nov.");
+    expect(curveSessionNote("2026-11-09", "2026-11-06", "CL", monday)).toBe("Today's settle reaches the archive after 17:30 ET; showing Fri 6 Nov.");
+    // Once 17:30 has passed in New York the day's settle is due: a curve still without it is the archive's gap.
+    expect(curveSessionNote("2026-11-09", "2026-11-06", "CL", new Date("2026-11-09T23:00:00Z")))
+      .toBe("No settle for Mon 9 Nov in the archive; showing Fri 6 Nov.");
+    expect(curveSessionNote("2026-11-03", "2026-11-02", "CL", monday)).toBe("No settle for Tue 3 Nov in the archive; showing Mon 2 Nov.");
+    // Thanksgiving, today or not, is the exchange's holiday.
+    expect(curveSessionNote("2026-11-26", "2026-11-25", "CL", new Date("2026-11-26T15:00:00Z"))).toBe("No settle for Thu 26 Nov, a holiday; showing Wed 25 Nov.");
+    expect([curveSessionNote("2026-11-06", "2026-11-06", "CL", monday), curveSessionNote("2026-11-08", null, "CL", monday)]).toEqual([null, null]);
+    // At 21:00 in New York, UTC is on Tuesday already, which has no settle to ask for.
+    const evening = new Date("2026-11-10T02:00:00Z");
+    expect(curveAsOfDate("2026-11-09", evening)).toBe("2026-11-09");
+    expect(() => curveAsOfDate("2026-11-10", evening)).toThrow("A futures curve cannot use a future date.");
+    // The server says its caveats in gaps too, for an older client; this one reads them as notes and the curve as complete.
+    const caveat = "Some contracts show an earlier price because they did not trade on 2026-11-06.";
+    const cl = archivedFuturesCurve("CL", { ...payload("2026-11-08", [row("CLZ26.NYM", "2026-11-20", 90.83, { tradeDate: "2026-11-06" })]),
+      asOf: "2026-11-06", gaps: [caveat, "No expired contracts."], notes: [caveat] }, { "1W": null, "1M": null }, "2026-11-09T18:00:00.000Z");
+    expect([cl.gaps, cl.notes, cl.status]).toEqual([["No expired contracts."], [caveat], "partial"]);
+    expect(archivedFuturesCurve("CL", { ...payload("2026-11-08", [row("CLZ26.NYM", "2026-11-20", 90.83)]), gaps: [caveat], notes: [caveat] },
+      { "1W": null, "1M": null }, "2026-11-09T18:00:00.000Z").status).toBe("available");
+    // Its observation date and as_of are the session served, Friday's, never the Sunday asked for.
+    expect(curveReportFreshness({ source: "gloom", contracts: [], asOf: "2026-11-06" } as never, "2026-11-08"))
+      .toEqual({ status: "not-a-feed", basis: "settlement archive", asOf: "2026-11-06" });
   });
 
   test("a past curve's settlements are only the rows the archive confirms, and its spread pairs settlements with settlements", () => {

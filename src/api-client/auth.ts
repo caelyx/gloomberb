@@ -16,6 +16,7 @@ import type {
   DeviceAuthTokenResponse,
   McpKeyScope,
   PersistedAuthUser,
+  ReferralInvite,
 } from "./types";
 
 type CloudApiRequest = <T>(path: string, options?: RequestInit, canApplySession?: () => boolean) => Promise<T>;
@@ -107,6 +108,33 @@ export class CloudAuthApi {
     );
     this.options.setCurrentUser(result.user);
     return result.user;
+  }
+
+  /**
+   * Signs in, or up, with the ID token Google One Tap handed the web
+   * terminal. The server checks it against its Google client and answers the
+   * way an email login does: the user, and the session in a cookie.
+   */
+  async signInWithGoogle(idToken: string, isCurrent: () => boolean = () => true): Promise<AuthUser> {
+    const result = await this.options.request<{ user: AuthUser }>(
+      "/auth/one-tap/callback",
+      {
+        method: "POST",
+        body: JSON.stringify({ idToken }),
+      },
+      isCurrent,
+    );
+    if (!isCurrent()) throw new Error("Another sign-in replaced this request.");
+    this.options.requireCapturedSession(
+      "Signed in with Google, but Gloom could not save the login session. Please try again.",
+    );
+    this.options.setCurrentUser(result.user);
+    return result.user;
+  }
+
+  /** The Google client One Tap runs on; fails while the server has One Tap off. */
+  async getOneTapConfig(): Promise<{ clientId: string }> {
+    return this.options.request<{ clientId: string }>("/cloud/one-tap", { method: "GET" });
   }
 
   /** Starts a QR / device sign-in; the mobile app approves the returned user code. */
@@ -258,6 +286,11 @@ export class CloudAuthApi {
     );
   }
 
+  /** The account's invite link and the free months it has earned. */
+  async getReferralInvite(): Promise<ReferralInvite> {
+    return this.options.request<ReferralInvite>("/account/referral", { method: "GET" });
+  }
+
   /** The private calendar feed link, or null until it is first created. */
   async getCalendarFeed(): Promise<CalendarFeed | null> {
     const result = await this.options.request<{ feed: CalendarFeed | null }>(
@@ -350,10 +383,15 @@ export class CloudAuthApi {
     });
   }
 
-  async deleteAccount(): Promise<void> {
+  /**
+   * A session signed in more than a day ago sends the account's password;
+   * without it the server refuses with 403 and says in `confirm` whether to
+   * ask for the password or to log in again (see deleteAccountRefusal).
+   */
+  async deleteAccount(password?: string): Promise<void> {
     await this.options.request("/account", {
       method: "DELETE",
-      body: JSON.stringify({}),
+      body: JSON.stringify(password ? { password } : {}),
     });
     this.options.setSessionToken(null);
     this.options.setCurrentUser(null);

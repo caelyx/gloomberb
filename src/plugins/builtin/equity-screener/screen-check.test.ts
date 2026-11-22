@@ -48,8 +48,21 @@ test("checks are pinned to the requested definition, listing and snapshot, prese
     expect(() => validateScreenCheck(bad, definition, { symbol: "NVDA", exchange: "NASDAQ" }, "one")).toThrow();
   }
   expect(() => screenCheckTicker("NVDA MSFT")).toThrow("Enter one ticker");
+  // The listing `quote` reads: a Hong Kong code without its zeros, or with a vendor's suffix, is the HKEX line.
+  for (const typed of ["700:HKEX", "700.HK", "00700.HK", "0700:HKEX"]) expect(screenCheckTicker(typed)).toEqual({ symbol: "0700", exchange: "HKEX" });
+  expect(screenCheckTicker("5:HKEX")).toEqual({ symbol: "0005", exchange: "HKEX" });
+  expect(screenCheckTicker("nvda:xnas")).toEqual({ symbol: "NVDA", exchange: "NASDAQ" });
+  // A bare symbol stays bare, and a US class letter is no venue suffix.
+  expect(screenCheckTicker("BRK.B")).toEqual({ symbol: "BRK.B" });
+  // Two decimals, as DVD's figures; only a value that would round onto its threshold keeps more.
   data.criteria[1]!.value = 1.0000000000000002;
-  expect(checkRows(data)[1]!.value).toBe("1.0000000000000002 x");
+  expect(checkRows(data)[1]!.value).toBe("1.00 x");
+  data.criteria[1]!.value = 6.934917224819917;
+  data.criteria[1]!.unit = "%";
+  expect(checkRows(data)[1]!.value).toBe("6.93%");
+  data.criteria[1]!.value = 26_425_365_880;
+  data.criteria[1]!.unit = "ZAR";
+  expect(checkRows(data)[1]!.value).toBe("26,425,365,880 ZAR");
   const alternate = fixture();
   alternate.symbol = "BRK-B";
   alternate.row!.symbol = "BRK.B";

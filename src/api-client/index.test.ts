@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, jest, test } from "bun:test";
+import { afterEach, describe, expect, jest, spyOn, test } from "bun:test";
 import { apiClient, ASSIST_ARG_OPTION_LIMIT, setCloudApiFetchTransport } from "./index";
+import { SOCKET_FIRST_RECONNECT_MAX_MS, SOCKET_RESYNC_AFTER_SILENCE_MS } from "./socket";
 import { publishableMarketplaceLayout } from "../shares/portable-layout";
 import { createDefaultConfig } from "../types/config";
 import type { PaneDef } from "../types/plugin";
@@ -9,6 +10,7 @@ import { getActiveQuoteDisplay } from "../market-data/market/status";
 import { installTestWebSocket, verifiedUser } from "../test-support/cloud-api";
 import type { AssistCommandDescriptor } from "./types";
 import { SyncRevisionConflictError } from "../sync/types";
+import { getLanguage, setLanguage } from "../i18n";
 
 const originalFetch = globalThis.fetch;
 const originalWebSocket = globalThis.WebSocket;
@@ -22,11 +24,13 @@ function mockFetch(
   return handler as unknown as typeof fetch;
 }
 
+/** Runs the batched subscription sends, short of the socket's connect timeout and silence checks, which never run out. */
 function flushQuoteSubscriptionUpdates(): void {
-  jest.runAllTimers();
+  jest.advanceTimersByTime(1_000);
 }
 
 afterEach(() => {
+  jest.restoreAllMocks();
   apiClient.dispose();
   globalThis.fetch = originalFetch;
   globalThis.WebSocket = originalWebSocket;
@@ -168,6 +172,30 @@ test("a sync push names the revision it merged with, and a refused one is a conf
   await expect(apiClient.putSyncSnapshot(snapshot, { baseRevision: 7 })).rejects.toBeInstanceOf(SyncRevisionConflictError);
   await expect(apiClient.putSyncSnapshot(snapshot, { baseRevision: 0 })).rejects.toBeInstanceOf(SyncRevisionConflictError);
   expect(ifMatch).toEqual(["7", "0"]);
+});
+
+test("a checkout tells the server the app's language", async () => {
+  const language = getLanguage();
+  const sent: unknown[] = [];
+  globalThis.fetch = mockFetch(async (input, init) => {
+    const request = input instanceof Request ? input : new Request(String(input), init);
+    expect(new URL(request.url).pathname).toEndWith("/stripe/checkout");
+    sent.push(await request.json());
+    return Response.json({ url: "https://checkout.stripe.com/c/pay/cs_test" });
+  });
+
+  try {
+    setLanguage("zh-TW");
+    await apiClient.createCloudCheckout(undefined, "year");
+    setLanguage("en");
+    await apiClient.createCloudCheckout("https://term.gloom.sh/");
+  } finally {
+    setLanguage(language);
+  }
+  expect(sent).toEqual([
+    { interval: "year", lang: "zh-TW" },
+    { returnTo: "https://term.gloom.sh/", interval: "month", lang: "en" },
+  ]);
 });
 
 describe("apiClient auth cookies", () => {
@@ -430,6 +458,39 @@ describe("apiClient auth cookies", () => {
     await expect(apiClient.getSession()).resolves.toBeNull();
     expect(apiClient.getSessionToken()).toBeNull();
     expect(apiClient.getWebSocketToken()).toBeNull();
+    expect(apiClient.getCurrentUser()).toBeNull();
+  });
+
+  test("deletes the account with the password when given, and keeps the session when an old one is refused", async () => {
+    apiClient.setSessionToken("persisted-token.value");
+    apiClient.restoreCachedUser(verifiedUser);
+    const sent: unknown[] = [];
+    let answer = () => Response.json(
+      { message: "Confirm your password, or log in again, to delete your account.", confirm: "password" },
+      { status: 403 },
+    );
+    globalThis.fetch = mockFetch(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(String(input), init);
+      expect(new URL(request.url).pathname).toEndWith("/account");
+      expect(request.method).toBe("DELETE");
+      sent.push(await request.json());
+      return answer();
+    });
+
+    const refused = await apiClient.deleteAccount().catch((error: unknown) => error);
+    expect(refused).toMatchObject({
+      status: 403,
+      message: "Confirm your password, or log in again, to delete your account.",
+      details: { confirm: "password" },
+    });
+    // Refused, the account and its session stay.
+    expect(apiClient.getSessionToken()).toBe("persisted-token.value");
+    expect(apiClient.getCurrentUser()).not.toBeNull();
+
+    answer = () => Response.json({ deleted: true });
+    await apiClient.deleteAccount("the-password");
+    expect(sent).toEqual([{}, { password: "the-password" }]);
+    expect(apiClient.getSessionToken()).toBeNull();
     expect(apiClient.getCurrentUser()).toBeNull();
   });
 
@@ -928,7 +989,8 @@ describe("apiClient scanner subscriptions", () => {
 
     jest.useFakeTimers();
     socket.closeWith({ code: 1006, reason: "network" });
-    jest.runAllTimers();
+    // The reconnect waits up to SOCKET_FIRST_RECONNECT_MAX_MS (one second, jittered).
+    jest.advanceTimersByTime(SOCKET_FIRST_RECONNECT_MAX_MS);
     const reconnected = sockets[1]!;
     reconnected.open();
     expect(reconnected.sent).toContainEqual({
@@ -937,6 +999,55 @@ describe("apiClient scanner subscriptions", () => {
     });
 
     unsubscribe();
+  });
+
+  // A server restart reconnects every client at once. If each reconnect's
+  // hello told every listener the user changed, each client would load its
+  // teams, theses and messages again in the same second.
+  test("a reconnect whose hello repeats the account does not report a user change, one that changes it does, and so does one after a long silence", () => {
+    const sockets = installTestWebSocket();
+    apiClient.setSessionToken("reconnect-session");
+    apiClient.restoreCachedUser(verifiedUser);
+    let changes = 0;
+    const stopListening = apiClient.subscribeCurrentUser(() => {
+      changes += 1;
+    });
+    const unsubscribe = apiClient.subscribeScanner("flow", () => {});
+    const hello = {
+      type: "ready",
+      user: { id: verifiedUser.id, username: verifiedUser.username, displayName: "Test User", emailVerified: true, plan: "free", trialEndsAt: null, effectivePlan: "free" },
+      features: [],
+    };
+    try {
+      sockets[0]!.open();
+      sockets[0]!.receive(hello);
+      // The first hello adds what the session load did not have.
+      expect(changes).toBe(1);
+
+      jest.useFakeTimers();
+      sockets[0]!.closeWith({ code: 1012, reason: "Server restarting" });
+      jest.advanceTimersByTime(SOCKET_FIRST_RECONNECT_MAX_MS);
+      sockets[1]!.open();
+      sockets[1]!.receive(hello);
+      expect(changes).toBe(1);
+
+      sockets[1]!.receive({ ...hello, user: { ...hello.user, plan: "pro", effectivePlan: "pro" } });
+      expect(changes).toBe(2);
+      expect(apiClient.getCurrentUser()).toMatchObject({ plan: "pro", effectivePlan: "pro" });
+
+      // A laptop that slept: its clock is a minute on when it finds the
+      // socket dead, and what changed meanwhile was missed.
+      const timerClock = Date.now.bind(Date);
+      spyOn(Date, "now").mockImplementation(() => timerClock() + SOCKET_RESYNC_AFTER_SILENCE_MS);
+      sockets[1]!.closeWith({ code: 1006, reason: "" });
+      jest.advanceTimersByTime(SOCKET_FIRST_RECONNECT_MAX_MS);
+      sockets[2]!.open();
+      sockets[2]!.receive({ ...hello, user: { ...hello.user, plan: "pro", effectivePlan: "pro" } });
+      expect(changes).toBe(3);
+    } finally {
+      unsubscribe();
+      stopListening();
+    }
   });
 });
 

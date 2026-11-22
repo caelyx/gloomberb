@@ -53,9 +53,13 @@ test("restored qualified Shopify stays in the five root results and retargets th
   initial.focusedPaneId = main.instanceId;
   const stateRef = { current: initial };
   let search!: ReturnType<typeof useCommandBarTickerSearchActions>;
-  const registry = { events: { emit() {} }, pinTicker() { throw new Error("The focused research pane should be retargeted"); } } as unknown as PluginRegistry;
+  const dispatch = (action: Parameters<typeof appReducer>[1]) => { stateRef.current = appReducer(stateRef.current, action); };
+  const registry = {
+    events: { emit() {} }, panes: new Map(),
+    updateLayout: (layout: typeof initial.config.layout) => dispatch({ type: "UPDATE_LAYOUT", layout }),
+    pinTicker() { throw new Error("The focused research pane should be retargeted"); },
+  } as unknown as PluginRegistry;
   function Harness() {
-    const dispatch = (action: Parameters<typeof appReducer>[1]) => { stateRef.current = appReducer(stateRef.current, action); };
     const pane = useCommandBarPaneActions({ dispatch, pluginRegistry: registry, stateRef });
     search = useCommandBarTickerSearchActions({ closeAll() {}, dispatch, focusTicker: pane.focusTicker,
       pluginRegistry: registry, tickerRepository: repo, tickers: initial.tickers });
@@ -134,7 +138,7 @@ test("a choice of listings says which one no longer trades, and when", async () 
   }).catch((caught: unknown) => caught);
   expect(error).toBeInstanceOf(AmbiguousTickerError);
   const names = (error as AmbiguousTickerError).listingNames;
-  expect(names.FRC).toBe("Last traded Apr 28, 2023");
+  expect(names.FRC).toBe("Last traded 28 Apr 2023");
   expect(Object.values(names)).toContain("First Republic Bank");
 });
 

@@ -8,20 +8,25 @@ import {
   usePaneStatusFooter,
   type ChartTableChart,
 } from "../../../components";
+import { ageFooterSegment } from "../../../components/layout/pane/footer";
 import { staticSeries } from "../../../components/chart/static/series";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { useAsyncResource, useAutoRefresh, usePluginPaneState, useUpdatedAgo } from "../../../public/react";
+import { useUtcDay } from "../../../react/auto-refresh";
+import { reportFooterSegment } from "../shared/source-footer";
+import { earningsCalendarHeadless } from "./headless";
 import { colors } from "../../../theme/colors";
 import { useLiveStreamingSetting } from "../../../state/hooks/live-streaming";
 import { useAssetData } from "../../runtime";
 import { isBoardRowLoading, useQuoteBoard } from "../shared/use-quote-board";
-import { newYorkToday, reportMove } from "./board-model";
-import { cachedEarningsHistory, loadEarningsHistory } from "./client";
+import { historyListing, newYorkToday, reportMove } from "./board-model";
+import { usePlanAccess } from "../../../api-client/plan-access";
+import { useResearchCloudSession } from "../shared/research-cloud-session";
+import { cachedEarningsHistory, loadEarningsHistory, noHistoryAbroad } from "./client";
 import { loadEarningsCalendar } from "./data/cache";
 import { chartAxis, chartPoints, chartRows, historyFigures, historyRows, type HistoryRow } from "./history-model";
 import { historyColumns, renderHistoryCell, type HistoryColumn, type LiveMove } from "./history-table";
 import { loadNoEarningsText } from "./no-earnings";
-import { listingAbroadVenue } from "../../../utils/sec";
 
 const barDate = (row: HistoryRow) => (row.implied != null || row.move != null ? new Date(`${row.date}T00:00:00Z`) : null);
 
@@ -38,10 +43,22 @@ export function EarningsHistoryView({ symbol, width, height, focused, registrati
   registrationId: string;
 }) {
   const dataProvider = useAssetData();
-  // Past reports are the US board's, where SAN is not SAN:EPA's company: a listing abroad shows its next report alone.
-  const abroad = listingAbroadVenue(symbol) != null;
-  const loader = useCallback((force: boolean) => (abroad ? Promise.resolve(null) : loadEarningsHistory(symbol, force)), [abroad, symbol]);
-  const resource = useAsyncResource(loader, { initialData: () => (abroad ? null : cachedEarningsHistory(symbol)) });
+  // Past reports are a US listing's and a Hong Kong, Singapore or China A listing's own (its exchange's results
+  // calendar and announcements, in their currency), read by its key however it was typed (0700.HK is 0700:HKEX): any
+  // other listing abroad shows its next report alone.
+  const { listing, abroad, ownAbroad } = historyListing(symbol);
+  // A Hong Kong listing's announcement figures come with Pro, as KPIS has them: what Gloom Cloud answers differs by
+  // plan, so it is kept per session and plan.
+  const access = usePlanAccess();
+  const session = useResearchCloudSession();
+  const accessKey = ownAbroad ? `${session.requestKey}:${access.hasProAccess ? "pro" : "free"}` : undefined;
+  const loader = useCallback(
+    (force: boolean) => (abroad ? Promise.resolve(null)
+      : ownAbroad ? loadEarningsHistory(listing, force, undefined, accessKey).catch(noHistoryAbroad)
+      : loadEarningsHistory(listing, force)),
+    [abroad, accessKey, listing, ownAbroad],
+  );
+  const resource = useAsyncResource(loader, { initialData: () => (abroad ? null : cachedEarningsHistory(listing, accessKey)) });
   // Past the stored calendar's horizon, and for listings it does not carry, the per-ticker calendar has the next date.
   const upcomingLoader = useCallback(
     (force: boolean) => loadEarningsCalendar(dataProvider, [symbol], { force }).then((result) => result.events[0] ?? null),
@@ -50,8 +67,8 @@ export function EarningsHistoryView({ symbol, width, height, focused, registrati
   const upcoming = useAsyncResource(upcomingLoader);
   const payload = resource.data?.payload ?? null;
   const today = newYorkToday();
-  const rows = useMemo(() => historyRows(payload, today, upcoming.data ?? null), [payload, today, upcoming.data]);
-  const columns = useMemo(() => historyColumns(width, rows), [rows, width]);
+  const rows = useMemo(() => historyRows(payload, today, upcoming.data ?? null, { abroad: ownAbroad }), [ownAbroad, payload, today, upcoming.data]);
+  const columns = useMemo(() => historyColumns(width, rows, { abroad: ownAbroad }), [ownAbroad, rows, width]);
   // A report out today shows its move so far, from the quotes EVTS reads, until its first close after settles it.
   const outToday = rows.some((row) => row.date === today && row.dateStatus === "reported" && row.move == null);
   const quoteSymbols = useMemo(() => (outToday ? [symbol] : []), [outToday, symbol]);
@@ -99,15 +116,22 @@ export function EarningsHistoryView({ symbol, width, height, focused, registrati
   // A coin's history fails (it is no US ticker), which says nothing once its type has answered.
   const historyError = noEarnings.loading || noEarnings.data ? null : resource.error;
   const updatedAgo = useUpdatedAgo(resource.updatedAt);
+  const utcDay = useUtcDay();
+  // Its source and when the history was read, as `fn ERN` ends; how long ago it loaded goes first on a narrow row.
+  const footerInfo = useMemo(() => abroad
+    ? [{ id: "us-listings", parts: [{ text: "past reports: US, Hong Kong, Singapore and China A listings only", tone: "muted" as const }] }]
+    : payload ? [
+      reportFooterSegment(earningsCalendarHeadless, { rows: [], metadata: { asOf: payload.asOf } }),
+      ...(updatedAgo ? [ageFooterSegment(updatedAgo)] : []),
+    ] : [], [abroad, payload, updatedAgo, utcDay]);
   useAutoRefresh(resource.updatedAt, resource.load);
-  usePaneRefreshKey(() => { void resource.reload(); void upcoming.reload(); }, { focused });
+  usePaneRefreshKey(() => { resource.reload(); upcoming.reload(); }, { focused });
   usePaneStatusFooter({
     registrationId,
     loading: resource.loading,
     error: historyError,
     stale: !!resource.data?.stale,
-    info: abroad ? [{ id: "us-listings", parts: [{ text: "past reports: US listings only", tone: "muted" as const }] }]
-      : payload && updatedAgo ? [{ id: "updated", parts: [{ text: updatedAgo, tone: "muted" as const }] }] : [],
+    info: footerInfo,
   });
 
   return (

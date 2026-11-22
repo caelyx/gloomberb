@@ -1,21 +1,45 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { TextAttributes } from "../../../ui";
-import { TickerBadgeList, type DataTableCell } from "../../../components";
+import type { DataTableCell } from "../../../components";
 import { colors } from "../../../theme/colors";
 import { formatRelativeTime } from "../../../utils/datetime-format";
 import {
-  CompanyCell,
   FavoriteCell,
+  ListingBadges,
 } from "./detail";
+import type { DatasetTicker } from "./detail/ui";
 import type { BuildoutColumn, BuildoutRow } from "./model/types";
 import {
   activityColor,
   activityLabel,
   criticalityColor,
+  listWord,
   metricColor,
+  moneyAmount,
+  moneyText,
   text,
   tickerSymbol,
 } from "./format";
 import { favoriteKey } from "./table-model";
+
+/** A dollar figure in the compact form, with its whole number for an export. */
+function moneyCell(value: string | null | undefined, color: string): DataTableCell {
+  const amount = moneyAmount(value);
+  return { text: moneyText(value), ...(amount == null ? {} : { value: amount }), color };
+}
+
+/**
+ * The dataset's tickers in one cell: a chip for each the app can open, bold
+ * plain text for one it cannot read, and the same for every row of the column.
+ */
+function tickerCell(tickers: readonly DatasetTicker[], width: number, selected: boolean): DataTableCell | null {
+  const symbols = tickers.flatMap((entry) => tickerSymbol(entry.ticker) ?? []);
+  if (symbols.length === 0) return null;
+  return {
+    text: symbols.join(" "),
+    content: <ListingBadges tickers={tickers} width={width} fallbackColor={selected ? colors.selectedText : colors.textBright} />,
+  };
+}
 
 interface BuildoutCellContext {
   favoriteBusyKey: string | null;
@@ -38,9 +62,9 @@ export function renderBuildoutCell(
       case "listDescription":
         return { text: text(list.shortDescription ?? list.description), color: colors.textDim };
       case "companyCount":
-        return { text: list.companyCount == null ? "-" : String(list.companyCount), color: colors.textDim };
+        return { text: list.companyCount == null ? MISSING_VALUE : String(list.companyCount), color: colors.textDim };
       case "totalMarketCap":
-        return { text: text(list.totalMarketCap), color: colors.textDim };
+        return moneyCell(list.totalMarketCap, colors.textDim);
       case "avgSectorGrowth":
         return { text: text(list.avgSectorGrowth), color: metricColor(list.avgSectorGrowth) };
       case "avgReturn1y":
@@ -69,17 +93,10 @@ export function renderBuildoutCell(
           ),
         };
       }
+      case "ticker":
+        return tickerCell([company], column.width, rowState.selected) ?? { text: "", value: null };
       case "company":
-        return {
-          text: company.ticker ? `${company.ticker} ${company.name}` : company.name,
-          content: (
-            <CompanyCell
-              company={company}
-              width={column.width}
-              selected={rowState.selected}
-            />
-          ),
-        };
+        return { text: company.name, color: colors.text };
       case "description":
         return { text: text(company.description), color: colors.textDim };
       case "sectorTech":
@@ -87,16 +104,16 @@ export function renderBuildoutCell(
       case "criticality":
         return { text: text(company.aiCriticality), color: criticalityColor(company.aiCriticality), attributes: TextAttributes.BOLD };
       case "marketCap":
-        return { text: text(company.marketCap), color: colors.textDim };
+        return moneyCell(company.marketCap, colors.textDim);
       case "revenue":
-        return { text: text(company.revenue), color: colors.textDim };
+        return moneyCell(company.revenue, colors.textDim);
       case "revenueGrowth":
         return {
           text: text(company.revenueGrowthYoy ?? company.lastQuarterGrowth),
           color: metricColor(company.revenueGrowthYoy ?? company.lastQuarterGrowth),
         };
       case "netIncome":
-        return { text: text(company.netIncome), color: metricColor(company.netIncome) };
+        return moneyCell(company.netIncome, metricColor(company.netIncome));
       case "margin":
         return { text: text(company.profitMargins), color: metricColor(company.profitMargins) };
       case "forwardPE":
@@ -107,6 +124,10 @@ export function renderBuildoutCell(
         return { text: text(company.return1y), color: metricColor(company.return1y) };
       case "employees":
         return { text: text(company.employeeCount), color: colors.textDim };
+      case "listRole":
+        return { text: text(listWord(company.listRole)), color: colors.textDim };
+      case "listTier":
+        return { text: text(listWord(company.listTier)), color: company.listTier === "leader" ? colors.text : colors.textDim };
     }
   }
 
@@ -134,22 +155,9 @@ export function renderBuildoutCell(
         return { text: site.name, color: colors.text };
       case "type":
         return { text: text(site.type), color: colors.textDim };
-      case "owner": {
-        const ownerTicker = tickerSymbol(site.ownerTicker);
-        if (ownerTicker) {
-          return {
-            text: ownerTicker,
-            content: (
-              <TickerBadgeList
-                symbols={[ownerTicker]}
-                width={column.width}
-                fallbackColor={rowState.selected ? colors.selectedText : colors.textBright}
-              />
-            ),
-          };
-        }
-        return { text: text(site.ownerName), color: colors.textDim };
-      }
+      case "owner":
+        return tickerCell([{ ticker: site.ownerTicker }], column.width, rowState.selected)
+          ?? { text: text(site.ownerName), color: colors.textDim };
       case "location":
         return { text: text(location), color: colors.textDim };
       case "park":
@@ -172,23 +180,9 @@ export function renderBuildoutCell(
     switch (column.id) {
       case "time":
         return { text: formatRelativeTime(update.publishedAt), color: colors.textDim };
-      case "companies": {
-        const symbols = (update.companies ?? [])
-          .map((company) => tickerSymbol(company.ticker))
-          .filter((symbol): symbol is string => symbol != null);
-        return symbols.length > 0
-          ? {
-            text: symbols.join(" "),
-            content: (
-              <TickerBadgeList
-                symbols={symbols}
-                width={column.width}
-                fallbackColor={rowState.selected ? colors.selectedText : colors.textBright}
-              />
-            ),
-          }
-          : { text: text(update.companies?.map((company) => company.name).filter(Boolean).join(", ")), color: colors.textDim };
-      }
+      case "companies":
+        return tickerCell(update.companies ?? [], column.width, rowState.selected)
+          ?? { text: text(update.companies?.map((company) => company.name).filter(Boolean).join(", ")), color: colors.textDim };
       case "headline":
         return { text: update.headline, color: colors.text };
     }

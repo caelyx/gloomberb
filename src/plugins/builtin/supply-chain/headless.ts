@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { SupplyRow } from "../../../api-client/supply-chain";
 import { DATE_OPTION_EXAMPLES, isoDateOption } from "../../../utils/calendar-date";
 import type { GraphEvidence, GraphPath, GraphPayload } from "../../../api-client/supply-chain-graph";
@@ -7,7 +8,8 @@ import { evidenceDate, evidenceLabel, isUnconfirmed, matchesSupplyOptions, suppl
 import { fetchSupplyGraph, graphOptions } from "./graph-client";
 import { entityTicker, exposureLabel, pathLabel } from "./graph-model";
 import { graphEvidenceRow } from "./graph-evidence";
-import { counterpartyName, disclosedValue, disclosureText, earlierRows, isTaggedFact, lockedDisclosures, nativeValue, periodText, roleLabel, shareParts, supplyPreviewNote, supplyRoleCounts } from "./model";
+import { counterpartyKind, counterpartyName, disclosedValue, disclosureText, earlierRows, isRelatedParty, isTaggedFact, lockedDisclosures, nativeValue, periodText, relationshipLabel, shareParts, supplyEmptyText, supplyPreviewNote,
+  supplyRoleCounts } from "./model";
 
 /**
  * The Table tab's columns, printed as the pane prints them: the share with
@@ -19,23 +21,27 @@ import { counterpartyName, disclosedValue, disclosureText, earlierRows, isTagged
 function tableColumns(rows: HeadlessPaneRow[], sources: ReadonlyMap<HeadlessPaneRow, SupplyRow>, focusId: string | undefined): HeadlessPaneColumn[] {
   const cell = (read: (row: SupplyRow) => string | null) => (value: unknown, row: HeadlessPaneRow) => {
     const source = sources.get(row);
-    return (source ? read(source) : value == null ? null : String(value)) ?? "-";
+    return (source ? read(source) : value == null ? null : String(value)) ?? MISSING_VALUE;
   };
   const valued = rows.some((row) => { const source = sources.get(row); return !!source && (nativeValue(source) !== null || source.usd !== null); });
   const lengths = rows.some((row) => sources.get(row)?.periodMonths != null);
   return [
-    { key: "counterparty", header: "Counterparty", format: cell(counterpartyName) },
+    // The text names a company with its subsidiaries (X及其子公司) as the group, as the pane's label beside the name does
+    // (the Role says whether it is a related party); a cohort or an undisclosed name already says what it is.
+    { key: "counterparty", header: "Counterparty", format: cell(counterpartyName),
+      textFormat: cell((row) => counterpartyKind(row) === "company" && row.entityScope === "group" ? `${counterpartyName(row)} (group)` : counterpartyName(row)) },
     { key: "evidenceTier", header: "Evidence" },
     { key: "ticker", header: "Ticker" },
-    { key: "role", header: "Role", format: cell((row) => roleLabel(row.role)) },
-    // Exports keep the share a number; the text says what it is a share of.
-    { key: "pct", header: "Share", format: cell((row) => shareParts(row, focusId)?.value ?? null),
+    // A related-party trade reads as one, never as a plain supplier or customer.
+    { key: "role", header: "Role", format: cell(relationshipLabel) },
+    // Exports keep the share a number, what it is a share of beside it in the Table's words ("% of total revenue (gold sales)").
+    { key: "pct", header: "Share", unitKey: "shareUnit", unitColumn: true, format: cell((row) => shareParts(row, focusId)?.value ?? null),
       textFormat: cell((row) => { const share = shareParts(row, focusId); return share ? `${share.value} ${share.basis}` : null; }) },
     ...(valued ? [{ key: "usd", header: "Value", align: "right" as const,
       format: cell((row) => nativeValue(row) === null && row.usd === null ? null : disclosedValue(row).replace(/ (disclosed|derived)$/, "")) }] : []),
-    // Exports keep the end date; the text adds the period's length when the source states it.
-    // A narrow table may cut the length as it cuts other text, never the date (eleven cells: the date and an ellipsis).
-    { key: "period", header: "Period", textFormat: cell(periodText), ...(lengths ? { minWidth: 11 } : {}) },
+    // Exports keep the end date; the text adds the period's length when the source states it ("year to 31 Dec
+    // 2025", "as of 26 Sep 2026"), and a narrow table never cuts it, so the date is never lost behind the length.
+    { key: "period", header: "Period", textFormat: cell(periodText), ...(lengths ? { minWidth: Math.max(...rows.map((row) => { const source = sources.get(row); return source ? periodText(source).length : 0; })) } : {}) },
     { key: "filed", header: "Published", format: cell(evidenceDate) },
   ];
 }
@@ -43,7 +49,7 @@ function tableColumns(rows: HeadlessPaneRow[], sources: ReadonlyMap<HeadlessPane
 const pathColumns = [
   { key: "route", header: "Route" }, { key: "hops", header: "Hops" },
   { key: "score", header: "Rank score", description: "Product of normalized edge weights; not a probability." },
-  { key: "confidence", header: "Confidence" }, { key: "exposureLabel", header: "Estimated exposure" },
+  { key: "confidence", header: "Confidence" }, { key: "exposureLabel", header: "Exposure" },
 ];
 /**
  * What a graph disclosure says in words: the text itself, or for a tagged
@@ -55,6 +61,12 @@ function graphStatement(item: GraphEvidence, siblings: readonly GraphEvidence[])
   if (!isTaggedFact(row)) return item.quote;
   const sentence = siblings.find((other) => other.id !== item.id && other.sourceKind === "filing_text" && other.reporter.id === item.reporter.id && other.quote.trim());
   return sentence?.quote ?? disclosureText(row);
+}
+
+/** A graph disclosure's share as the Table words it, naming the company it is a share of; null when none is disclosed. */
+function graphShare(item: GraphEvidence): string | null {
+  const share = shareParts(graphEvidenceRow(item), undefined, { includeReporter: true });
+  return share ? `${share.value} ${share.basis}` : null;
 }
 
 function graphReport(data: GraphPayload, target: string): HeadlessBundleResult {
@@ -75,14 +87,16 @@ function graphReport(data: GraphPayload, target: string): HeadlessBundleResult {
     }));
   sections.push({ title: "Disclosure evidence", columns: [
     { key: "reporter", header: "Reporting company" }, { key: "from", header: "Supplier / from" }, { key: "to", header: "Customer / to" },
-    { key: "role", header: "Role" }, { key: "pct", header: "% disclosed" }, { key: "denominator", header: "Denominator" },
+    // The share in the Table's words, its reporter named ("27% of NEM total revenue (gold sales)"); exports keep pct and denominator apart.
+    { key: "role", header: "Role", textFormat: (value, row) => row.relatedParty ? `related-party ${String(value)}` : String(value) },
+    { key: "pct", header: "Share", textFormat: (_value, row) => String(row.share ?? MISSING_VALUE) },
     { key: "period", header: "Period", textFormat: (value, row) => periodText({ period: String(value), periodMonths: row.periodMonths as number | null }) },
     { key: "filed", header: "Filed" }, { key: "confidence", header: "Confidence" },
     // A tagged XBRL fact prints the link's filing sentence when one names the same pair, otherwise the fact in words; exports keep the stored text.
     { key: "quote", header: "Quote", textFormat: (value, row) => row.statement == null ? String(value ?? "") : String(row.statement) }, { key: "filingUrl", header: "Filing" },
   ], rows: data.links.flatMap(link => link.evidence.map(item => ({ id: item.id, linkId: link.id, primary: item.id === link.primaryEvidenceId,
-    statement: graphStatement(item, link.evidence),
-    reporter: item.reporter.name, from: item.from.name, to: item.to.name, role: item.role, pct: item.pctOfRevenue ?? null,
+    statement: graphStatement(item, link.evidence), share: graphShare(item),
+    reporter: item.reporter.name, from: item.from.name, to: item.to.name, role: item.role, relatedParty: isRelatedParty(item), pct: item.pctOfRevenue ?? null,
     denominator: item.pctBasis && !(item.sourceKind === "xbrl" && item.pctScope) ? `${item.reporter.name} ${item.pctBasis}${item.pctScope ? ` (${item.pctScope})` : ""}` : null,
     pctBasis: item.pctBasis, pctScope: item.pctScope, period: item.period, periodMonths: item.periodMonths ?? null, filed: item.filedDate, asOf: item.asOf,
     confidence: item.confidence, quote: item.quote, quoteLanguage: item.quoteLanguage, quoteGloss: item.quoteGloss ?? null,
@@ -132,22 +146,31 @@ export const supplyChainHeadless: HeadlessPaneDefinition<"bundle"> = {
   ],
   describe: (args) => `Supply chain | ${args.symbols[0]}${args.options.to ? ` → ${args.options.to}` : ""}`,
   async load(args, ctx) {
+    const asOfOption = args.options.asOf ?? args.options["as-of"];
+    const asOf = typeof asOfOption === "string" && asOfOption ? asOfOption : undefined;
     if (args.options.tab === "graph" || args.options.tab === "path") {
       const target = String(args.options.to ?? "").trim();
       if (args.options.tab === "path" && !target) throw new Error("Path requires a target company: --to TICKER");
-      return graphReport(await fetchSupplyGraph(args.symbols[0]!, graphOptions(args.options), target, ctx.apiClient), target);
+      const graph = await fetchSupplyGraph(args.symbols[0]!, graphOptions(args.options), target, ctx.apiClient);
+      // The free preview reads the graph's latest snapshot whatever the cutoff: said, never served as if it were that day's.
+      if (asOf && graph.options.asOf !== asOf) {
+        throw new Error(`--as-of ${asOf} on the ${args.options.tab === "path" ? "Path" : "Graph"} tab needs Gloom Pro; the free preview reads the latest disclosures. `
+          + `The Table tab reads it for everyone: gloom fn SPLC ${args.symbols[0]} --as-of ${asOf}`);
+      }
+      return graphReport(graph, target);
     }
     const options = supplyOptions(args.options.tiers);
-    const data = await fetchSupplyChain(args.symbols[0]!, ctx.apiClient, options);
+    const data = await fetchSupplyChain(args.symbols[0]!, ctx.apiClient, { ...options, ...asOf ? { asOf } : {} });
     const sources = new Map<HeadlessPaneRow, SupplyRow>();
     const sourced = (source: SupplyRow, row: HeadlessPaneRow) => { sources.set(row, source); return row; };
     // The pane's figures, per tab: Table shows one direction, Flow both.
     const figures = (key: "counterparties" | "locked") => Object.fromEntries(([["says", ["says"]], ["names", ["names"]], ["flow", ["says", "names"]]] as const)
       .map(([scope, views]) => [scope, Object.fromEntries(supplyRoleCounts(data, views, options).filter((entry) => entry[key] > 0).map((entry) => [entry.role, entry[key]]))]));
+    const shareOf = (row: SupplyRow) => { const share = shareParts(row, data.entity?.id); return share ? `% ${share.basis}` : null; };
     const record = (row: SupplyRow) => sourced(row, { counterparty: row.counterparty.name, ticker: entityTicker(row.counterparty), aggregate: row.counterparty.aggregate, role: row.role, direction: row.direction,
-      pct: row.pctOfRevenue, pctBasis: row.pctBasis, pctScope: row.pctScope, usd: row.usd, usdBasis: row.usdBasis, period: row.period, periodMonths: row.periodMonths ?? null, fiscalYear: row.fiscalYear,
+      pct: row.pctOfRevenue, shareUnit: shareOf(row), pctBasis: row.pctBasis, pctScope: row.pctScope, usd: row.usd, usdBasis: row.usdBasis, period: row.period, periodMonths: row.periodMonths ?? null, fiscalYear: row.fiscalYear,
       nativeAmount: row.nativeAmount ?? null, nativeCurrency: row.nativeCurrency ?? null, nativeScale: row.nativeScale ?? null,
-      jurisdiction: row.jurisdiction ?? null, entityScope: row.entityScope ?? null,
+      jurisdiction: row.jurisdiction ?? null, entityScope: row.entityScope ?? null, relatedParty: isRelatedParty(row),
       evidenceTier: evidenceLabel(row), tier: trustTier(row), claimType: row.claimType, corroboration: row.corroboration ?? 1,
       leadStatus: row.leadStatus ?? "none", whyUnconfirmed: row.whyUnconfirmed ?? null,
       firstSeenAt: row.firstSeenAt, lastSeenAt: row.lastSeenAt, lastConfirmedAt: row.lastConfirmedAt,
@@ -177,9 +200,18 @@ export const supplyChainHeadless: HeadlessPaneDefinition<"bundle"> = {
     // A requested view is complete when the preview leaves none of its own rows out.
     const locked = lockedDisclosures(data, views);
     const truncated = data.truncated && (!requested || locked > 0);
+    // A company with no relationship at all says what SPLC reads and where else to look, not that it is "not covered".
+    const none = !sections.every((section) => !section.rows?.length) ? null
+      : asOf && data.status === "available" ? `No relationship of ${data.symbol}'s was disclosed by ${asOf}.`
+        : asOf ? `No relationship of ${data.symbol}'s was disclosed by ${asOf}; ${supplyEmptyText(data, (symbol) => `fn SPLC ${symbol}`)}`
+          : supplyEmptyText(data, (symbol) => `fn SPLC ${symbol}`);
+    // Dated by the newest disclosure shown, as each row's Published says, never by the latest period one covers: a
+    // filing published on 29 Oct about June is known from 29 Oct.
+    const published = [...sources.values()].map(evidenceDate).sort().at(-1) ?? null;
     return { complete: !truncated, errors: truncated ? [data.access === "preview" ? supplyPreviewNote(data, locked) : "Additional relationships need Gloom Pro"] : [],
-      sections,
-      metadata: { symbol: data.symbol, asOf: data.asOf, view: requested ?? "both", counterparties: figures("counterparties"), locked: figures("locked"),
+      sections, ...(none && !requested ? { empty: none } : {}),
+      metadata: { symbol: data.symbol, asOf: published, latestPeriod: data.asOf, ...asOf ? { knownBy: asOf } : {},
+        view: requested ?? "both", counterparties: figures("counterparties"), locked: figures("locked"),
         counts: data.counts, earlierCounts: data.earlierCounts ?? null, tierCounts: data.tierCounts, tiers: options.tiers, disclaimer: data.disclaimer } };
   },
 };

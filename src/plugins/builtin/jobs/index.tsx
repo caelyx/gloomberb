@@ -24,6 +24,7 @@ export const jobsModule: PluginModule = {
       order: 37,
       component: JobsResearchTab,
       instruments: ["equity"],
+      proOnly: true,
     });
   },
 
@@ -39,6 +40,7 @@ export const jobsModule: PluginModule = {
       icon: "J",
       component: JobsPane,
       defaultPosition: "right",
+      shareItem: { ticker: true },
       tickerFollower: true,
       instruments: ["equity"],
       defaultMode: "floating",

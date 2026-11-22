@@ -22,6 +22,7 @@ import {
   resolveNativeFloatingResizeCornerRect,
 } from "../../window-edit/status";
 import { MENU_Z_INDEX } from "../menu";
+import { DesktopDropPreview } from "../drag/overlays";
 import { truncateToDisplayWidth } from "../../../../utils/format";
 
 interface ShellWindowModeOverlaysProps {
@@ -103,7 +104,18 @@ export function ShellWindowModeOverlays({
 
   return (
     <>
-      {windowModeDockMovePreview && (
+      {windowModeDockMovePreview && (nativePaneChrome ? (
+        <DesktopDropPreview
+          rect={windowModeDockMovePreview.rect}
+          zIndex={MENU_Z_INDEX - 2}
+          role="window-mode-drop-preview"
+          attributes={{
+            "data-target-id": windowModeDockMovePreview.targetId,
+            "data-position": windowModeDockMovePreview.position,
+          }}
+        />
+      ) : (
+        // An outline alone: the terminal cannot tint what is under it.
         <Box
           position="absolute"
           left={windowModeDockMovePreview.rect.x}
@@ -114,14 +126,12 @@ export function ShellWindowModeOverlays({
           border
           borderStyle="single"
           borderColor={colors.borderFocused}
-          backgroundColor={colors.panel}
-          data-gloom-role="window-mode-drop-preview"
-          data-target-id={windowModeDockMovePreview.targetId}
-          data-position={windowModeDockMovePreview.position}
         />
-      )}
+      ))}
 
-      {highlightedPaneId && !nativePaneChrome && highlightedRect && highlightedRect.height >= 2 && (!overlayOpen || menuOpen) && (() => {
+      {/* Outside window mode a floating pane draws its own sides, in the focus colour when focused (floating-pane.tsx). */}
+      {highlightedPaneId && !nativePaneChrome && highlightedRect && highlightedRect.height >= 2 && (!overlayOpen || menuOpen)
+        && (windowMode || !highlightedFloatingPane) && (() => {
         const selectedInWindowMode = !!windowMode;
         const borderColor = selectedInWindowMode ? colors.borderFocused : colors.border;
         const bodyTop = highlightedRect.y + 1;

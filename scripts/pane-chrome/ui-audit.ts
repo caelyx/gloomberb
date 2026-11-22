@@ -5,6 +5,7 @@ import { takeOption } from "../tui-benchmark-harness";
 import { cacheDir, click, evaluate, launchBrowser, sleep, waitFor, type Browser, type Cdp } from "./browser";
 import { checkoutPlugin, pluginLock } from "./plugin-lock";
 import { pathName, visitAlternatives } from "./tab-visits";
+import { isTransientPane } from "../../src/layout/pane-manager/transient";
 import { UI_AUDIT_MEASURE, type AuditMeasure } from "./ui-audit-measure";
 import { writeAuditReport } from "./ui-audit-report";
 import {
@@ -190,6 +191,49 @@ const SAMPLE_PANE = { instanceId: "world-indices:audit", paneId: "world-indices"
 const COMMAND_BAR = "[data-gloom-role=command-bar-panel]";
 
 /**
+ * A US watchlist that holds BAE Systems on the LSE as `BA`, the symbol Boeing
+ * trades under in New York: its row names the venue (BA:LSE), and the
+ * research pane, the quote cards and the logo beside it are BAE's.
+ */
+const FOREIGN_LISTING_SEED: SeedOptions = {
+  tickers: [
+    { ticker: "LMT", exchange: "NYSE", currency: "USD", name: "Lockheed Martin Corporation", assetCategory: "STK" },
+    { ticker: "NOC", exchange: "NYSE", currency: "USD", name: "Northrop Grumman Corporation", assetCategory: "STK" },
+    { ticker: "RTX", exchange: "NYSE", currency: "USD", name: "RTX Corporation", assetCategory: "STK" },
+    { ticker: "BA", exchange: "LSE", currency: "GBp", name: "BAE Systems plc", assetCategory: "STK" },
+  ],
+};
+const FOREIGN_LISTING_LAYOUT = {
+  dockRoot: {
+    kind: "split", axis: "horizontal", ratio: 0.45,
+    first: { kind: "pane", instanceId: "portfolio-list:audit" },
+    second: { kind: "pane", instanceId: "ticker-research:audit" },
+  },
+  instances: [
+    { instanceId: "portfolio-list:audit", paneId: "portfolio-list", params: { collectionId: "watchlist" }, binding: { kind: "none" } },
+    { instanceId: "ticker-research:audit", paneId: "ticker-research", binding: { kind: "fixed", symbol: "BA" } },
+  ],
+  floating: [],
+  detached: [],
+};
+/** Quote cards from three sessions (Hong Kong's index, a Cboe yield, BAE in London and a New York name), each saying what its price is as of. */
+const SESSION_CARDS = ["^HSI", "^TNX", "BA", "LMT"];
+const SESSION_CARDS_PANE = {
+  instanceId: "quote-monitor:audit",
+  paneId: "quote-monitor",
+  binding: { kind: "fixed", symbol: SESSION_CARDS[0] },
+  settings: { symbol: SESSION_CARDS[0], symbols: SESSION_CARDS, symbolsText: SESSION_CARDS.join(", ") },
+};
+/** An index's daily bars, whose volume the source does not know on some days (a dash, not 0). */
+const INDEX_HISTORY_PANE = { instanceId: "historical-prices:audit", paneId: "historical-prices", binding: { kind: "fixed", symbol: "^HSI" } };
+
+/** Opens the focused pane's menu from its actions button, once the pane has drawn it. */
+async function openPaneMenu(cdp: Cdp): Promise<void> {
+  const at = await waitFor<{ x: number; y: number } | null>(cdp, `(() => { const r = document.querySelector("[data-gloom-role=pane-action] > *")?.getBoundingClientRect(); return r && r.width > 0 ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null; })()`, 6_000);
+  if (at) await click(cdp, at);
+}
+
+/**
  * The shell around the panes: views with no pane of their own to scope to.
  * `surface` is what opening the view must put on the page; a view whose
  * surface is not there fails the run instead of measuring the page under it.
@@ -207,18 +251,14 @@ const SHELL_VIEWS: Array<{ id: string; layout: object; focused?: string; seed?: 
   { id: "pane-settings-dialog", layout: dock(SAMPLE_PANE), focused: SAMPLE_PANE.instanceId, surface: ".gloom-dialog [data-gloom-role=pane-setting-row]", async open(cdp) { await runCommand(cdp, "PS"); } },
   // A form dialog the command bar opens: the default config's manual portfolio is enough for it.
   { id: "position-form", layout: dock(SAMPLE_PANE), focused: SAMPLE_PANE.instanceId, surface: ".gloom-dialog [data-gloom-role=desktop-text-field]", async open(cdp) { await runCommand(cdp, "Set Portfolio Position"); } },
-  {
-    id: "pane-menu",
-    layout: dock(SAMPLE_PANE),
-    focused: SAMPLE_PANE.instanceId,
-    surface: ".gloom-menu, [role=menu]",
-    // The pane's actions button (its "more" icon) opens the pane menu, once the pane has drawn it.
-    async open(cdp) {
-      const at = await waitFor<{ x: number; y: number } | null>(cdp, `(() => { const r = document.querySelector("[data-gloom-role=pane-action] > *")?.getBoundingClientRect(); return r && r.width > 0 ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null; })()`, 6_000);
-      if (!at) return;
-      await click(cdp, at);
-    },
-  },
+  // The pane's actions button (its "more" icon) opens the pane menu.
+  { id: "pane-menu", layout: dock(SAMPLE_PANE), focused: SAMPLE_PANE.instanceId, surface: ".gloom-menu, [role=menu]", open: openPaneMenu },
+  // Listings that share a symbol across venues, and quotes from markets on different clocks.
+  { id: "foreign-listing", layout: FOREIGN_LISTING_LAYOUT, focused: "portfolio-list:audit", seed: FOREIGN_LISTING_SEED, async open() {} },
+  { id: "session-cards", layout: dock(SESSION_CARDS_PANE), focused: SESSION_CARDS_PANE.instanceId, seed: FOREIGN_LISTING_SEED, surface: "[data-gloom-role=quote-monitor-card]", async open() {} },
+  // Its menu holds Export CSV.
+  { id: "session-cards-menu", layout: dock(SESSION_CARDS_PANE), focused: SESSION_CARDS_PANE.instanceId, seed: FOREIGN_LISTING_SEED, surface: ".gloom-menu, [role=menu]", open: openPaneMenu },
+  { id: "index-history", layout: dock(INDEX_HISTORY_PANE), focused: INDEX_HISTORY_PANE.instanceId, async open() {} },
 ];
 
 async function writeLine(file: string, value: unknown): Promise<void> {
@@ -385,15 +425,26 @@ async function main(): Promise<void> {
   async function auditPane(entry: AuditEntry): Promise<AuditView[]> {
     const cdp = browser.cdp;
     await viewport(widths[widths.length - 1]!);
-    const instance = await discover(cdp, app.url, replay, entry) ?? fallbackInstance(entry);
-    const id = instance.instanceId as string;
-    const scope = `[data-gloom-pane-id="${id}"]`;
+    // A window no layout keeps (the Layouts browser, LAY) is opened through its command each time, as a user opens it:
+    // a layout that docks it loads without it. Its instance is named afresh by each opening, so it is found by its pane.
+    const transient = isTransientPane(entry.paneId);
+    const instance = transient ? fallbackInstance(entry) : await discover(cdp, app.url, replay, entry) ?? fallbackInstance(entry);
+    let id = instance.instanceId as string;
+    const scope = transient ? `[data-gloom-pane-id^="${entry.paneId}:"]` : `[data-gloom-pane-id="${id}"]`;
     const base = { kind: "pane" as const, token: entry.token, paneId: entry.paneId, ...(entry.plugin ? { plugin: entry.plugin } : {}), instance };
     const views = new Map<string, AuditView>();
     const paneText = () => evaluate<string>(cdp, `document.querySelector(${JSON.stringify(scope)})?.innerText ?? ""`);
     const open = async (theme: string) => {
       debug(`open ${theme}`);
-      await loadLayout(cdp, app.url, replay, dock(instance), id, { theme });
+      if (transient) {
+        await loadLayout(cdp, app.url, replay, EMPTY_LAYOUT, undefined, { theme });
+        await sleep(800);
+        await runCommand(cdp, entry.token);
+        await settle(cdp, scope);
+        id = await evaluate<string>(cdp, `document.querySelector(${JSON.stringify(scope)})?.getAttribute("data-gloom-pane-id") ?? ""`) || id;
+      } else {
+        await loadLayout(cdp, app.url, replay, dock(instance), id, { theme });
+      }
       await settle(cdp, scope);
       debug("settled");
     };

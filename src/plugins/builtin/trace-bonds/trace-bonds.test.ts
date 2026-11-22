@@ -4,13 +4,14 @@ import { createTestDataProvider, createTestQuote } from "../../../test-support/d
 import { createTestHeadlessArgs, createTestHeadlessContext } from "../../../test-support/headless";
 import { setCliWidthOverride, visibleLength } from "../../../utils/cli-output";
 import { setHttpFetchTransport } from "../../../utils/http-transport";
+import { ApiRequestError } from "../../../api-client/errors";
 import { bondTapeRequests, fetchBondTape, isCusip, noPrintsText, parseBondQuery, tapeIssuerName } from "./client";
 import { traceBondsHeadless } from "./headless";
-import { buildBondColumns } from "./model";
+import { DEFAULT_BOND_SORT, buildBondColumns, sharesOneIssuer, shownBondSort } from "./model";
 
 type Row = Record<string, unknown>;
 type Filter = { fieldName: string; compareType: string; fieldValue: string | null };
-interface Posted { filters: Filter[]; limit: number; token: string | null }
+interface Posted { filters: Filter[]; limit: number; token: string | null; domain?: { fieldName: string; values: string[] }[] }
 
 const TODAY = "2026-10-16";
 
@@ -24,8 +25,11 @@ function fakeTape(answer: (posted: Posted) => Row[] | Response): Posted[] {
   const posted: Posted[] = [];
   setHttpFetchTransport(async (_url, init) => {
     if (!init?.method) return new Response("", { headers: { "set-cookie": "XSRF-TOKEN=token-1; Path=/; Secure" } });
-    const body = JSON.parse(String(init.body)) as { compareFilters: Filter[]; limit: number };
-    const entry = { filters: body.compareFilters, limit: body.limit, token: new Headers(init.headers).get("X-XSRF-TOKEN") };
+    const body = JSON.parse(String(init.body)) as { compareFilters: Filter[]; limit: number; domainFilters?: Posted["domain"] };
+    const entry = {
+      filters: body.compareFilters, limit: body.limit, token: new Headers(init.headers).get("X-XSRF-TOKEN"),
+      ...(body.domainFilters ? { domain: body.domainFilters } : {}),
+    };
     posted.push(entry);
     const rows = answer(entry);
     if (rows instanceof Response) return rows;
@@ -42,9 +46,9 @@ const filterOn = (posted: Posted, field: string, type?: string) => posted.filter
 /** The date filter that leaves matured issues out, or the one that asks for perpetuals. */
 const perpetual = (posted: Posted) => filterOn(posted, "maturityDate", "EQUAL")?.fieldValue === null;
 
-async function report(argument: string, marketData = createTestDataProvider()) {
-  const args = createTestHeadlessArgs({ argument, rawArgument: argument });
-  const result = await traceBondsHeadless.load(args, createTestHeadlessContext({ marketData }));
+async function report(argument: string, marketData = createTestDataProvider(), apiClient?: object, options: Record<string, string> = {}) {
+  const args = createTestHeadlessArgs({ argument, rawArgument: argument, options });
+  const result = await traceBondsHeadless.load(args, createTestHeadlessContext({ marketData, ...(apiClient ? { apiClient: apiClient as never } : {}) }));
   return { result, text: renderHeadlessPaneText(traceBondsHeadless, result, args, "TRACE") };
 }
 
@@ -132,6 +136,19 @@ test("an issuer's matured bonds stay out, its perpetuals stay in, and a CUSIP sh
   expect((await fetchBondTape("963320AT3", { today: TODAY })).bonds.map((row) => row.lastSaleYield)).toEqual([42.56]);
 });
 
+test("a zero price is no last sale: its price, yield, change and date show as none, and it does not date the tape", async () => {
+  // New Fortress Energy's notes on 2 Nov 2026: one printed 0.000 at -15.900 on 2026-09-15.
+  const zero = bond("U6422PAD0", "NFE4797181", "NEW FORTRESS ENERGY INC", "2026-10-30", { lastSalePrice: 0, lastSaleYield: null, priceChangeNumber: -15.9 });
+  const sold = bond("644393AC4", "NFE4797180", "NEW FORTRESS ENERGY INC", "2026-09-04", { lastSalePrice: 16.25, lastSaleYield: 118.36, priceChangeNumber: 0 });
+  fakeTape(() => [zero, sold]);
+  const tape = await fetchBondTape("new fortress", { today: TODAY });
+  expect(tape.tradeDate).toBe("2026-09-04");
+  expect(tape.bonds.map((row) => [row.cusip, row.lastSalePrice, row.lastSaleYield, row.priceChangeNumber, row.lastTradeDate])).toEqual([
+    ["644393AC4", 16.25, 118.36, 0, "2026-09-04"],
+    ["U6422PAD0", null, null, null, null],
+  ]);
+});
+
 test("one request failing leaves the others' rows, and a 204 with no body is no rows", async () => {
   fakeTape((request) => filterOn(request, "issuerName")
     ? new Response("upstream down", { status: 502 })
@@ -179,6 +196,57 @@ test("a ticker with no bonds of its own is asked once by its company's name, and
   expect(noPrintsText(tape.query!, null)).toBe("No prints for ZZZQ.");
 });
 
+test("a ticker's bonds are those linked to its company, by CUSIP, whatever name the tape gives them", async () => {
+  // Ping An's 2318: no issue on the tape starts with the code, and none with the name its quote gives.
+  const pingAn = bond("Y69790AA4", "PIAIF5851797", "Ping An Insurance Co Ltd", "2026-09-21", { couponRate: 0.875, maturityDate: "2029-07-22" });
+  const posted = fakeTape((request) => request.domain ? [pingAn, bond("Y15009AR7", "PIAIF6194715", "CHINA PING AN INS OVERSEAS HLDGS LTD", "2026-11-09")] : []);
+  const asked: string[] = [];
+  const apiClient = {
+    async getCloudIssuerBondIssues(listing: string) {
+      asked.push(listing);
+      return { symbol: "601318:SSE", name: "PING AN INSURANCE", cusips: ["Y69790AA4"] };
+    },
+  };
+  const args = createTestHeadlessArgs({ argument: "2318", rawArgument: "2318" });
+  const result = await traceBondsHeadless.load(args, createTestHeadlessContext({
+    marketData: createTestDataProvider({ getQuote: async (symbol) => createTestQuote({ symbol, name: "Ping An Insurance (Group) Company of China, Ltd." }) }),
+    apiClient: apiClient as never,
+    resolveInstrument: async (symbol) => ({ symbol, exchange: "HKEX" }),
+  }));
+  const text = renderHeadlessPaneText(traceBondsHeadless, result, args, "TRACE");
+  expect(asked).toEqual(["2318:HKEX"]);
+  expect(posted.at(-1)!.domain).toEqual([{ fieldName: "cusip", values: ["Y69790AA4"] }]);
+  // Only the linked issue, and no warning that the company was guessed by name.
+  expect(result.metadata).toMatchObject({ matched: 1, company: "PING AN INSURANCE" });
+  expect(result.warnings).toBeUndefined();
+  expect(result.notes).toContain("Showing the bonds linked to PING AN INSURANCE.");
+  expect(text).toContain("Y69790AA4");
+  expect(text).not.toContain("Y15009AR7");
+  expect(parseBondQuery("2318:hkex")).toMatchObject({ ticker: "2318:HKEX", root: null });
+  expect(parseBondQuery("601318")).toMatchObject({ ticker: "601318" });
+});
+
+test.each([[401, "signed out"], [403, "no Pro"]])("refused its company's linked bonds (%i, %s), a ticker is asked by its company's name as before, said nowhere", async (status) => {
+  const cumulus = bond("23110AAB2", "CUMU5000001", "CUMULUS MEDIA NEW HLDGS INC", "2026-07-27", { couponRate: 8, maturityDate: "2029-07-01" });
+  const posted = fakeTape((request) => filterOn(request, "issuerName")?.fieldValue === "CUMULUS MEDIA" && !perpetual(request) ? [cumulus] : []);
+  const asked: string[] = [];
+  const refused = async (listing: string) => {
+    asked.push(listing);
+    throw new ApiRequestError("Bond trades require Pro", status, undefined, "pro_required");
+  };
+  const quoted = createTestDataProvider({ getQuote: async (symbol) => createTestQuote({ symbol, name: "Cumulus Media Inc." }) });
+  const { result, text } = await report("CMLSQ", quoted, { getCloudIssuerBondIssues: refused, getCloudStoredIssuerBonds: refused });
+  expect(asked).toContain("CMLSQ");
+  expect(posted.some((request) => request.domain)).toBe(false);
+  // Today's answer: the company's name, said to be a guess, and nothing about the refusal.
+  expect(result.warnings).toEqual(["Showing bonds for CUMULUS MEDIA (Cumulus Media Inc.): none trade under CMLSQ."]);
+  expect(result.complete).toBe(true);
+  expect(result.errors).toBeUndefined();
+  expect(result.notes).toBeUndefined();
+  expect(text).toContain("23110AAB2");
+  expect(text).not.toContain("Pro");
+});
+
 test("a failed issuer-name lookup leaves an empty report incomplete and names the failed check", async () => {
   fakeTape((request) => request.limit === 1
     ? [bond("65334HAE2", "NXY3816446", "NEXEN INC", "2026-10-16")]
@@ -205,13 +273,22 @@ test.each(["abort error", "caller signal", "resolved after cancellation"])("a ca
   expect(posted).toHaveLength(4);
 });
 
-test("a narrow tape keeps coupon and maturity, and the trade date outlasts the CUSIP and yield", async () => {
-  const ids = (width: number) => buildBondColumns(width).map((column) => column.id);
-  expect(ids(56)).toEqual(["issuer", "coupon", "maturity", "price"]);
-  expect(ids(72)).toEqual(["issuer", "coupon", "maturity", "price", "traded"]);
-  expect(ids(80)).toEqual(["issuer", "coupon", "maturity", "price", "yield", "traded"]);
-  expect(ids(95)).toEqual(["issuer", "cusip", "coupon", "maturity", "price", "yield", "traded"]);
+test("a narrow tape keeps price, yield and CUSIP ahead of what describes the bond, and one issuer's rows drop its name", async () => {
+  const ids = (width: number, sharedIssuer = false) => buildBondColumns(width, { sharedIssuer }).map((column) => column.id);
+  // A 45-column window: the sale and the CUSIP that tells two 7.875% 2034 issues apart, then the coupon.
+  expect(ids(43, true)).toEqual(["price", "yield", "cusip", "coupon"]);
+  expect(ids(56, true)).toEqual(["price", "yield", "cusip", "coupon", "maturity"]);
+  expect(ids(78, true)).toEqual(["price", "yield", "cusip", "coupon", "maturity", "change", "traded"]);
+  // Several issuers' rows keep the name that tells them apart, first.
+  expect(ids(56)).toEqual(["issuer", "price", "yield", "cusip"]);
   expect(ids(120)).toHaveLength(9);
+
+  const whirlpool = { issuerName: "WHIRLPOOL CORP", symbol: "WHR6415676" };
+  expect(sharesOneIssuer([whirlpool, { issuerName: "WHIRLPOOL CORP MEDIUM TERM NTS", symbol: "WHR.GM" }])).toBe(true);
+  expect(sharesOneIssuer([whirlpool, { issuerName: "WHIRLPOOL FINANCE", symbol: "WHRF4800338" }])).toBe(false);
+  // One row is the only thing naming its issuer; rows without symbols go by the name.
+  expect(sharesOneIssuer([whirlpool])).toBe(false);
+  expect(sharesOneIssuer([{ issuerName: "ACME", symbol: null }, { issuerName: "ACME ", symbol: null }])).toBe(true);
 
   fakeTape((request) => perpetual(request) ? [] : [
     bond("963320BG0", "WHR6415676", "WHIRLPOOL CORP", "2026-10-16"),
@@ -220,11 +297,57 @@ test("a narrow tape keeps coupon and maturity, and the trade date outlasts the C
   setCliWidthOverride(56);
   const { text } = await report("whirlpool");
   const lines = text.split("\n");
-  const header = lines.find((line) => line.includes("Issuer"))!;
-  for (const name of ["Coupon", "Maturity", "Price"]) expect(header).toContain(name);
-  // Two issues of one issuer stay apart by coupon and maturity, the CUSIP moved under each.
-  expect(lines.find((line) => line.includes("7.875"))).toContain("2034-07-01");
-  expect(lines.find((line) => line.includes("7.500"))).toContain("2031-07-01");
-  expect(text).toContain("CUSIP 963320BG0");
+  // One issuer's tape leaves its name out of the table, as the pane does.
+  const header = lines.find((line) => line.includes("CUSIP"))!;
+  for (const name of ["Price", "Yield"]) expect(header).toContain(name);
+  expect(text).not.toContain("WHIRLPOOL CORP");
+  // Two issues of one issuer stay apart by CUSIP, and the name's room goes to their coupon and maturity.
+  expect(lines.find((line) => line.includes("963320BG0"))).toMatch(/7\.875 +2034-07-01 +88\.055/);
+  expect(lines.find((line) => line.includes("963320BF2"))).toMatch(/7\.500 +2031-07-01/);
   expect(lines.filter((line) => visibleLength(line) > 56)).toEqual([]);
+
+  // A saved issuer sort, with the column left out, sorts as the default the header shows.
+  const issuerSort = { columnId: "issuer", direction: "asc" } as const;
+  expect(shownBondSort(issuerSort, true)).toEqual(DEFAULT_BOND_SORT);
+  expect(shownBondSort(issuerSort, false)).toBe(issuerSort);
+});
+
+test("a CUSIP reports its kept daily closes in the range, titled by since when they are kept; a refusal is a note beside the tape", async () => {
+  fakeTape(() => [bond("644393AC4", "NFE5833345", "NEW FORTRESS ENERGY INC", "2026-10-30")]);
+  const day = (date: string, price: number | null) => ({ date, prints: 1, price, yield: 25 });
+  const history = {
+    cusip: "644393AC4", issuerName: "NEW FORTRESS ENERGY INC", coupon: 8.75, maturity: "2029-03-15",
+    issuer: { symbol: "NFE", name: "New Fortress Energy Inc." }, from: "2023-10-28", to: "2026-11-01", trades: [], truncated: false,
+    keptSince: "2024-03-05", backfillPending: false,
+    // A day whose only sale had no price is not a close.
+    days: [day("2024-03-05", 97.25), day("2026-08-14", 61), day("2026-10-29", null), day("2026-10-30", 52.5)],
+  };
+  const asked: string[] = [];
+  const client = { getCloudStoredBond: async (cusip: string) => (asked.push(cusip), history) };
+  const { result, text } = await report("644393AC4", undefined, client);
+  expect(asked).toEqual(["644393AC4"]);
+  expect(result.sections?.[1]).toMatchObject({ title: "Daily closes, kept since 2024-03-05" });
+  // 3M by default: the closes since 2026-08-03, newest first.
+  expect(result.sections?.[1]?.rows?.map((row) => row.date)).toEqual(["2026-10-30", "2026-08-14"]);
+  expect(text).toContain("Kept since 2024-03-05.");
+  const all = await report("644393AC4", undefined, client, { range: "3Y" });
+  expect(all.result.sections?.[1]?.rows?.map((row) => row.date)).toEqual(["2026-10-30", "2026-08-14", "2024-03-05"]);
+  const pending = await report("644393AC4", undefined, { getCloudStoredBond: async () => ({ ...history, keptSince: "2026-11-02", backfillPending: true, days: [] }) });
+  expect(pending.text).toContain("Kept since 2026-11-02; earlier prints are still being read.");
+
+  const refused = await report("644393AC4", undefined, { getCloudStoredBond: async () => { throw new ApiRequestError("Pro only", 403); } });
+  expect(refused.result.sections).toHaveLength(1);
+  expect(refused.result.complete).toBe(true);
+  expect(refused.text).toContain("Kept price history needs Gloom Pro.");
+});
+
+test("a ticker's lookup keeps its company's bonds from now on, and a failure to do so never touches the report", async () => {
+  fakeTape(() => [bond("963320BG0", "WHR6415676", "WHIRLPOOL CORP", "2026-10-16")]);
+  const kept: string[] = [];
+  const { result } = await report("WHR", undefined, {
+    getCloudStoredIssuerBonds: async (symbol: string) => { kept.push(symbol); throw new ApiRequestError("down", 503); },
+  });
+  expect(kept).toEqual(["WHR"]);
+  expect(result.complete).toBe(true);
+  expect(result.notes ?? []).toEqual([]);
 });

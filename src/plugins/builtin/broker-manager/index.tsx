@@ -11,7 +11,7 @@ import {
   resetSignedInBrokerCatalog,
   subscribeSignedInBrokers,
 } from "../../../brokers/signed-in/catalog";
-import { DataTableStackView, EmptyState } from "../../../components";
+import { Button, DataTableStackView, EmptyState } from "../../../components";
 import { t } from "../../../i18n";
 import { useAppLanguage } from "../../../i18n/react";
 import {
@@ -37,12 +37,13 @@ import {
   type BrokerProfileRow,
 } from "./model";
 import { useBrokerManagerActions } from "./pane-actions";
-import { useSignInEnds } from "./sign-in-end";
+import { useSignInReads } from "./sign-in-end";
 import {
   buildBrokerColumns,
   renderBrokerCell,
   type BrokerColumn,
 } from "./table";
+import { logFailure } from "../../../utils/log-failure";
 
 export function BrokersPane({ focused, width, height }: PaneProps) {
   const language = useAppLanguage();
@@ -81,10 +82,10 @@ export function BrokersPane({ focused, width, height }: PaneProps) {
 
   // Signed-in profiles take their broker's name from the connector list.
   const signedInBrokers = useSyncExternalStore(subscribeSignedInBrokers, getSignedInBrokers, getSignedInBrokers);
-  const { ends: signInEnds, reload: reloadSignInEnds } = useSignInEnds(config.brokerInstances);
+  const { reads: signInReads, reload: reloadSignInReads } = useSignInReads(config.brokerInstances);
   const rows = useMemo(
-    () => buildBrokerProfileRows(config, adapters, brokerAccounts, signInEnds, getBrokerLogo, brokerSyncErrors),
-    [adapters, brokerAccounts, brokerSyncErrors, config, getBrokerLogo, language, signInEnds, signedInBrokers, statusVersion],
+    () => buildBrokerProfileRows(config, adapters, brokerAccounts, signInReads, getBrokerLogo, brokerSyncErrors),
+    [adapters, brokerAccounts, brokerSyncErrors, config, getBrokerLogo, language, signInReads, signedInBrokers, statusVersion],
   );
   const selectedIndex = Math.max(0, rows.findIndex((row) => row.id === selectedId));
   const selectedRow = rows[selectedIndex] ?? null;
@@ -114,8 +115,8 @@ export function BrokersPane({ focused, width, height }: PaneProps) {
   // After a connect or sync, which can renew a sign-in or find it ended.
   const refreshStatuses = useCallback(() => {
     setStatusVersion((version) => version + 1);
-    reloadSignInEnds();
-  }, [reloadSignInEnds]);
+    reloadSignInReads();
+  }, [reloadSignInReads]);
 
   const {
     busy,
@@ -275,7 +276,7 @@ export function BrokersPane({ focused, width, height }: PaneProps) {
   }, []);
 
   const saveCurrentEdit = useCallback(() => {
-    saveEdit().catch(() => {});
+    saveEdit().catch(logFailure("broker-manager", "Save broker profile edit failed"));
   }, [saveEdit]);
 
   // The detail insets one cell each side like the table cells.
@@ -340,10 +341,14 @@ export function BrokersPane({ focused, width, height }: PaneProps) {
           sortDirection="asc"
           getItemKey={(row) => row.id}
           renderCell={renderCell}
-          // The footer's a adds one.
+          // The same add the footer's a and the command bar start; as the state's first
+          // action it also answers Enter.
           emptyContent={(
             <Box width="100%" paddingX={1} paddingY={1}>
-              <EmptyState title={t("No broker profiles.")} />
+              <EmptyState
+                title={t("No broker profiles.")}
+                actions={<Button label="Add Broker Account" onPress={startAdd} />}
+              />
             </Box>
           )}
           emptyStateTitle={t("No broker profiles.")}
@@ -361,9 +366,10 @@ export const brokerManagerModule: PluginModule = {
       personalData: "account",
       icon: "B",
       component: BrokersPane,
-      reportFreshness: { status: "not-a-feed", basis: "broker connections" },
+      reportFreshness: { status: "not-a-feed", basis: "broker connections", local: true },
       defaultPosition: "right",
       defaultMode: "floating",
+      utilityWindow: true,
       defaultFloatingSize: { width: 92, height: 24 },
       portableShare: {
         private: { title: true, params: true, settings: true, state: true },

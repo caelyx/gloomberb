@@ -34,6 +34,12 @@ export interface HeadlessPaneArgumentDef {
   examples?: readonly string[];
 }
 
+/** A list the catalog prints under a function's options, such as the sector names a screen's criteria match. */
+export interface HeadlessPaneReference {
+  title: string;
+  items: readonly string[];
+}
+
 export interface HeadlessPaneOptionValue {
   value: string;
   aliases?: string[];
@@ -83,8 +89,12 @@ export interface HeadlessPaneOptionDef {
    * absent.
    */
   valueWords?: number;
+  /** The value is a comma list (`--metric trailingPE,dividendYieldPercent`), and the flag typed again adds to it. */
+  list?: boolean;
   /** The option in use as typed after the function, such as `--expiration 2028-01-21`; the catalog shows it as an example. */
   example?: string;
+  /** Other uses the catalog shows after `example`: a form of the value the first does not show. */
+  examples?: readonly string[];
   /** The example runs without the function's optional argument, as an option that works only then does (`fn INS --side sell`). */
   exampleWithoutArgument?: boolean;
   /**
@@ -119,6 +129,8 @@ export interface HeadlessPaneContext {
   capabilities?: CapabilityInvoker;
   /** The catalog's name for the series charted as an expression (`FRED:DFII10`); undefined for one it does not list. */
   catalogSeriesName?: (expression: string) => string | undefined;
+  /** The catalog series a bare word is an alias of (`hashrate` is CAP:bitcoin:hashrate); undefined for any other word. */
+  catalogSeriesNamed?: (word: string) => { expression: string; name: string } | undefined;
   /** Locally registered broker adapters. Reports may read account data; they never submit orders. */
   resolveBroker?: (brokerType: string) => import("./broker").BrokerAdapter | null;
   /** Read one local portfolio without passing holdings through a remote endpoint. */
@@ -138,13 +150,33 @@ export interface HeadlessPaneContext {
    * known. A code several companies list (BDI) throws asking which, with
    * `quote`'s message; `argumentWith(key)` is the function's argument naming
    * that listing instead (`BDI:TSX`), for the retry each listing offers.
+   * `coinNote` is what `quote` says of a bare coin ticker read as a listing
+   * that is not the coin (ETH, the Grayscale fund), for the report's warnings.
    */
-  resolveListing?: (symbol: string, argumentWith: (key: string) => string) => Promise<{ symbol: string; exchange?: string; name?: string } | null>;
+  resolveListing?: (symbol: string, argumentWith: (key: string) => string) => Promise<{ symbol: string; exchange?: string; name?: string; coinNote?: string;
+    /** What became of the company that had the symbol, as `quote` says it ("GOGL was Golden Ocean Group until 2025, now Cmb.Tech: CMBT"). */
+    successorNote?: string;
+    /** What the symbol was read as, as `quote` says it ("Read "NDX" as ^NDX:NIM (NASDAQ-100)."). */
+    readAs?: string;
+    /** The index or future a code a security owns is typed for, as `quote` names it ("also ^MOVE ICE BofA MOVE Index ..."). */
+    ownedNotes?: string[];
+    /**
+     * The symbol is no ticker, as `quote` reads it: the error its quote failed with ("Not a ticker: UNISWAP."), which
+     * its series fail with, without asking for their data. The rest of the result is the symbol as typed.
+     */
+    notATicker?: Error } | null>;
   /**
    * What a plugin keeps on this device only (its `ctx.resume` state, never
    * synced), such as ALRT's log of the alerts the app fired; null when none.
    */
   readDeviceState?: <T = unknown>(pluginId: string, key: string) => T | null;
+  /**
+   * A plugin's saved state as the app left it on this device (its
+   * `ctx.persistence.getState`), read only, with when it was saved: NOTE's
+   * copy of the Gloom Cloud notes it read last, for a report offline. Null
+   * when none, or when this build cannot read it.
+   */
+  readSavedState?: <T = unknown>(pluginId: string, key: string, schemaVersion?: number) => { value: T; savedAt: number } | null;
 }
 
 export type HeadlessPaneRow = Record<string, unknown>;
@@ -181,6 +213,13 @@ export interface HeadlessPaneColumn {
   stackRows?: number;
   /** The text table leaves the column out when fitted to fewer terminal columns than this; exports and piped output keep it. */
   minTableWidth?: number;
+  /**
+   * The narrow text table drops the column, rightmost first, before it moves any column under its rows: a figure
+   * the others imply (RETURN's interval $ beside its prices). Exports and a table that fits keep it.
+   */
+  optional?: boolean;
+  /** Among optional columns, a higher priority is dropped sooner. */
+  dropPriority?: number;
   description?: string;
   format?: (value: unknown, row: HeadlessPaneRow) => string;
   /** What the text report prints when it can say more than an export should (a unit word beside a number); CSV and NDJSON keep `format`. */
@@ -197,11 +236,22 @@ export interface HeadlessPaneColumn {
   /** With `unitKey`: always a `<header> unit` column, so the header is the same whichever rows loaded. */
   unitColumn?: boolean;
   /**
+   * CSV and NDJSON write the figure to the digits `format` draws (-315.12 for -315.12046875), as it is read on
+   * screen; JSON keeps the row's figure whole.
+   */
+  exportAsShown?: boolean;
+  /**
+   * A column the export gained after its others were set (RV's `Fwd P/E period`): CSV and NDJSON write it last,
+   * after the fixed columns and `retrieved_at`, so no column an earlier export had moves.
+   */
+  exportLast?: boolean;
+  /**
    * The text report prints the value on its own lines under the row instead
    * of in a column, for a footnote that belongs to that row; an empty value
-   * prints nothing. Exports keep it as a column.
+   * prints nothing. Exports keep it as a column. `"line"`: one line cut to
+   * the width, never wrapped (a story's summary under its headline).
    */
-  underRow?: boolean;
+  underRow?: boolean | "line";
 }
 
 export interface HeadlessPaneEntry {
@@ -216,6 +266,13 @@ export interface HeadlessPaneEntry {
    * rather than read back the number `formatted` draws.
    */
   unit?: string;
+  /**
+   * The unit an export names in `currency_or_unit` for a figure written as
+   * `formatted` draws it, where `value` is not in that unit and `unit` would
+   * rescale what JSON keeps: a ratio drawn as a percent (`pct`). Named only
+   * beside a number; a figure missing with its reason has no unit.
+   */
+  exportUnit?: string;
   /**
    * In a report with `exportDated`, where this line is not of the section's own period and release (a previous
    * reading, a year ago): the period it covers, when it was released and what it is as of. A null `released`
@@ -274,6 +331,13 @@ export interface HeadlessPaneFreshness {
   delayMinutes?: number;
   /** What not-a-feed data is, in a few words: "filed data", "monthly release", "your inputs". */
   basis?: string;
+  /**
+   * The pane shows nothing from a market or a feed: the user's own notes and
+   * rules, the app's connections, documentation, an account. A screenshot's
+   * footer then carries no status line, which would date nothing or call the
+   * app's own state "not a live feed". `fn` still cites `source` and `basis`.
+   */
+  local?: boolean;
   /**
    * How often the data is published, when its dates mark the start of a period
    * (a monthly statistic is dated the 1st). The report then names the month,
@@ -393,6 +457,24 @@ export interface HeadlessPaneFreshness {
    * `newest story` dates a news list `newest story Tue 29 Sep 2026 20:17 UTC`.
    */
   asOfLabel?: string;
+  /**
+   * The newest observation is a bar of this many minutes that opens at the
+   * as-of: the line names its span, `last bar 15:00–16:00 UTC`, so the bar's
+   * open is not read as how far the data runs.
+   */
+  barMinutes?: number;
+  /**
+   * Say when the rows were retrieved too, after the newest one's date: a list
+   * dated by its newest filing was not read then (`newest filing Tue 27 Oct
+   * 2026 · retrieved Wed 28 Oct 2026 19:07 UTC`).
+   */
+  retrievedToo?: boolean;
+  /**
+   * When the source last read the data, when that is not now: a page the
+   * server reads hourly is retrieved when it read it, not when the report
+   * asked the server. An ISO instant; ignored when in the future.
+   */
+  retrievedAt?: string;
   /** What the figures are, said after the status: `funding = current estimate, pays 08:00 UTC`. */
   note?: string;
   /**
@@ -424,6 +506,12 @@ interface HeadlessPaneResultBase {
   /** Failures: a source that did not answer, or a value that could not be computed. */
   errors?: string[];
   /**
+   * What a report with `complete: false` leaves out, in the few words its
+   * status line and `# incomplete` line name it by ("NGZ31 not resolved"),
+   * when neither a count asked for nor a symbol without data says it.
+   */
+  incompleteDetail?: string;
+  /**
    * Caveats about a report that did load: what it leaves out, what it assumes,
    * how a value was marked. One sentence each. They never make a report fail;
    * `complete: false` says when the report does not cover what was asked.
@@ -436,6 +524,12 @@ interface HeadlessPaneResultBase {
    */
   warnings?: string[];
   metadata?: Record<string, unknown>;
+  /**
+   * Options the load settled from what it was given rather than from a flag
+   * (AUCT's market, from a search naming Hong Kong's paper): the report's
+   * `options` show these, so they name what was used, not the default.
+   */
+  appliedOptions?: HeadlessPaneOptionValues;
   /** What this load knows about its data's source and age; overrides the definition's `freshness`. */
   freshness?: HeadlessPaneFreshness;
 }
@@ -465,6 +559,12 @@ export interface HeadlessRowsResult extends HeadlessPaneResultBase {
   /** What the report says when `rows` is empty, in place of "No data.": why there are none. */
   empty?: string;
   /**
+   * Sections the text report prints under the rows, drawn as a bundle's are:
+   * the figures a pane shows beside its table (a curve's spreads). JSON keeps
+   * them in `metadata`, and the exports leave them out.
+   */
+  textSections?: HeadlessBundleSection[];
+  /**
    * The row fields naming each row's own unit, symbol and observation date
    * (an ISO date or instant), for rows of several series dated apart: each
    * exported row names them in `currency_or_unit`, `symbol_or_series` and
@@ -477,6 +577,8 @@ export interface HeadlessRowsResult extends HeadlessPaneResultBase {
   rowAsOfKey?: string;
   /** The interval every row is at (`daily`), which each exported row names in `interval`. */
   interval?: string;
+  /** The currency or unit every row's figures are in (`GBP`, `index points`), which each exported row names in `currency_or_unit`. */
+  unit?: string;
   /**
    * Tables `--csv` and `--ndjson` write after the rows, each in its own
    * section, such as the dated history the rows sum up. The text report and
@@ -488,6 +590,13 @@ export interface HeadlessRowsResult extends HeadlessPaneResultBase {
 export type HeadlessBundleSection =
   | {
     title: string;
+    /**
+     * The heading the text report prints in place of `title`, when it can say
+     * more than an export's section name should (the scale its amounts are
+     * printed in, "Total revenue, USD millions"). JSON, CSV and NDJSON keep
+     * `title`, so a section read by its name stays where it was.
+     */
+    textTitle?: string;
     columns?: HeadlessPaneColumn[];
     rows: HeadlessPaneRow[];
     /** What the report says when `rows` is empty, in place of "No data.": why there are none, and what to run instead. */
@@ -525,6 +634,16 @@ export type HeadlessBundleSection =
     rowAsOfKey?: string;
     /** The bar interval the rows are of (`1d`), which every exported row names in `interval`. */
     interval?: string;
+    /** The row field naming each row's own interval (a contract's funding interval, `8h`), for rows that differ: each exported row names it in `interval`. */
+    rowIntervalKey?: string;
+    /**
+     * The row field naming who each row is cited to, for a table whose rows
+     * come from different publishers (each venue's contract): each exported
+     * row names it in `source`, in place of the closing lines' source that
+     * lists them all.
+     */
+    rowSourceKey?: string;
+    appendedColumns?: number;
     /** The symbol every row is of, where the report's own is not (a section per name): each exported row names it in `symbol_or_series`. */
     symbol?: string;
     /** When every row was observed (an ISO date or instant), where it is not the report's newest: each exported row names it in `as_of`. */
@@ -543,6 +662,7 @@ export type HeadlessBundleSection =
   | {
     title: string;
     entries: HeadlessPaneEntry[];
+    source?: string;
     /**
      * The lines the text report prints in place of `entries`, when the pane
      * says in one line what the exported records keep apart (a range as
@@ -560,13 +680,16 @@ export type HeadlessBundleSection =
     /** In a report with `exportDated`: the period the figures cover, and when they were released (an ISO date or instant), which each exported line names in `period` and `released`. */
     period?: string;
     released?: string;
+    textTitle?: never;
     columns?: never;
     rows?: never;
     textColumns?: never;
     textRows?: never;
-    unit?: never;
+    unit?: string;
     rowUnitKey?: never;
-    interval?: never;
+    interval?: string;
+    rowIntervalKey?: never;
+    rowSourceKey?: never;
     locked?: never;
   };
 
@@ -581,12 +704,21 @@ export interface HeadlessBundleResult extends HeadlessPaneResultBase {
 
 export interface HeadlessSeriesPoint extends HeadlessPaneRow {
   date: string | number | Date;
+  nativeAmount?: { value: number; currency: string };
   value?: number | null;
   open?: number | null;
   high?: number | null;
   low?: number | null;
   close?: number | null;
   volume?: number | null;
+  /** A continuous future's bar (CL=F): the contract it is of (CLZ26). */
+  contract?: string | null;
+  /** The contract differs from the point before's, the one before the window included: the series rolled on this point. */
+  roll?: boolean;
+  /** The point is a session still forming, not a close. */
+  partial?: boolean;
+  /** A formula of futures: each leg's contract and price on this point, in `formulaLegs` order. */
+  legs?: ReadonlyArray<{ contract: string | null; price: number }>;
 }
 
 export interface HeadlessSeries {
@@ -602,9 +734,36 @@ export interface HeadlessSeries {
   interval?: string;
   /** Decimal places the text report prints the latest value to (a correlation to 3); JSON and CSV keep every digit. */
   textDecimals?: number;
+  /** The text report prints the latest value as the tables print an amount (63.33B), for a company's reported total; JSON and CSV keep every digit. */
+  textCompact?: boolean;
   /** Each point's `value` is its bar's close: `--csv` and `--ndjson` write Close alone, JSON keeps both. */
   valueIsClose?: boolean;
+  /** The series' current value is not meaningful: the report prints N/M dated by the period, and why. */
+  notMeaningful?: { reason: string; asOf: string };
+  /**
+   * The day the latest value is from, `YYYY-MM-DD`, when its point's own date
+   * does not say: a month still forming is dated by its 1st, its value by the
+   * quote it ends on (^NDX's November bar by Mon 9 Nov's close).
+   */
+  latestDate?: string;
+  /** A formula of futures: its legs as charted (`RB=F`), which name the exported contract columns of its points' `legs`. */
+  formulaLegs?: readonly string[];
+  /**
+   * A daily count's trailing averages to its latest day, which the text report
+   * prints beside the latest value: a single day of transits says little.
+   */
+  trailing?: HeadlessSeriesTrailing;
   points: HeadlessSeriesPoint[];
+}
+
+/** Daily means over the 7 and 28 days to a series' latest day, and the same 28 days a year before. */
+export interface HeadlessSeriesTrailing {
+  avg7: number | null;
+  avg28: number | null;
+  /** The mean over the 28 days that ended one year before the latest day. */
+  yearAgoAvg28: number | null;
+  /** `avg28` against `yearAgoAvg28`, in percent. */
+  changeVsYearAgoPct: number | null;
 }
 
 export interface HeadlessSeriesResult extends HeadlessPaneResultBase {
@@ -615,6 +774,8 @@ export interface HeadlessSeriesResult extends HeadlessPaneResultBase {
 export interface HeadlessSnapshotResult extends HeadlessPaneResultBase {
   asOf: string | number | Date;
   items: HeadlessPaneRow[];
+  /** What the report says when `items` is empty, in place of "No data.": why there are none. */
+  empty?: string;
 }
 
 export interface HeadlessPaneResultByShape {
@@ -637,9 +798,19 @@ export interface HeadlessPaneDefinition<Shape extends HeadlessPaneShape = Headle
      * means and the commands that run them, and `catalog ivol` lists them first.
      */
     suggestFor?: string[];
+    /**
+     * Words that name one case of the function, each with the argument it
+     * takes for it: CTM opens the VIX futures curve for `VX` and `vix
+     * futures`. `fn VX` runs `CTM VIX` and says so, and `catalog vx` lists
+     * the function first. A case can also preset options (`fn PDUFA` is
+     * `fn CATL --type pdufa`); an option typed after the word wins over it.
+     */
+    opens?: ReadonlyArray<{ words: readonly string[]; argument: string; options?: Readonly<Record<string, string>> }>;
     intents?: string[];
     dataRequirements?: string[];
     limitations?: string[];
+    /** Names an option's values match, listed by the catalog under each title: EQS's sectors and industries. */
+    reference?: HeadlessPaneReference[];
     screenshotReadiness?: "ready" | "partial" | "live-dom" | "unsupported";
   };
   /**
@@ -648,6 +819,12 @@ export interface HeadlessPaneDefinition<Shape extends HeadlessPaneShape = Headle
    * says what opening the pane does and is used when this is absent.
    */
   description?: string;
+  /**
+   * False keeps the report out of Ask Gloom's tools: it reads text the user
+   * wrote for themselves (NOTE's quick notes), which reaches the assistant
+   * only when they paste it. `fn` and the exports still run it.
+   */
+  askGloom?: false;
   argument: HeadlessPaneArgumentDef;
   /**
    * The data covers US listings only, named as a sentence starts ("Time and
@@ -657,11 +834,33 @@ export interface HeadlessPaneDefinition<Shape extends HeadlessPaneShape = Headle
    */
   usListingsOnly?: string;
   /**
+   * The data covers US over-the-counter lines too (FINRA's short interest
+   * and weekly off-exchange volume, the SEC's fails to deliver, daily
+   * closes), so a listing abroad is offered its company's OTC line when it
+   * has no US exchange listing (Tencent's TCEHY for 0700.HK). Without it
+   * only exchange listings are offered, as options, trades and FINRA's
+   * daily short volume cover no OTC line.
+   */
+  usListingsOtc?: boolean;
+  /**
    * A sentence that answer adds for a listing abroad, after its US listing:
    * where to read the nearest data the function has for it (time and sales
    * points at GIP's 1-minute bars). `key` is the listing as read, RMS:ASX.
    */
   usListingsOnlyHint?(key: string): string;
+  /**
+   * The ticker argument also takes a FRED series as the catalog writes it
+   * (`FRED:T10Y2Y`), which reaches `load` as typed instead of being read as a
+   * listing: MDAY reads a spread's moves on release days.
+   */
+  fredSeriesArgument?: boolean;
+  /**
+   * The ticker argument takes a currency pair as its listing (EURUSD=X): a
+   * currency typed after a word the catalog matches to this function
+   * (`hp eur`) is suggested as its pair. Functions without it keep the word
+   * as typed.
+   */
+  currencyPairs?: boolean;
   /**
    * A typed symbol the function reads as another before it is resolved, with
    * the note that says so: OPX and OVDV read a bare BTC or ETH as the coin
@@ -672,9 +871,11 @@ export interface HeadlessPaneDefinition<Shape extends HeadlessPaneShape = Headle
   /**
    * A listing the function has no data for, answered before any request with
    * what exists instead: OPX and OVDV answer a coin nothing lists options on
-   * (SOL-USD) with BTC and ETH options. `key` is the listing as read.
+   * (SOL-USD) with BTC and ETH options, and OVDV, VCA and HIVG an FX pair with
+   * the currency funds' options. `key` is the listing as read; `details` is
+   * the line after `message`, left out when the message says it all.
    */
-  refuseSymbol?(key: string): { message: string; details: string } | null;
+  refuseSymbol?(key: string): { message: string; details?: string } | null;
   /**
    * `fn` exits 1 when the report has no name with data: no rows, or every row
    * is one of `unavailableSymbols`. A list that gives data for some names

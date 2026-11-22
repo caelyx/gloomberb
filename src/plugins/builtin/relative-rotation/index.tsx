@@ -2,7 +2,7 @@ import { isOnPortfolio } from "../../../shares/pane-image";
 import type { PluginModule } from "../plugin-module";
 import { rotationCache } from "./client";
 import { rotationHeadless } from "./headless";
-import { RelativeRotationPane } from "./pane";
+import { DEFAULT_ROTATION_BENCHMARK } from "./model";
 
 export const relativeRotationModule: PluginModule = {
   panes: [
@@ -10,7 +10,7 @@ export const relativeRotationModule: PluginModule = {
       id: "relative-rotation",
       name: "Relative Rotation",
       icon: "R",
-      component: RelativeRotationPane,
+      get component(): typeof import("./pane").RelativeRotationPane { const { RelativeRotationPane } = require("./pane"); return RelativeRotationPane; },
       defaultPosition: "right",
       defaultMode: "floating",
       defaultFloatingSize: { width: 100, height: 36 },
@@ -41,7 +41,7 @@ export const relativeRotationModule: PluginModule = {
             key: "benchmark",
             label: "Benchmark",
             type: "text",
-            placeholder: "SPY:NYSEARCA",
+            placeholder: DEFAULT_ROTATION_BENCHMARK,
           },
           {
             key: "trail",

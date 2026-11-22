@@ -15,16 +15,27 @@ concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GLOOMBERB_NO_TELEMETRY: "1"
+  DO_NOT_TRACK: "1"
+
 jobs:
   typecheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: ./.github/actions/setup-bun
+        with:
+          desktop: "true"
 
       - name: Typecheck production runtimes and built-in plugin tests
         run: bun run typecheck
+
+      # Fails on a promise in src/ that nothing awaits or handles, and on a
+      # stale entry in src/architecture/floating-promise-allowlist.json.
+      - name: Check for new floating promises
+        run: bun run check:floating-promises
 
       # Fails on unused files, exports and dependencies. See knip.jsonc for
       # what it deliberately skips.
@@ -44,9 +55,11 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: ./.github/actions/setup-bun
+        with:
+          desktop: "true"
 
       - name: Test
         run: bun test
@@ -61,6 +74,10 @@ jobs:
       - name: Dry-run Cloudflare Worker
         run: bunx wrangler deploy --dry-run --env production
 
+      # build.ts also runs the x64 binaries on an emulated CPU without AVX2.
+      - name: Install QEMU's user-mode emulator
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user
+
       # The musl one is smoke tested in an Alpine container.
       - name: Build core binaries
         run: bun run scripts/build.ts --target linux-x64 --target linux-x64-musl
@@ -68,39 +85,78 @@ jobs:
       - name: Test global upgrade from 0.5.0
         run: bun run test:global-upgrade
 
-  # Fails when a plugin the registry lists, at the ref it would install,
-  # imports a host export this change does not have. Not a deploy gate: it
-  # reads other repositories, and a plugin's own breakage only warns.
+  # Fails when a plugin the registry lists, at the commit the registry
+  # reviewed or the ref it would install, imports a host export this change
+  # does not have. Not a deploy gate: it reads other repositories, and a
+  # plugin's own breakage only warns.
+  #
+  # This job and the next run code from other repositories. They leave no
+  # token on disk. They restore no Actions cache either, but code in them
+  # could still write one, through the runner's token: what matters is that
+  # no job that signs, publishes or deploys restores any (setup-bun's cache
+  # is off unless a job asks).
   registry-plugins:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-bun
 
       - name: Compile registry plugins against this host
         run: bun run plugins:registry:check
 
+  # Loads every plugin the registry lists in the terminal as it ships: the
+  # compiled binary and the desktop's bundled terminal entry. Compiling
+  # against sources does not reach what a packaged host serves to a plugin
+  # (v0.19.3 to v0.19.5 shipped a binary whose React had no named exports, and
+  # every plugin failed to load). A host that does not serve what a plugin
+  # imports fails the job; the registry or a plugin's own breakage only warns.
+  # Not a deploy gate, for the same reason as the job above.
+  registry-plugins-packaged:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-bun
+
+      # build.ts also runs the x64 binary on an emulated CPU without AVX2.
+      - name: Install QEMU's user-mode emulator
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user
+
+      - name: Build the terminal binary
+        run: bun run scripts/build.ts --target linux-x64
+
+      - name: Load registry plugins in the packaged terminal
+        run: bun run plugins:registry:packaged --terminal dist/gloomberb-linux-x64.gz --desktop-tui
+
   deploy-web:
+    environment: web-production
     name: Deploy terminal to Cloudflare
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs:
       - typecheck
       - build-and-test
     runs-on: ubuntu-latest
-    env:
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
+      # Restores no Actions cache while it holds the deploy token.
       - uses: ./.github/actions/setup-bun
 
       - name: Build browser app
         run: bun run web:build
 
       - name: Deploy terminal Worker
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: bunx wrangler deploy --env production --message "$GITHUB_SHA"
 
       - name: Verify production
@@ -110,7 +166,7 @@ jobs:
           for attempt in {1..12}; do
             if curl --fail --silent --show-error --max-time 15 https://term.gloom.sh/health >/dev/null \
               && curl --fail --silent --show-error --max-time 15 "https://term.gloom.sh/l/00000000000000000000000000000000?ref=$GITHUB_SHA" \
-                | grep --fixed-strings --quiet '/assets/share/main.js'; then
+                | grep --fixed-strings --quiet '/assets/share/main-'; then
               exit 0
             fi
             sleep 5

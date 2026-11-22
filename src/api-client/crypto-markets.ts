@@ -6,12 +6,14 @@ interface CryptoDailyCloses {
 
 export type CryptoAssetKind = "coin" | "stablecoin";
 
-/** What a stablecoin holds to: a currency, or a dollar value that accrues yield. */
+/** What a stablecoin holds to: a currency, a dollar value that accrues yield, or a dollar at a bond's maturity. */
 export interface CryptoPeg {
   /** The currency it is pegged to: USD, EUR. */
   currency: string;
-  /** Yield accrues into the price (USDY): it has no par to be off. */
+  /** Its price is not held at par: yield accrues into it (USDY), or it is a bond token priced toward par at maturity (BUSD0). It has no par to be off. */
   accrues: boolean;
+  /** What a coin that accrues is: `yield` (USDY) or `bond` (BUSD0), `par` for the rest; absent from servers before it was served, where an accruing coin is a yield one. */
+  kind?: "par" | "yield" | "bond";
   /** The target in dollars: 1 for USD, the EUR/USD rate for EUR; null when it accrues or the rate is unavailable. */
   price: number | null;
   /** When a target that moves (an exchange rate) was quoted; null for USD. */
@@ -26,6 +28,16 @@ interface CryptoDayRange {
   highAt: string;
   start: string;
   end: string;
+  /**
+   * The spot exchanges whose own 24-hour low reached `low`; one of several checked makes the low that exchange's,
+   * not the market's. Absent from a server that does not check, or when no exchange could be read.
+   */
+  lowVenues?: string[];
+  highVenues?: string[];
+  /** The exchanges whose own 24-hour range was read beside the composite's. */
+  venuesChecked?: string[];
+  /** The exchanges' own candles around the extremes are still being read: a later answer names them. */
+  venuesPending?: boolean;
 }
 
 export interface CryptoMarketAsset {
@@ -71,6 +83,8 @@ export interface CryptoMarketsPayload {
   generatedAt: string;
   /** Each asset's change is since 00:00 UTC; a server before it sent the screener's 24-hour move. */
   dayChangeBasis?: "utc-day";
+  /** Each asset's market cap is its price times its circulating supply; a server before it sent the source's own figure. */
+  marketCapBasis?: "circulating";
   asOf: string | null;
   status: "available" | "partial" | "unavailable";
   source: {
@@ -167,6 +181,18 @@ export interface DefiTvlProtocol {
   change7dPercent: number | null;
   change30d: number | null;
   change30dPercent: number | null;
+  /**
+   * USD its users paid in fees over the last 24 hours, 7 and 30 days, its
+   * versions together, read with its TVL; null where the source has no
+   * figure. Absent from servers before them.
+   */
+  fees24h?: number | null;
+  fees7d?: number | null;
+  fees30d?: number | null;
+  /** The part of those fees the protocol kept (the source's revenue), USD. */
+  revenue24h?: number | null;
+  revenue7d?: number | null;
+  revenue30d?: number | null;
 }
 
 export interface DefiTvlChain {
@@ -197,9 +223,51 @@ export interface DefiTvlPayload {
   protocols: DefiTvlProtocol[];
   /** When the protocols' figures were read: the source's latest, not a daily close. */
   protocolsAsOf: string | null;
+  /** When the protocols' fees and revenue were read; null when they could not be, absent from servers before them. */
+  incomeAsOf?: string | null;
   /** The largest chains by TVL, largest first. */
   chains: DefiTvlChain[];
   /** Total DeFi TVL in USD per UTC day since `start`, its first day with value locked. */
   history: { start: string; total: Array<number | null> } | null;
+  warnings: string[];
+}
+
+/** One value per UTC day, oldest first. */
+export interface BitcoinNetworkDailyValue {
+  date: string;
+  value: number;
+}
+
+/**
+ * `GET /cloud/crypto/bitcoin/network`: the bitcoin network's daily hash rate,
+ * the difficulty at each retarget, the next retarget's estimate and hashprice,
+ * derived from the block rewards, the BTC price and the difficulty.
+ */
+export interface BitcoinNetworkPayload {
+  version: 1;
+  generatedAt: string;
+  status: "available" | "stale" | "unavailable";
+  /** Who serves the figures, as a chart cites them: Gloom Cloud. */
+  source: { name: string; url: string };
+  /** When the hash rate and rewards were last read. */
+  historyFetchedAt: string | null;
+  /** Exahashes per second, each UTC day's average; the newest day is the day so far. */
+  hashrate: BitcoinNetworkDailyValue[];
+  /** The difficulty each retarget set, dated by its block. */
+  difficulty: Array<{ date: string; height: number; difficulty: number; changePercent: number | null }>;
+  /** USD per PH/s per day, derived. */
+  hashprice: BitcoinNetworkDailyValue[];
+  /** The estimate of the next retarget, as last read. */
+  retarget: {
+    changePercent: number;
+    estimatedAt: string;
+    nextHeight: number;
+    remainingBlocks: number;
+    progressPercent: number;
+    previousChangePercent: number | null;
+    readAt: string;
+  } | null;
+  /** The estimated change in percent, the last read of each UTC day. */
+  retargetHistory: BitcoinNetworkDailyValue[];
   warnings: string[];
 }

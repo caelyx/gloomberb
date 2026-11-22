@@ -4,14 +4,17 @@ import { fixedIncomeShortcut } from "../fixed-income/shortcut";
 import {
   attachTreasuryAuctionsPersistence,
   resetTreasuryAuctionsPersistence,
+  TREASURY_DIRECT_CONNECTION_ID,
   TREASURY_FISCAL_DATA_CONNECTION_ID,
 } from "./cache";
-import { AUCTION_HISTORY_WINDOWS, auctionHistoryLabel } from "./model";
+import { AUCTION_HISTORY_WINDOWS, auctionCommandRequest, auctionHistoryLabel } from "./model";
+import { AUCTION_HISTORY_DAYS } from "./client";
 import { createPublicPaneShare } from "../shared/public-pane";
 import { treasuryAuctionsHeadless } from "./headless";
+import { attachHkTendersPersistence, resetHkTendersPersistence } from "./hk";
 
 
-let disposeConnection: (() => void) | null = null;
+let disposeConnections: Array<() => void> = [];
 
 export function treasuryAuctionsSettings(): PaneSettingsDef {
   return {
@@ -23,6 +26,7 @@ export function treasuryAuctionsSettings(): PaneSettingsDef {
         description: "How far back auction results are requested.",
         type: "select",
         options: AUCTION_HISTORY_WINDOWS.map((days) => ({ value: String(days), label: auctionHistoryLabel(days) })),
+        defaultValue: String(AUCTION_HISTORY_DAYS),
       },
     ],
   };
@@ -31,20 +35,32 @@ export function treasuryAuctionsSettings(): PaneSettingsDef {
 export const treasuryAuctionsModule: PluginModule = {
   setup(ctx) {
     attachTreasuryAuctionsPersistence(ctx.persistence, ctx.connectionHealth);
-    disposeConnection = ctx.connectionHealth.registerSource({
-      id: TREASURY_FISCAL_DATA_CONNECTION_ID,
-      name: "Treasury Fiscal Data",
-      kind: "api",
-      ownerId: "credit",
-      priority: 300,
-      detail: "fiscaldata.treasury.gov",
-    });
+    attachHkTendersPersistence(ctx.persistence);
+    disposeConnections = [
+      ctx.connectionHealth.registerSource({
+        id: TREASURY_FISCAL_DATA_CONNECTION_ID,
+        name: "Treasury Fiscal Data",
+        kind: "api",
+        ownerId: "credit",
+        priority: 300,
+        detail: "fiscaldata.treasury.gov",
+      }),
+      ctx.connectionHealth.registerSource({
+        id: TREASURY_DIRECT_CONNECTION_ID,
+        name: "TreasuryDirect",
+        kind: "api",
+        ownerId: "credit",
+        priority: 301,
+        detail: "treasurydirect.gov",
+      }),
+    ];
   },
 
   dispose() {
-    disposeConnection?.();
-    disposeConnection = null;
+    for (const dispose of disposeConnections) dispose();
+    disposeConnections = [];
     resetTreasuryAuctionsPersistence();
+    resetHkTendersPersistence();
   },
 
   paneTemplates: [
@@ -54,7 +70,7 @@ export const treasuryAuctionsModule: PluginModule = {
         paneId: "treasury-auctions",
         label: "Treasury Auctions",
         description:
-          "Bill, note, bond, and TIPS auction results from Treasury Fiscal Data: rate, stop-out versus average, bid-to-cover, indirect, direct and dealer takedown, and size. Search by benchmark (10Y) or CUSIP.",
+          "Bill, note, bond and TIPS auction results since 1979, from Treasury Fiscal Data and TreasuryDirect: rate, stop-out versus median, bid-to-cover, bidder takedown and size; an after view ranks each auction against its tenor and shows the yield's moves after it. Search by benchmark (10Y) or CUSIP. Hong Kong's EF Bills, EF Notes and Government Bond tenders too.",
         keywords: [
           "treasury",
           "auction",
@@ -69,17 +85,38 @@ export const treasuryAuctionsModule: PluginModule = {
           "indirect",
           "takedown",
           "tail",
+          "when issued",
+          "when-issued",
+          "wi",
           "stop-out",
           "stop out",
+          "treasury auction",
+          "bond auction",
+          "note auction",
+          "bill auction",
+          "auction results",
+          "10 year auction",
+          "30 year auction",
+          "percentile",
           "cusip",
           "reopening",
           "issuance",
+          "hong kong",
+          "hk",
+          "hkma",
+          "exchange fund bills",
+          "exchange fund notes",
+          "efb",
+          "hkgb",
+          "hk government bonds",
+          "tender",
+          "tender results",
         ],
         shortcut: { prefix: "AUCT", argKind: "text", argOptional: true, argPlaceholder: "search" },
         headless: treasuryAuctionsHeadless,
         createInstance: (_context, options) => {
-          const search = options?.arg?.trim();
-          return { placement: "floating", ...(search ? { params: { search } } : {}) };
+          const { params, settings } = auctionCommandRequest(options?.arg);
+          return { placement: "floating", params, ...(settings ? { settings } : {}) };
         },
         publicShare: createPublicPaneShare("Treasury Auctions"),
       }, "treasury", "auctions"),

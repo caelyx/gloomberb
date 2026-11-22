@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type {
   EstimateObservation,
   EstimatePeriod,
@@ -7,10 +8,10 @@ import type { DataTableColumn } from "../../../components";
 import { dateOptionError, readCalendarDate } from "../../../utils/calendar-date";
 export const estimateNumber = (value: number | null | undefined) =>
   value == null
-    ? "--"
+    ? MISSING_VALUE
     : value.toLocaleString("en-US", { maximumFractionDigits: 4 });
 export const estimatePercent = (value: number | null | undefined) =>
-  value == null ? "--" : `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
+  value == null ? MISSING_VALUE : `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
 export const estimateCurrent = (period: EstimatePeriod) =>
   period.current ?? period.recorded.at(-1) ?? null;
 export const periodLabel = (period: EstimatePeriod) =>
@@ -49,7 +50,7 @@ export const PERIOD_COLUMNS: DataTableColumn[] = [
   { id: "percentile", label: "PCTL 1Y", width: 9, align: "right" },
   { id: "change", label: "CHANGE %", width: 11, align: "right" },
   { id: "breadth", label: "UP/DN 30D", width: 12, align: "right" },
-  { id: "range", label: "HI-LO", width: 11, align: "right" },
+  { id: "range", label: "HI-LO", width: 11, align: "right", omitWhenEmpty: true },
   { id: "asOf", label: "AS OF", width: 12, align: "left", flexGrow: 1 },
 ];
 export function sortPeriods(

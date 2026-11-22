@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useCallback, useEffect, useMemo, useRef, type ReactNode } from "react";
 import {
   DataTableStackView,
@@ -23,6 +24,7 @@ import {
 } from "../../../components";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import {
+  useAssetData,
   useDebouncedPluginPaneState,
   usePaneSettingValue,
   usePaneTitle,
@@ -34,6 +36,7 @@ import type { PaneProps } from "../../../types/plugin";
 import { Box, type ScrollBoxRenderable } from "../../../ui";
 import { isPlainArrowUp, stopSearchFocusNavigation } from "../../../utils/search-focus-navigation";
 import { toneColor, withoutQuietColumns } from "../shared/research-cells";
+import { looksLikeTicker, useTickerCompanySearch } from "../shared/ticker-company";
 import { OpenFdaClient, parseOpenFdaDate } from "./client";
 import {
   activeFilters,
@@ -41,6 +44,7 @@ import {
   FILTER_DEFAULT,
   recordColumns,
   recordTone,
+  termsCellText,
   type ColumnId,
   type FilterKey,
   type FilterState,
@@ -69,11 +73,21 @@ const EMPTY_FILTERS: FilterState = {};
 const MAX_FILL_PAGES = 4;
 
 /** Products FDA's product data does not cover (most vaccines) have no labeler on any row. */
-const QUIET_COLUMNS = { labeler: ["-"] } as const;
+const QUIET_COLUMNS = { labeler: [MISSING_VALUE] } as const;
 
-const formatDate = (date: Date | null): string => (date ? date.toISOString().slice(0, 10) : "-");
+const formatDate = (date: Date | null): string => (date ? date.toISOString().slice(0, 10) : MISSING_VALUE);
 
 const capitalize = (text: string): string => text.charAt(0).toUpperCase() + text.slice(1);
+
+/** A search written as a ticker is, in capitals (`AZN`, `BRK.B`); `cat` or `azn` is a word to search for. */
+const writtenAsTicker = (term: string): boolean => looksLikeTicker(term) && term === term.toUpperCase();
+
+/** What a search that matched nothing points to, by what each dataset is searched on. */
+const EMPTY_SEARCH_HINTS: Record<OpenFdaDataset, string> = {
+  drug: "Try the drug's brand or generic name…",
+  device: "Try the device or manufacturer name…",
+  recall: "Try the firm or product name…",
+};
 
 /** A generic's record lists every labeler; the cell counts them instead of naming one. */
 function labelerText(record: DrugReport): string | null {
@@ -82,7 +96,7 @@ function labelerText(record: DrugReport): string | null {
 }
 
 function cellFor(record: OpenFdaRecord, column: ColumnId, colors: ThemeColors): DataTableCell {
-  const missing: DataTableCell = { text: "-", color: colors.textMuted };
+  const missing: DataTableCell = { text: MISSING_VALUE, color: colors.textMuted };
   const toned = (text: string | null): DataTableCell => (text
     ? { text, color: toneColor(recordTone(column, text), colors) }
     : missing);
@@ -95,13 +109,19 @@ function cellFor(record: OpenFdaRecord, column: ColumnId, colors: ThemeColors): 
         return text ? { text, color: record.manufacturer ? colors.text : colors.textMuted } : missing;
       }
       if (column === "role") return toned(record.role ? capitalize(record.role) : null);
-      if (column === "reactions") return record.reactions.length > 0 ? { text: record.reactions.join(", "), color: colors.text } : missing;
+      // The row names the first few; its export, like the record, keeps every one.
+      if (column === "reactions") {
+        return record.reactions.length > 0 ? { text: termsCellText(record.reactions), value: record.reactions.join(", "), color: colors.text } : missing;
+      }
       if (column === "outcome") return toned(record.outcome);
       break;
     case "device":
       if (column === "product") return { text: record.product, color: colors.textBright };
       if (column === "manufacturer") return record.manufacturer ? { text: record.manufacturer, color: colors.text } : missing;
-      if (column === "problems") return record.productProblems.length > 0 ? { text: record.productProblems.join(", "), color: colors.text } : missing;
+      if (column === "problems") {
+        return record.productProblems.length > 0
+          ? { text: termsCellText(record.productProblems), value: record.productProblems.join(", "), color: colors.text } : missing;
+      }
       if (column === "event") return toned(record.eventType);
       break;
     case "recall":
@@ -201,6 +221,7 @@ const isDataset = (value: unknown): value is OpenFdaDataset => DATASETS.some((en
 
 export function OpenFdaPane({ width, height, focused }: PaneProps) {
   const client = useMemo(() => new OpenFdaClient(), []);
+  const dataProvider = useAssetData();
   const [storedQuery] = usePaneSettingValue("query", "");
   const initialQuery = String(storedQuery ?? "").trim();
   const [query, setQuery] = usePluginPaneState("query", initialQuery);
@@ -278,9 +299,25 @@ export function OpenFdaPane({ width, height, focused }: PaneProps) {
     setOpenItemId(null);
   }, [setFilterState, setOpenItemId, setSelectedId]);
 
-  const loading = records.loading && rows.length === 0;
-  const error = records.error?.message ?? null;
-  usePaneRefreshKey(records.reload, { focused, enabled: !searchFocused && !openItemId });
+  // `FDA AZN`: FDA records name the firm and its products, never a symbol, so a
+  // ticker that finds nothing is searched as its company's name (AstraZeneca),
+  // as TRIAL reads one, and the search box then shows it. Only a term written in
+  // capitals, as a ticker is (the search box or `fn FDA AZN`): a word such as
+  // "cat" stays the search it is. Each term is looked up once.
+  const companySearch = useTickerCompanySearch(dataProvider, term, {
+    eligible: records.status === "loaded" && rows.length === 0 && !records.error && writtenAsTicker(term),
+    key: term,
+    onCompany: updateQuery,
+  });
+  const retryCompanySearch = companySearch.retry;
+
+  const loading = (records.loading && rows.length === 0) || companySearch.resolving;
+  const error = records.error?.message ?? companySearch.error;
+  const reload = useCallback(() => {
+    retryCompanySearch();
+    records.reload();
+  }, [records, retryCompanySearch]);
+  usePaneRefreshKey(reload, { focused, enabled: !searchFocused && !openItemId });
 
   const linkRecord = openRecord ?? selected;
   const info = useMemo<PaneFooterSegment[]>(() => [
@@ -420,7 +457,7 @@ export function OpenFdaPane({ width, height, focused }: PaneProps) {
       resetScrollKey={`${dataset}:${term}:${filtersKey}`}
       selectedTextOverridesCellColor
       emptyStateTitle={term ? `No ${datasetLabel.toLowerCase()} match ${term}.` : `No ${datasetLabel.toLowerCase()}.`}
-      emptyStateHint="Press / to search…"
+      emptyStateHint={term ? EMPTY_SEARCH_HINTS[dataset] : "Press / to search…"}
     />
   );
 }

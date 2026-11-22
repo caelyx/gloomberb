@@ -21,7 +21,9 @@ import {
 import { t } from "../../../../i18n";
 import { isQuoteStaleForCurrentSession } from "../../../../market-data/quotes/freshness";
 import { delistingLabel, delistingStateLabel } from "../../../../market-data/quotes/delisting";
-import { formatQuoteNavAsOf } from "../../../../market-data/quotes/time";
+import { formatQuoteNavAsOf, formatQuoteSessionAsOf } from "../../../../market-data/quotes/time";
+import { ClippedText } from "../../../../components/ui/display";
+import { useSelectionFill } from "../../../../components/ui/selection-fill";
 import { useQuoteFlashDirection } from "../../../../components/quote-flash";
 import { followLiveSparklinePrice } from "../../../../components/price-sparkline/model";
 import {
@@ -43,7 +45,10 @@ const DESKTOP_DETAIL_CHAR_PX = 12 * 0.6;
 /**
  * The extended print's line, "After-Hours $336.08 -0.17%": the full label
  * where the room allows, else "AH", "PM" or "ON" as the heat map marks them,
- * and at the narrowest the mark and the move without the price.
+ * and no line where even that does not fit. Its move is never set without its
+ * price: "AH +2.77%" beside the day's +2.33% read as a second day's move
+ * (^N225 on a 70-column board, 9 Nov 2026), which a wide card's
+ * "After-Hours 60,404.00 +2.77%" did not.
  */
 function extendedLineParts(
   extended: ExtendedSessionDisplay,
@@ -55,12 +60,29 @@ function extendedLineParts(
   const candidates = [
     { label: extendedSessionLineLabel(extended, t), figures: `${priceText} ${percent}` },
     { label: mark, figures: `${priceText} ${percent}` },
-    { label: mark, figures: percent },
   ];
   return candidates.find(({ label, figures }) => fits(`${label} ${figures}`)) ?? null;
 }
 
 const DESKTOP_DETAIL_TEXT_STYLE = { fontSize: "var(--gloom-type-ui)", lineHeight: "14px", whiteSpace: "nowrap" };
+
+/** A desktop card row: its line's height at least, more only as its line needs. */
+const CARD_LINE_ROW = "minmax(min-content, auto)";
+
+/** The desktop card's muted lines: the name under its symbol, and what the price is as of. */
+/** A line set over the sparkline, backed in the card's colour (the theme's, as drawn) so the line does not run through it. */
+function backedLineStyle() {
+  return { alignSelf: "start", maxWidth: "100%", backgroundColor: colors.bg, boxShadow: `0 0 0 2px ${colors.bg}`, paddingRight: 2 };
+}
+
+const DESKTOP_META_LINE_STYLE = {
+  fontSize: "var(--gloom-type-ui)",
+  lineHeight: "14px",
+  maxWidth: "100%",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+};
 
 function ExtendedSessionLine({
   parts,
@@ -123,9 +145,12 @@ export function QuoteMonitorCard({
   onSelect,
   onOpen,
   perpetuals,
+  label = symbol,
 }: {
   perpetuals?: ReactNode;
   symbol: string;
+  /** What the card is headed with, when not the symbol as saved: one form across the board (8058:JPX). */
+  label?: string;
   ticker: TickerRecord | null;
   cachedFinancials: TickerFinancials | null;
   quoteEntry: QueryEntry<Quote> | null;
@@ -142,6 +167,7 @@ export function QuoteMonitorCard({
   onOpen: (symbol: string) => void;
 }) {
   const { nativePaneChrome, cellWidthPx = 8 } = useUiCapabilities();
+  const selectionFill = useSelectionFill();
   const quote = resolveEntryData(quoteEntry) ?? cachedFinancials?.quote;
   const queriedPriceHistory = resolveEntryData(chartEntry);
   const barHistory = queriedPriceHistory && queriedPriceHistory.length >= 2
@@ -170,6 +196,10 @@ export function QuoteMonitorCard({
   const quoteStatus = resolveQuoteStatus(quoteEntry, symbol, quote);
   const quoteFailed = quoteStatus.failed && !!display;
   const navAsOf = formatQuoteNavAsOf(quote);
+  // Each card says what its own price is as of (`CLOSED · 08:09 UTC` beside `15 min delayed · 21:20 UTC`);
+  // a fund says its NAV's date instead.
+  const sessionAsOf = quoteStatus.ended ? null : formatQuoteSessionAsOf(quote);
+  const desktopAsOf = nativePaneChrome ? navAsOf ?? sessionAsOf : null;
   const changeColor = quoteFailed ? colors.textDim : priceColor(display?.change ?? 0);
   const flashing = !!flashDirection && !headlineHolds;
   const currency = quote?.currency || ticker?.metadata.currency || "USD";
@@ -188,7 +218,7 @@ export function QuoteMonitorCard({
   // stacked card); the desktop gives it a row of its own under the name.
   const extendedRoom = nativePaneChrome
     ? (width * cellWidthPx - 24) / DESKTOP_DETAIL_CHAR_PX
-    : stacked ? width - 3 - displayWidth(symbol) : width - 3 - priceColumnWidth;
+    : stacked ? width - 3 - displayWidth(label) : width - 3 - priceColumnWidth;
   const extendedParts = display && extended
     ? extendedLineParts(extended, formatMarketPriceWithCurrency(extended.price, currency, priceOptions), (text) => displayWidth(text) <= extendedRoom)
     : null;
@@ -206,8 +236,12 @@ export function QuoteMonitorCard({
   const trend = quoteTrend(display?.change);
   const terminalSparklineHeight = !nativePaneChrome && !stacked && height >= 4 ? 2 : 1;
   const statusRows = (quoteFailed && !compactQuoteFailure ? 1 : 0) + (navAsOf && !compactNavAsOf ? 1 : 0);
+  const headerRows = stacked ? 3 : 2;
   const showTerminalSparkline = (!quoteFailed && !navAsOf)
-    || height >= (stacked ? 3 : 2) + statusRows + terminalSparklineHeight;
+    || height >= headerRows + statusRows + terminalSparklineHeight;
+  // The terminal gives the as-of line a row only where the card has one to spare: the sparkline keeps its rows.
+  const showTerminalSessionAsOf = !!sessionAsOf
+    && height >= headerRows + statusRows + (perpetuals ? 1 : 0) + (showTerminalSparkline ? terminalSparklineHeight : 0) + 1;
   // Figures sit over the sparkline, so the desktop rings them in the card colour.
   const figureHalo = { textShadow: `0 1px 2px ${colors.bg}` };
   // The card's title: a heading over the app's 12px name, under the 20px price.
@@ -222,9 +256,10 @@ export function QuoteMonitorCard({
     onSelect,
     onActivate: onOpen,
   });
-  // The terminal marks the cursor on the symbol; the desktop rings the card.
-  const symbolFg = selected && !nativePaneChrome ? colors.selectedText : colors.textBright;
-  const symbolBg = selected && !nativePaneChrome ? colors.selected : undefined;
+  // The terminal marks the cursor on the symbol, quieter while the board does
+  // not have the keys; the desktop rings the card.
+  const symbolFg = selected && !nativePaneChrome && selectionFill.lit ? colors.selectedText : colors.textBright;
+  const symbolBg = selected && !nativePaneChrome ? selectionFill.bg : undefined;
 
   return (
     <Box
@@ -259,7 +294,7 @@ export function QuoteMonitorCard({
       {!display ? (
         <Box flexDirection="column" flexGrow={1} justifyContent="center">
           <Text attributes={TextAttributes.BOLD} fg={symbolFg} bg={symbolBg} style={desktopSymbolStyle}>
-            {symbol}
+            {label}
           </Text>
           <Text fg={quoteStatus.ended ? colors.warning : quoteStatus.failed ? colors.negative : colors.textDim}>{quoteStatus.text}</Text>
         </Box>
@@ -270,9 +305,14 @@ export function QuoteMonitorCard({
             position: "relative",
             zIndex: 1,
             display: "grid",
-            // The name gives way first; the price keeps its natural width.
-            gridTemplateColumns: "minmax(0, 1fr) auto",
-            gridTemplateRows: "auto 1fr auto auto",
+            // The symbol and the price keep their natural widths; the name gives way first.
+            gridTemplateColumns: "minmax(min-content, 1fr) auto",
+            // The symbol and price, what the price is as of, an extended print, the range, a perpetual. Each row
+            // keeps its line's height however short the card: a line cut for width (overflow hidden) counts for
+            // no height in an `auto` row, and on a narrow board the as-of, after-hours and range lines drew over
+            // one another ("After-Hours $155.90 -0." under the range, the as-of half hidden). The board gives the
+            // card that height (QuoteMonitorPane).
+            gridTemplateRows: `${CARD_LINE_ROW} ${CARD_LINE_ROW} minmax(min-content, 1fr) ${CARD_LINE_ROW} ${CARD_LINE_ROW}`,
             columnGap: "var(--gloom-space-md)",
             width: "100%",
             height: "100%",
@@ -283,13 +323,13 @@ export function QuoteMonitorCard({
             minWidth={0}
             style={{
               gridColumn: "1",
-              gridRow: extendedParts || endedRow ? "1" : "1 / span 2",
+              gridRow: extendedParts || endedRow || desktopAsOf ? "1" : "1 / span 3",
               minWidth: 0,
               overflow: "hidden",
             }}
           >
-            <Text attributes={TextAttributes.BOLD} fg={symbolFg} bg={symbolBg} style={desktopSymbolStyle}>
-              {symbol}
+            <Text attributes={TextAttributes.BOLD} fg={symbolFg} bg={symbolBg} style={{ ...desktopSymbolStyle, whiteSpace: "nowrap" }}>
+              {label}
             </Text>
             {quoteFailed && !endedRow && (
               <Text fg={quoteStatus.ended ? colors.warning : colors.negative} style={{ fontSize: "var(--gloom-type-ui)", lineHeight: "14px" }}>
@@ -297,23 +337,9 @@ export function QuoteMonitorCard({
               </Text>
             )}
             {!quoteFailed && ticker?.metadata.name && (
-              <Text
-                fg={colors.textDim}
-                style={{
-                  fontSize: "var(--gloom-type-ui)",
-                  lineHeight: "14px",
-                  maxWidth: "100%",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
-              >
+              // No width of its own: the column is the symbol's, and the name is cut to it.
+              <Text fg={colors.textDim} style={{ ...DESKTOP_META_LINE_STYLE, contain: "inline-size" }}>
                 {ticker.metadata.name}
-              </Text>
-            )}
-            {navAsOf && (
-              <Text fg={colors.textDim} style={{ fontSize: "var(--gloom-type-ui)", lineHeight: "14px" }}>
-                {navAsOf}
               </Text>
             )}
           </Box>
@@ -339,6 +365,16 @@ export function QuoteMonitorCard({
             </Box>
           </Box>
 
+          {desktopAsOf && (
+            // Across the card under the name and the price, so the time is never cut beside a wide price.
+            <Text
+              fg={colors.textDim}
+              style={{ ...DESKTOP_META_LINE_STYLE, gridColumn: "1 / -1", gridRow: "2", justifySelf: "start", ...backedLineStyle() }}
+            >
+              {desktopAsOf}
+            </Text>
+          )}
+
           {endedRow && (
             // Under the price, across the card, so the date is never cut on a narrow card;
             // backed like the price so the sparkline does not run through it.
@@ -346,7 +382,7 @@ export function QuoteMonitorCard({
               fg={colors.warning}
               style={{
                 gridColumn: "1 / -1",
-                gridRow: "2",
+                gridRow: "3",
                 justifySelf: "start",
                 alignSelf: "start",
                 fontSize: "var(--gloom-type-ui)",
@@ -368,7 +404,7 @@ export function QuoteMonitorCard({
               dim={extendedDim}
               desktopStyle={{
                 gridColumn: "1 / -1",
-                gridRow: "2",
+                gridRow: "3",
                 justifySelf: "start",
                 alignSelf: "start",
                 maxWidth: "100%",
@@ -380,13 +416,14 @@ export function QuoteMonitorCard({
             />
           )}
 
-          {perpetuals && <Box style={{ gridColumn: "1 / -1", gridRow: "4", alignSelf: "end" }}>{perpetuals}</Box>}
+          {perpetuals && <Box style={{ gridColumn: "1 / -1", gridRow: "5", alignSelf: "end" }}>{perpetuals}</Box>}
           {rangeLabel && (
             <Text
               fg={colors.textDim}
               style={{
-                gridColumn: "2",
-                gridRow: "3",
+                // Across the card, so a wide range never widens the price's column into the symbol's.
+                gridColumn: "1 / -1",
+                gridRow: "4",
                 justifySelf: "end",
                 alignSelf: "end",
                 fontSize: "var(--gloom-type-ui)",
@@ -407,7 +444,7 @@ export function QuoteMonitorCard({
             <Box flexDirection="column">
               <Box flexDirection="row" gap={1} height={1} overflow="hidden">
                 <Text attributes={TextAttributes.BOLD} fg={symbolFg} bg={symbolBg} style={desktopSymbolStyle}>
-                  {symbol}
+                  {label}
                 </Text>
                 {compactNavAsOf && <Text fg={colors.textDim}>{navAsOf}</Text>}
                 {extendedParts && <ExtendedSessionLine parts={extendedParts} color={extendedColor} dim={extendedDim} />}
@@ -431,7 +468,7 @@ export function QuoteMonitorCard({
             >
               <Box flexDirection="column" flexGrow={1} minWidth={0}>
                 <Text attributes={TextAttributes.BOLD} fg={symbolFg} bg={symbolBg} style={desktopSymbolStyle}>
-                  {symbol}
+                  {label}
                 </Text>
                 {extendedParts && <ExtendedSessionLine parts={extendedParts} color={extendedColor} dim={extendedDim} />}
                 {nativePaneChrome && ticker?.metadata.name && width >= 36 && (
@@ -465,6 +502,9 @@ export function QuoteMonitorCard({
           )}
           {navAsOf && !compactNavAsOf && (
             <Box height={1} overflow="hidden"><Text fg={colors.textDim}>{navAsOf}</Text></Box>
+          )}
+          {showTerminalSessionAsOf && (
+            <Box height={1} overflow="hidden"><ClippedText text={sessionAsOf!} width={Math.max(1, width - 2)} fg={colors.textDim} /></Box>
           )}
           {perpetuals}
           {showTerminalSparkline && <Box height={terminalSparklineHeight} flexDirection="row" alignItems="center" gap={1}>

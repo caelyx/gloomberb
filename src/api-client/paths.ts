@@ -125,7 +125,8 @@ function normalizeCloudLogoSymbol(
   symbol: string,
 ): string | null {
   let normalized = symbol.trim().toUpperCase();
-  if (kind === "crypto") normalized = normalized.replace(CRYPTO_QUOTE, "");
+  // A coin is its code alone: BTC-USD:CCC and BTC/USDT are both BTC.
+  if (kind === "crypto") normalized = parsePublicTickerKey(normalized).symbol.replace(CRYPTO_QUOTE, "");
   return LOGO_SYMBOL_RE.test(normalized) ? normalized : null;
 }
 
@@ -143,12 +144,17 @@ function appendQuery(path: string, search: URLSearchParams): string {
   return `${path}${query ? `?${query}` : ""}`;
 }
 
-export function cloudMarketSearchPath(query: string, limit: number): string {
+/**
+ * `deep`: the search waits for a venue's own site (the CLI's), which a search
+ * box's keystroke gives about a second.
+ */
+export function cloudMarketSearchPath(query: string, limit: number, deep = false): string {
   return appendQuery(
     "/market/search",
     new URLSearchParams({
       q: query,
       limit: String(limit),
+      ...(deep ? { deep: "1" } : {}),
     }),
   );
 }
@@ -167,11 +173,14 @@ export function cloudOptionsChainPath(
   symbol: string,
   exchange?: string,
   expirationDate?: number,
+  /** The contracts adjusted for a corporate action, in place of the standard ones. */
+  adjusted = false,
 ): string {
   const search = new URLSearchParams({ symbol });
   if (exchange) search.set("exchange", exchange);
   if (expirationDate != null)
     search.set("expirationDate", String(expirationDate));
+  if (adjusted) search.set("adjusted", "1");
   return appendQuery("/market/options", search);
 }
 
@@ -422,11 +431,16 @@ export function cloudProxyStatementPath(ticker: string, year: number, listing?: 
   return issuerPath("/cloud/proxies", ticker, listing, `/${year}`);
 }
 
-/** The principal maturity schedule; a US symbol goes as given, as it always has. */
+/**
+ * The maturity schedule; a US symbol goes as given, as it always has.
+ * `version=2` asks for schedules in a filing's own bands too, which servers
+ * before them ignore.
+ */
 export function cloudDebtMaturitiesPath(symbol: string, listing: IssuerListingParams = {}): string {
   const abroad = listingAbroad(symbol, listing.exchange, listing.name);
   const search = new URLSearchParams({ symbol: abroad?.symbol ?? symbol });
   setListingAbroad(search, abroad);
+  search.set("version", "2");
   return appendQuery("/cloud/debt-maturities", search);
 }
 
@@ -621,10 +635,18 @@ export function cloudNewsPath(params: CloudNewsParams = {}): string {
 
 /** Stories whose headline, summary or publisher matches the text, best match first; the service takes at most 100. */
 /** `topics` are NI codes the stories must carry: `query=gold&topics=metals` is gold's market news. */
-export function cloudNewsSearchPath(query: string, limit?: number, topics?: readonly string[]): string {
+/**
+ * `closest`: when no story has every word, the stories with the most of them, marked `match: "closest"`.
+ * `tickers`: only the stories filed under them (`HAWK:NYSE`).
+ */
+export function cloudNewsSearchPath(
+  query: string, limit?: number, topics?: readonly string[], options: { closest?: boolean; tickers?: readonly string[] } = {},
+): string {
   const search = new URLSearchParams({ query });
   if (limit != null) search.set("limit", String(limit));
   if (topics?.length) search.set("topics", topics.join(","));
+  if (options.tickers?.length) search.set("tickers", options.tickers.join(","));
+  if (options.closest) search.set("closest", "1");
   return appendQuery("/news/search", search);
 }
 

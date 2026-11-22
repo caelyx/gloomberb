@@ -1,12 +1,15 @@
 import type { PluginModule } from "../plugin-module";
 import { createTickerSurfacePaneTemplate } from "../shared/ticker-surface";
-import { VolSurfacePane } from "./pane";
+import { dvolCache } from "../volatility/dvol";
 import { volSurfaceHeadless } from "./headless";
 
 export const volSurfaceModule: PluginModule = {
+  // A coin's last DVOL is kept on the device, for when the service cannot be reached.
+  setup(ctx) { dvolCache.attach(ctx.persistence); },
+  dispose() { dvolCache.reset(); },
   panes: [{
-    id: "vol-surface", name: "Volatility Surface", icon: "V", component: VolSurfacePane,
-    defaultPosition: "right", tickerFollower: true, defaultMode: "floating", defaultFloatingSize: { width: 126, height: 36 },
+    id: "vol-surface", name: "Volatility Surface", icon: "V", get component(): typeof import("./pane").VolSurfacePane { const { VolSurfacePane } = require("./pane"); return VolSurfacePane; },
+    defaultPosition: "right", shareItem: { ticker: true }, tickerFollower: true, defaultMode: "floating", defaultFloatingSize: { width: 126, height: 36 },
     tableExport: true, headless: volSurfaceHeadless,
     settings: {
       title: "Volatility Surface Settings",
@@ -39,7 +42,7 @@ export const volSurfaceModule: PluginModule = {
   paneTemplates: [createTickerSurfacePaneTemplate({
     id: "vol-surface-pane", paneId: "vol-surface", label: "Volatility Surface",
     description: "Implied volatility surface, smiles, term structure, skew (25-delta risk reversal and butterfly) and forwards; DVOL beside BTC-USD and ETH-USD.",
-    keywords: ["ovdv", "volatility", "surface", "smile", "skew", "options", "risk reversal", "butterfly", "25 delta", "dvol", "deribit", "implied volatility index"],
+    keywords: ["ovdv", "volatility", "vol", "surface", "smile", "skew", "options", "risk reversal", "put skew", "25d put", "25 delta put", "butterfly", "25 delta", "dvol", "deribit", "implied volatility index"],
     shortcut: "OVDV", publicShare: true,
     settings: (_symbol, _context, options) => options?.values?.expiration
       ? { expiration: Number(options.values.expiration) } : {},

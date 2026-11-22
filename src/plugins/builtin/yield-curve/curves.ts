@@ -6,6 +6,8 @@ import type { CurveBasis } from "./forward";
 import { yieldSpreads, type YieldLookbackCurves } from "./chart";
 import { completeYieldCurve, loadHistoricalYieldCurve, yieldCurveDate } from "./history";
 import { DATE_OPTION_FORMATS, dateOptionHint, readCalendarDate } from "../../../utils/calendar-date";
+import { formatBasisPoints } from "../../../utils/basis-points";
+import { MISSING_VALUE, formatPercentileRank } from "../../../utils/format";
 import { isYieldObservationDate, loadYieldCurve, type YieldPoint } from "./treasury-data";
 
 export type CurveId = CloudCurveId;
@@ -27,6 +29,8 @@ export const CURVE_OPTIONS: readonly CurveOption[] = [
   { id: "gb", label: "Gilt", aliases: ["gilt", "gilts", "uk", "gb", "gbp"] },
   { id: "jp", label: "JGB", aliases: ["jgb", "jgbs", "jp", "japan", "jpy"] },
   { id: "ca", label: "Canada", aliases: ["canada", "ca", "goc", "cad"] },
+  { id: "mx", label: "Mexico", aliases: ["mexico", "mx", "mbono", "mbonos", "bono", "bonos", "cetes", "mxn"] },
+  { id: "br", label: "Brazil", aliases: ["brazil", "br", "brl", "prefixado", "ltn", "ntn-f", "ntnf"] },
 ];
 
 export function isCurveId(value: unknown): value is CurveId {
@@ -44,17 +48,35 @@ export function curveOption(id: CurveId): CurveOption {
   return CURVE_OPTIONS.find((option) => option.id === id) ?? CURVE_OPTIONS[0]!;
 }
 
-/** `GC`, `GC 2026-01-02`, `GC JGB`, `GC TIPS 2024-01-02`: a curve word and a date, either order. */
+/**
+ * `GC`, `GC 2026-01-02`, `GC JGB`, `GC TIPS 2024-01-02`: a curve word and a
+ * date, either order. Words with no digit are no date: one that names no
+ * curve (`GC world`, `GC "South Africa"`) lists the curves and points at the
+ * world tab, which sets them side by side, as does a second curve word.
+ */
 export function parseCurveArgument(value: unknown, now = new Date()): { curve: CurveId | null; date: string } {
   const words = typeof value === "string" ? value.trim().split(/\s+/).filter(Boolean) : [];
   let curve: CurveId | null = null;
   const rest: string[] = [];
   for (const word of words) {
     const match = CURVE_OPTIONS.find((option) => option.aliases.includes(word.toLowerCase()));
-    if (match && !curve) curve = match.id;
+    if (match && curve && match.id !== curve) {
+      throw new Error(`GC shows one curve: ${curveOption(curve).aliases[0]} or ${match.aliases[0]}. `
+        + "The world tab sets every market's 2- and 10-year yields side by side: gloom fn GC --tab world.");
+    }
+    if (match) curve = match.id;
     else rest.push(word);
   }
-  return { curve, date: yieldCurveDate(rest.join(" ") || null, now) };
+  const text = rest.join(" ");
+  if (text && !/\d/.test(text) && text.toLowerCase() !== "latest") throw new Error(unknownCurveMessage(text));
+  return { curve, date: yieldCurveDate(text || null, now) };
+}
+
+/** `Unknown curve "world"`, with the curves there are and where they are side by side. */
+export function unknownCurveMessage(word: string): string {
+  const names = CURVE_OPTIONS.map((option) => option.aliases[0]);
+  return `Unknown curve "${word}"; the curves are ${names.slice(0, -1).join(", ")} and ${names.at(-1)}. `
+    + "The world tab sets their 2- and 10-year yields side by side: gloom fn GC --tab world.";
 }
 
 /**
@@ -150,6 +172,19 @@ export function curveSpreadFigures(data: CurveData | null, lookbacks: YieldLookb
   if (!data) return [];
   return data.spreads ?? yieldSpreads(data.points, lookbacks)
     .map(({ id, spread, change1d }) => ({ id, value: spread, change1d, percentile1y: null }));
+}
+
+/**
+ * A spread as GC reads it, the pane's figure and the report's row alike: its
+ * level ("+38bp"), and under it the day's move and where it sits in the last
+ * year ("+1bp 1D · 20 pctl 1Y"), the rank left out when the source has none.
+ */
+export function curveSpreadText(figure: CurveSpreadFigure): { value: string; detail: string } {
+  return {
+    value: figure.value == null ? MISSING_VALUE : formatBasisPoints(figure.value),
+    detail: [`${figure.change1d == null ? MISSING_VALUE : formatBasisPoints(figure.change1d)} 1D`,
+      ...(figure.percentile1y == null ? [] : [formatPercentileRank(figure.percentile1y, "1Y")])].join(" · "),
+  };
 }
 
 /**

@@ -1,4 +1,5 @@
 import { TIME_RANGES, type ChartResolution, type TimeRange } from "./range";
+import { withoutControlCharacters } from "../utils/untrusted-text";
 import { isRealizedVolatilityEstimator } from "../market-data/realized-volatility";
 import { getChartResolutionLabel, isChartResolution } from "./resolution";
 import {
@@ -37,7 +38,7 @@ import { isLeverageFactor } from "./leverage";
 const RANGE_SET = new Set<TimeRange>(TIME_RANGES);
 const PERIODS = new Set<SeriesPeriod>(["auto", "daily", "weekly", "monthly", "quarterly", "annual", "ttm"]);
 // `band` only stays on a capability series: a field's styles and an economic series' leave it out.
-const STYLES = new Set<SeriesStyle>(["line", "area", "step", "columns", "points", "candles", "ohlc", "hlc", "band"]);
+const STYLES = new Set<SeriesStyle>(["line", "area", "step", "columns", "points", "candles", "hollow", "heikin-ashi", "ohlc", "hlc", "band"]);
 const ECONOMIC_STYLES = new Set<SeriesStyle>(["line", "area", "step", "columns", "points"]);
 const TRANSFORMS = new Set<SeriesTransform>(["raw", "percent", "index100", "yoy", "qoq", "log"]);
 const AXES = new Set<SeriesAxis>(["auto", "left", "right"]);
@@ -71,7 +72,7 @@ export function isDatasetChart(spec: Pick<ChartSpec, "series">): boolean {
 }
 
 export function isOhlcSeriesStyle(style: SeriesStyle): boolean {
-  return style === "candles" || style === "ohlc" || style === "hlc";
+  return style === "candles" || style === "hollow" || style === "heikin-ashi" || style === "ohlc" || style === "hlc";
 }
 
 export function coerceSeriesTransformForStyle(
@@ -111,6 +112,15 @@ export interface ChartSpecValidationResult {
 
 function nonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+
+/**
+ * A label someone wrote (a panel's, a series', a formula's name), which a
+ * shared or saved chart brings to another terminal: drawn as text, without
+ * control characters.
+ */
+function plainLabel(value: unknown): string | null {
+  return typeof value === "string" ? nonEmptyString(withoutControlCharacters(value)) : null;
 }
 
 function uniqueId(candidate: unknown, prefix: string, index: number, seen: Set<string>): string {
@@ -181,7 +191,7 @@ function normalizeSource(value: unknown): ChartSeriesSource | null {
   };
 }
 
-function normalizedDateWindow(value: unknown): { start: string; end: string } | undefined {
+function normalizedDateWindow(value: unknown): ChartSpec["viewport"]["dateWindow"] {
   const window = recordOrNull(value);
   const start = nonEmptyString(window?.start);
   const end = nonEmptyString(window?.end);
@@ -189,7 +199,7 @@ function normalizedDateWindow(value: unknown): { start: string; end: string } | 
   const startTime = Date.parse(start);
   const endTime = Date.parse(end);
   if (!Number.isFinite(startTime) || !Number.isFinite(endTime) || startTime > endTime) return undefined;
-  return { start, end };
+  return { start, end, ...(window?.endAtLatestObservation === true ? { endAtLatestObservation: true } : {}) };
 }
 
 function normalizePanel(value: unknown, index: number, seen: Set<string>): ChartPanelSpec | null {
@@ -201,7 +211,7 @@ function normalizePanel(value: unknown, index: number, seen: Set<string>): Chart
     : undefined;
   return {
     id,
-    label: nonEmptyString(panel.label) ?? undefined,
+    label: plainLabel(panel.label) ?? undefined,
     height,
     scale: SCALES.has(panel.scale as PanelScale) ? panel.scale as PanelScale : "linear",
   };
@@ -247,7 +257,7 @@ function normalizeSeries(
   return {
     id: uniqueId(entry.id, "series", index, seen),
     source: normalizedSource,
-    label: nonEmptyString(entry.label) ?? undefined,
+    label: plainLabel(entry.label) ?? undefined,
     style,
     transform,
     axis: AXES.has(entry.axis as SeriesAxis) ? entry.axis as SeriesAxis : "auto",
@@ -271,6 +281,11 @@ function normalizeStudy(
   for (const [key, parameter] of Object.entries(rawParameters ?? {})) {
     if (typeof parameter === "number" && Number.isFinite(parameter)) parameters[key] = parameter;
     else if (study.kind === "realized-vol" && key === "estimator" && typeof parameter === "string") parameters[key] = parameter;
+    // A catalog formula keeps its name (`3-2-1 crack spread`).
+    else if (study.kind === "formula" && key === "name") {
+      const name = plainLabel(parameter);
+      if (name) parameters[key] = name.slice(0, 120);
+    }
   }
   return {
     id: uniqueId(study.id, "study", index, seen),
@@ -333,6 +348,8 @@ export function normalizeChartSpec(value: unknown, fallback: ChartSpec = DEFAULT
         ? Math.min(10_000, Math.floor(viewport.maxPoints))
         : undefined,
       ...(viewport?.extendedHours === true ? { extendedHours: true } : {}),
+      ...(viewport?.totalReturn === true ? { totalReturn: true } : {}),
+      ...(typeof viewport?.currency === "string" && /^[A-Z]{3}$/.test(viewport.currency) ? { currency: viewport.currency } : {}),
     },
     panels,
     series,
@@ -529,6 +546,10 @@ export function validateChartSpec(spec: ChartSpec): ChartSpecValidationResult {
     for (const [name, value] of Object.entries(study.parameters)) {
       if (study.kind === "realized-vol" && name === "estimator") {
         if (!isRealizedVolatilityEstimator(value)) errors.push(issue(`${path}.parameters.${name}`, "invalid-estimator", "Choose a supported realized volatility estimator."));
+        continue;
+      }
+      if (study.kind === "formula" && name === "name") {
+        if (typeof value !== "string" || !value.trim()) errors.push(issue(`${path}.parameters.${name}`, "invalid-parameter", "A formula's name is text."));
         continue;
       }
       if (typeof value !== "number" || !Number.isFinite(value)) errors.push(issue(`${path}.parameters.${name}`, "invalid-parameter", "Numeric study parameters must be finite."));

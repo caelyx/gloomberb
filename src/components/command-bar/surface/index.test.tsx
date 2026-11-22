@@ -136,6 +136,55 @@ describe("CommandBar", () => {
     expect(checks).toBe(1);
   });
 
+  // "quit" and "exit" used to run the first hit, Add a Desk.
+  test.each(["quit", "exit"])("%s is the first row and quits when chosen", async (query) => {
+    let quits = 0;
+    await tui.render(<CommandBarHarness query={query} onQuit={() => { quits += 1; }} />, { width: 100, height: 24 });
+    await tui.waitForFrameToContain("QUIT Quit");
+    // Under its section heading, before anything else the word finds.
+    const rows = tui.frame().split("\n").slice(1).filter((line) => line.trim());
+    expect(rows.slice(0, 2).map((line) => line.trim())).toEqual(["Navigation", "QUIT Quit"]);
+
+    await act(async () => {
+      tui.setup().mockInput.pressEnter();
+      await tui.setup().renderOnce();
+    });
+    expect(quits).toBe(1);
+  });
+
+  // `config` and Enter wrote a backup of the whole config to the home folder: the first row was Export Config.
+  test("config lists the app's settings, a choice first, ahead of Export and Import Config", async () => {
+    await tui.render(<CommandBarHarness query="config" />, { width: 100, height: 40 });
+    await tui.waitForFrameToContain("Export Config");
+    const rows = tui.frame().split("\n").slice(1).map((line) => line.trim()).filter(Boolean);
+    const at = (label: string) => rows.findIndex((row) => row.endsWith(label) || row.includes(` ${label} `) || row.includes(`${label}  `));
+    expect(rows[1]).toContain("Change Theme");
+    expect(at("Change Theme")).toBeLessThan(at("Export Config"));
+    expect(at("Change Language")).toBeLessThan(at("Import Config"));
+  });
+
+  // A partial word put QUIT first, so Enter on `q` or `e` quit the app.
+  test.each([
+    ["q", "QQ Quote Monitor"],
+    ["qu", "QQ Quote Monitor"],
+    ["e", "Export Config"],
+    ["ex", "Export Config"],
+    ["close", "Close Pane"],
+  ])("%s never makes Quit the row Enter runs", async (query, first) => {
+    let quits = 0;
+    await tui.render(<CommandBarHarness query={query} onQuit={() => { quits += 1; }} />, { width: 100, height: 24 });
+    await tui.waitForFrameToContain(first);
+    const rows = tui.frame().split("\n").slice(1).map((line) => line.trim()).filter(Boolean);
+    expect(rows[1]).toBe(first);
+    expect(rows.some((row) => row.endsWith("Quit"))).toBe(false);
+
+    await act(async () => {
+      tui.setup().mockInput.pressEnter();
+      await tui.setup().renderOnce();
+    });
+    expect(quits).toBe(0);
+  });
+
   test("Check for Updates is inert once the terminal binary is swapped in", async () => {
     let checks = 0;
     await tui.render(<CommandBarHarness
@@ -570,9 +619,10 @@ describe("CommandBar", () => {
     expect(storeRef.current!.getState().paneState["brokers:main"]?.brokerAddRequest).toEqual(expect.any(Number));
   });
 
-  test("opens ticker search from a launch request with saved ticker metadata", async () => {
+  test("opens ticker search from a launch request with saved ticker metadata, and Esc closes the bar", async () => {
     await tui.render(<CommandBarHarness
       query=""
+      live
       extraTickers={[createTestTicker("BRK.B", "Berkshire Hathaway Inc.", {
         exchange: "NYSE",
         assetCategory: "STK",
@@ -596,9 +646,14 @@ describe("CommandBar", () => {
     // The class moved into the left badge; the trailing text carries only the venue.
     expect(frame).toMatch(/EQ\s+BRK\.B.*NYSE/);
     expect(frame).not.toContain("Equity NYSE");
+
+    // The search key opened the bar on this screen: one Esc puts the user
+    // back where they were, not on a root screen they never saw.
+    await tui.emitKeypress({ name: "escape" }, { frames: 2, afterCommit: true });
+    await waitForFrameToContain("bar:closed");
   });
 
-  test("opens ticker search when activating the Ticker Research pane item without a ticker", async () => {
+  test("opens ticker search when activating the Ticker Research pane item without a ticker, and Esc goes back", async () => {
     await tui.render(<CommandBarHarness query="ticker research" />, {
       width: 100,
       height: 24,
@@ -621,6 +676,10 @@ describe("CommandBar", () => {
     expectSingleBackControl(frame);
     expect(frame).toContain("Security Description");
     expect(frame).toContain("Search tickers");
+
+    await tui.emitKeypress({ name: "escape" }, { frames: 2, afterCommit: true });
+    await waitForFrameToContain("Ticker Research");
+    expect(tui.frame()).not.toContain("Security Description");
   });
 
   test("keeps typed prefixes in the root query until a result is activated", async () => {
@@ -794,7 +853,34 @@ describe("CommandBar", () => {
       await tui.setup().renderOnce();
     });
 
-    expect(created.map(({ templateId, options }) => [templateId, options?.symbol])).toEqual([["insider-pane", symbol]]);
+    // The bar reads INS's argument as a list, as `fn INS` does: the active ticker is its one symbol.
+    expect(created.map(({ templateId, options }) => [templateId, options?.symbols?.[0]])).toEqual([["insider-pane", symbol]]);
+  });
+
+  // `fn INS MO,PM,LMT` reads three companies; the bar took one ticker only.
+  test("INS takes several tickers: one window over the list", async () => {
+    const created: Array<{ templateId: string; options?: PaneTemplateCreateOptions }> = [];
+    await tui.render(<CommandBarHarness
+      query="INS AAPL,MSFT"
+      configurePluginRegistry={(pluginRegistry) => {
+        mutablePaneRegistryMap(pluginRegistry.paneTemplates).set("insider-pane", insiderModule.paneTemplates![0]!);
+        pluginRegistry.createPaneFromTemplateAsync = async (templateId, options) => {
+          created.push({ templateId, options });
+        };
+      }}
+    />, { width: 100, height: 20 });
+    await tui.setup().renderOnce();
+    expect(tui.frame()).toContain("Shortcut: Insider · AAPL,MSFT");
+    await act(async () => {
+      tui.setup().mockInput.pressEnter();
+      await Bun.sleep(0);
+      await tui.setup().renderOnce();
+    });
+    expect(created.map(({ templateId, options }) => [templateId, options?.symbols])).toEqual([["insider-pane", ["AAPL", "MSFT"]]]);
+    const template = insiderModule.paneTemplates![0]!;
+    expect(template.createInstance!({} as never, created[0]!.options)).toMatchObject({
+      title: "INS AAPL, MSFT", binding: { kind: "none" }, settings: { symbols: ["AAPL", "MSFT"] },
+    });
   });
 
   test("consumes enter before focused pane shortcuts when executing a pane shortcut", async () => {

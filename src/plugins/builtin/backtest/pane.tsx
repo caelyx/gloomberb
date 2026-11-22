@@ -29,7 +29,7 @@ import { useAutoRefresh } from "../../../react/auto-refresh";
 import { loadBacktestHistory } from "./client";
 import type { BacktestTrade } from "./engine";
 import { backtestEquityCsv } from "./export";
-import { formatStat, PRICE_RETURN_NOTE, SUMMARY_ROWS, type SummaryRow } from "./format";
+import { formatStat, formatTradePrice, PRICE_RETURN_NOTE, SUMMARY_ROWS, type SummaryRow } from "./format";
 import { BACKTEST_PRESETS, DEFAULT_PRESET, lookbackYears, resolveRules, strategyPreset } from "./presets";
 import { backtestPriceUnit, backtestReport } from "./report";
 import { parseRule } from "./rules";
@@ -100,7 +100,9 @@ export function BacktestPane({ width, height, focused }: PaneProps) {
   const strategyControl = useRef<SelectControl>(null);
   const instrument = instrumentFromTicker(ticker, symbol);
   const instrumentKey = JSON.stringify(instrument);
-  const loader = useCallback((force: boolean) => loadBacktestHistory(instrument!, { forceRefresh: force }), [instrumentKey]);
+  const wholeHistory = lookbackYears(lookback) == null;
+  const loader = useCallback((force: boolean) => loadBacktestHistory(instrument!, { forceRefresh: force, wholeHistory }),
+    [instrumentKey, wholeHistory]);
   const history = useAsyncResource(instrument ? loader : null);
   useAutoRefresh(history.updatedAt, history.load);
 
@@ -119,7 +121,7 @@ export function BacktestPane({ width, height, focused }: PaneProps) {
     }
   }, [history.data, rules, lookback, costBps, runWindow]);
   const result = run.result;
-  const continuation = instrument ? continuationNote(instrument.symbol, instrument.exchange) : null;
+  const continuation = instrument ? continuationNote(instrument.symbol, instrument.exchange, history.data?.rollNote) : null;
   // Export CSV writes the daily curve `fn BT --csv --equity` prints for this run, whichever table is in view;
   // the table reads it when the export runs. Without a run the table's own rows export.
   const exportCsv = result && symbol ? () => {
@@ -154,7 +156,7 @@ export function BacktestPane({ width, height, focused }: PaneProps) {
   const chooseStrategy = () => strategyControl.current?.open();
   // The footer hints bind e, v and s in both views and every load state; only
   // the reload is the pane's own key.
-  usePaneRefreshKey(() => void history.reload(), { focused });
+  usePaneRefreshKey(() => history.reload(), { focused });
 
   const notices = [identityError, history.error, rules.error, run.error, ...(result?.warnings ?? []), ...(result && continuation ? [continuation] : [])]
     .filter((value): value is string => !!value);
@@ -269,9 +271,9 @@ export function BacktestPane({ width, height, focused }: PaneProps) {
             exportCsv={exportCsv}
             renderCell={(trade, column) => ({
               text: column.id === "entryDate" ? trade.entryDate
-                : column.id === "entryPrice" ? trade.entryPrice.toFixed(2)
+                : column.id === "entryPrice" ? formatTradePrice(trade.entryPrice, symbol ?? "")
                   : column.id === "exitDate" ? (trade.open ? "open" : trade.exitDate!)
-                    : column.id === "exitPrice" ? (trade.exitPrice?.toFixed(2) ?? "--")
+                    : column.id === "exitPrice" ? formatTradePrice(trade.exitPrice, symbol ?? "")
                       : column.id === "returnPct" ? (Math.abs(trade.returnPct) < 0.05 ? "0.0%" : `${trade.returnPct > 0 ? "+" : ""}${trade.returnPct.toFixed(1)}%`)
                         : String(trade.sessions),
               color: column.id === "returnPct" ? (Math.abs(trade.returnPct) < 0.05 ? undefined : trade.returnPct > 0 ? colors.positive : colors.negative)

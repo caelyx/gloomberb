@@ -1,8 +1,10 @@
 import { logFailure } from "../../utils/log-failure";
+import { readCompanyFrom } from "../../types/company-from";
 import { exchangeRateMetadata } from "../../utils/exchange-rate-snapshot";
 import type { ExchangeRateSnapshot } from "../../types/exchange-rate";
 import type { TimeRange } from "../../time-series/range";
-import { subtractTimeRange } from "../../time-series/date-window";
+import { ALL_HISTORY_REACH_MONTHS, subtractTimeRange } from "../../time-series/date-window";
+import { calendarMonthsBefore } from "../../utils/calendar-date";
 import { HistoryCoverageError, parseHistoryCoverageNote, parseHistoryCoverageStart } from "../history-coverage";
 import { cloudNonPositiveCloseDates } from "../history-omitted";
 import {
@@ -17,6 +19,8 @@ import type {
   EarningsEvent,
   SecFilingDocument,
   SecFilingItem,
+  SecForm4Trade,
+  BatchedReadMethod,
   MarketDataRequestContext,
   QuoteBatchOptions,
   QuoteBatchResult,
@@ -42,12 +46,12 @@ import {
 import type { NewsArticle, NewsQuery } from "../../types/news-source";
 import { normalizeNewsFeed } from "../../news/news-model";
 import { resolveCurrencyUnit } from "../../utils/currency-units";
-import { isRoundTheClockCoin } from "../../utils/crypto-pair";
+import { exchangeLineCoinListing, isRoundTheClockCoin, withExchangeLinesAsCoinListings } from "../../utils/crypto-pair";
 import { canonicalExchange, canonicalTickerKey, parsePublicTickerKey } from "../../utils/exchanges";
 import { normalizePriceHistory, priceHistoryIntervalMs, reachesLatestSettledSession } from "../../utils/price-history";
-import { createProviderMiss, ProviderBusyError, providerMissReason, StaleHistoryError } from "../provider-errors";
+import { createProviderMiss, isRateLimited, ProviderBusyError, providerMissReason, StaleHistoryError } from "../provider-errors";
 import { parseListingDelisting } from "../../market-data/quotes/delisting";
-import { isRetryableApiError } from "../../api-client/errors";
+import { isRetryableApiError, markAskedTwice, sourceDidNotAnswer, wasAskedTwice } from "../../api-client/errors";
 import { assertSecRegistrantMatches } from "../sec-registrant";
 import { nonUsSecListingVenue } from "../../utils/sec";
 import { publicListingTarget } from "../listing-target";
@@ -65,6 +69,7 @@ import {
   GLOOMBERB_CLOUD_PROVIDER_ID,
   formatCloudDateTime,
   formatCloudHistoryEnd,
+  isCloudSourceFailure,
   isEmptyCloudStatus,
   mapBatchError,
   NOT_FOUND_REASON,
@@ -83,16 +88,29 @@ import {
   perpetualTarget,
   searchPerpetualMarkets,
   boardSearchesFrom,
+  PerpetualBoardCache,
 } from "./perpetuals";
 import { predictionMarketListing } from "../../tickers/prediction-listing";
+import { cleanListingName } from "../../tickers/company-name";
 import { settleWithin } from "../../utils/async-deadline";
 import { cloudSearchBatch, cloudTickerChangesBatch } from "./batched-lookups";
+import { cappedAnswerStart, firstBarDate, reachesWindowStart, withOlderBars } from "./dated-chunks";
+import { chunked, mapWithConcurrency } from "../../utils/concurrency";
 
 const providerId = GLOOMBERB_CLOUD_PROVIDER_ID;
+/** Listings in one quote batch request: the most the service reads in a signed-out batch. */
+const QUOTE_BATCH_SIZE = 100;
+/** Quote batch requests of one long list in flight at once. */
+const QUOTE_BATCHES_IN_FLIGHT = 3;
 /** How long a search that is not typed waits for perpetual markets. */
 const PERPETUAL_SEARCH_WAIT_MS = 2_000;
 /** How long a batched search waits for the board it answers every query's perpetual markets from. */
 const PERPETUAL_BOARD_WAIT_MS = 5_000;
+/** A bare symbol a command looks up (AAPL, MCO), not a search the person typed to browse: `search` and the command bar keep the contracts. */
+function isSymbolLookup(query: string, context?: SearchRequestContext): boolean {
+  return !context?.interactive && context?.perpetuals !== "always" && /^[A-Za-z][A-Za-z0-9]{1,5}$/.test(query.trim());
+}
+
 const CLOUD_RESOLUTION_SUPPORT = normalizeChartResolutionSupport([
   { resolution: "1m", maxRange: "1W" },
   { resolution: "5m", maxRange: "1M" },
@@ -126,7 +144,10 @@ function mapCloudSecFiling(item: {
   primaryDocumentUrl?: string;
   fileNumber?: string;
   fundSeries?: boolean;
+  pressReleaseUrl?: string;
+  form4?: unknown;
 }): SecFilingItem {
+  const form4 = readForm4Trade(item.form4);
   return {
     accessionNumber: item.accessionNumber,
     form: item.form,
@@ -143,7 +164,43 @@ function mapCloudSecFiling(item: {
     // Absent from an older server: no file number is not the same as an empty one.
     ...(typeof item.fileNumber === "string" ? { fileNumber: item.fileNumber } : {}),
     ...(typeof item.fundSeries === "boolean" ? { fundSeries: item.fundSeries } : {}),
+    ...(typeof item.pressReleaseUrl === "string" && /^https:\/\/www\.sec\.gov\//.test(item.pressReleaseUrl)
+      ? { pressReleaseUrl: item.pressReleaseUrl } : {}),
+    ...(form4 ? { form4 } : {}),
   };
+}
+
+/** A Form 4's trade as the service summarized it, or null when it sent none or an unreadable one. */
+function readForm4Trade(value: unknown): SecForm4Trade | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  const text = (field: unknown) => typeof field === "string" && field.trim() ? field.trim() : null;
+  const issuerName = text(raw.issuerName);
+  const sides = ["buy", "sell", "acquired", "disposed"] as const;
+  const side = sides.find((entry) => entry === raw.side);
+  const shares = typeof raw.shares === "number" && Number.isFinite(raw.shares) && raw.shares > 0 ? raw.shares : null;
+  if (!issuerName || !side || shares == null) return null;
+  const price = typeof raw.price === "number" && Number.isFinite(raw.price) && raw.price > 0 ? raw.price : null;
+  return {
+    ownerName: text(raw.ownerName) ?? "",
+    issuerName,
+    issuerTicker: text(raw.issuerTicker),
+    issuerCik: text(raw.issuerCik),
+    code: text(raw.code) ?? "",
+    side,
+    shares,
+    price,
+    ...(raw.derivative === true ? { derivative: true } : {}),
+  };
+}
+
+/** Search rows with a venue's fixed-width name cleaned of the stray code after its spaces ("Americold Realty Trust Inc.   R"). */
+function withCleanNames<T extends { name: string }>(rows: T[]): T[] {
+  return rows.map((row) => {
+    if (typeof row.name !== "string") return row;
+    const name = cleanListingName(row.name);
+    return name === row.name ? row : { ...row, name };
+  });
 }
 
 function isCloudProviderMiss(error: unknown): boolean {
@@ -203,8 +260,9 @@ function mapCloudPriceHistory(
     && requestedStart.getTime() < Date.parse(coverageStart)) throw new HistoryCoverageError(coverageStart);
   // The server marks a cached copy it could not refresh in time. Bars that
   // reach the venue's latest settled session still answer, and the router's
-  // own current-window check applies to them as to any other copy. Older bars,
-  // or a stale answer without bars, are a miss.
+  // own current-window check applies to them as to any other copy. Older bars
+  // are a miss that carries them, shown as behind when no source has the
+  // present; a stale answer without bars is a miss.
   const stale = isStaleCloudResponse(response);
   if (stale && response.status !== "success" && response.status !== "partial") {
     throw new StaleHistoryError(`Cloud chart data is stale for ${ticker}`);
@@ -231,9 +289,6 @@ function mapCloudPriceHistory(
       `Cloud chart data is unavailable for ${ticker}`,
     ).map((point) => mapPricePoint(point, divisor, exchange, coin)),
   );
-  if (stale && !reachesLatestSettledSession(points, Date.now(), { symbol: ticker, exchange, intervalMs: priceHistoryIntervalMs(interval) })) {
-    throw new StaleHistoryError(`Cloud chart data is stale for ${ticker}`);
-  }
   const intraday = /^\d+(min|h)$/i.test(interval);
   // Daily bars answering an intraday range: the listing has no intraday bars.
   const dailyBars = intraday && response.servedResolution === "1day";
@@ -258,7 +313,7 @@ function mapCloudPriceHistory(
   // Sessions of daily bars the answer left out for a close at or below zero.
   const nonPositiveCloseDates = resolution === "1d" ? cloudNonPositiveCloseDates(response.omittedSessions) : undefined;
   const delisting = parseListingDelisting(response.delisting);
-  return {
+  const result: PriceHistoryResult = {
     points,
     resolution,
     ...(delisting ? { delisting } : {}),
@@ -268,6 +323,30 @@ function mapCloudPriceHistory(
     ...(coverageNote ? { coverageNote } : {}),
     ...(extendedHours ? { extendedHours: true } : {}),
   };
+  if (stale && !reachesLatestSettledSession(points, Date.now(), { symbol: ticker, exchange, intervalMs: priceHistoryIntervalMs(interval) })) {
+    throw new StaleHistoryError(`Cloud chart data is stale for ${ticker}`, result);
+  }
+  return result;
+}
+
+/**
+ * One older chunk of bars an answer said were left out (withOlderBars): its
+ * bars, or "empty" when the source has none in it.
+ */
+async function readCloudHistoryChunk(
+  symbol: string, exchange: string, interval: string, from: Date, to: Date,
+  context: MarketDataRequestContext | undefined, ticker: string,
+): Promise<PriceHistoryResult | "empty"> {
+  const { response, extendedHours } = await withCloudFallback(
+    () => loadCloudHistory(interval, () => apiClient.getCloudHistory(symbol, exchange, {
+      interval,
+      startDate: formatCloudDateTime(from, false, exchange),
+      endDate: formatCloudDateTime(to, false, exchange),
+    }), context),
+    `Cloud chart history is unavailable for ${ticker}`,
+  );
+  if (response.status === "empty" && !parseHistoryCoverageStart(response.coverage)) return "empty";
+  return mapCloudPriceHistory(response, symbol, exchange, interval, from, to, extendedHours);
 }
 
 const DAY_MS = 86_400_000;
@@ -315,12 +394,33 @@ function cloudResponseTargetKey(key: string, requested: Set<string>): string | u
 
 /**
  * The listing as Gloom Cloud knows it. A Hong Kong code goes out with its four
- * digits: Cloud has no 700 or 5 on HKEX, only 0700 and 0005.
+ * digits: Cloud has no 700 or 5 on HKEX, only 0700 and 0005. A crypto
+ * exchange's line of a coin pair (BTC/GBP on COINBASE PRO), which no source
+ * quotes, goes out as the crypto venue's listing of the pair, BTC-GBP on CCC.
  */
 function cloudInstrumentTarget(symbol: string, exchange?: string) {
   rejectPredictionMarket(symbol, exchange);
   const target = publicListingTarget(symbol, exchange);
+  const coin = exchangeLineCoinListing(target.symbol, target.exchange);
+  if (coin) return { symbol: coin.symbol, exchange: coin.exchange };
   return target.exchange ? { ...target, symbol: hongKongListingCode(target.symbol, target.exchange) } : target;
+}
+
+/**
+ * Whether a quote names a listing other than the one asked for: asked for BHP
+ * on Cboe Australia, Gloom Cloud has answered with BHP on NYSE, in dollars. A
+ * price for another instrument is worse than none. A quote that names no
+ * listing is judged by its symbol alone, as the router judges it.
+ */
+function pricesOtherListing(quote: Quote, target: ReturnType<typeof cloudInstrumentTarget>): boolean {
+  const metadata = quoteMetadataFromQuote(quote);
+  const named = !!(metadata.listingExchangeName || parsePublicTickerKey(quote.symbol).exchange);
+  return !quoteMetadataMatchesTarget(metadata, named ? target.symbol : parsePublicTickerKey(target.symbol).symbol, named ? target.exchange : undefined);
+}
+
+function otherListingMiss(ticker: string, quote: Quote) {
+  const venue = quote.listingExchangeName || quote.exchangeName || parsePublicTickerKey(quote.symbol).exchange;
+  return createProviderMiss(`Cloud quoted ${quote.symbol}${venue ? ` on ${venue}` : ""} for ${ticker}`);
 }
 
 function cloudHistoryRecovery(
@@ -398,6 +498,8 @@ function unwrapRequiredCloudResponse<T>(response: CloudMarketResponse<T>, messag
   if (isEmptyCloudStatus(response.status)) {
     throw createProviderMiss(response.reasonCode ?? message, response.message, { notFound: response.reasonCode === NOT_FOUND_REASON });
   }
+  // The service's own source failed on a listing read asked twice (`readListing`): not an answer that the listing has nothing.
+  if (isCloudSourceFailure(response.status) && wasAskedTwice(response)) throw markAskedTwice(sourceDidNotAnswer(response.reasonCode ?? message));
   throw new Error(response.reasonCode ?? message);
 }
 
@@ -430,6 +532,10 @@ function perpetualFinancials(quote: Quote): TickerFinancials {
 }
 
 export class GloomberbCloudProvider implements AssetDataProvider {
+  /** See `AssetDataProvider.knownUsStock`; this provider asks for no perpetual contracts of such a symbol either. */
+  knownUsStock?: (symbol: string) => boolean;
+  private readonly perpetualBoards = new PerpetualBoardCache();
+
   readonly id = providerId;
   readonly name = "Gloom Cloud";
   readonly priority = 100;
@@ -520,10 +626,12 @@ export class GloomberbCloudProvider implements AssetDataProvider {
     return withCloudFallback(
       async () => {
         const response = await apiClient.getCloudQuote(target.symbol, target.exchange);
-        const quote = retainRequestedQuoteSymbol(mapQuote(
+        const answered = mapQuote(
           unwrapRequiredCloudResponse(response, `Cloud quotes are unavailable for ${ticker}`),
           response.providerMeta,
-        ), ticker);
+        );
+        if (pricesOtherListing(answered, target)) throw otherListingMiss(ticker, answered);
+        const quote = retainRequestedQuoteSymbol(answered, ticker);
         // A stale answer is the last price the service has. It stays flagged, so
         // no freshness check passes it and only a request with no current quote
         // from any source falls back to it.
@@ -564,6 +672,25 @@ export class GloomberbCloudProvider implements AssetDataProvider {
     const { valid, invalid } = cloudBatchTargets(targets);
     const rejected = invalid.map((entry) => ({ ...entry, quote: null }));
     if (!valid.length) return rejected;
+    // A request per hundred listings, a few in flight: the service reads a signed-out batch of a hundred at most and
+    // refuses a longer one whole, which left a pasted list of 300 to be asked one listing at a time.
+    // A request refused for the service's request limit leaves its listings, and those of the requests not sent yet,
+    // with that refusal: the others keep their answers.
+    if (valid.length > QUOTE_BATCH_SIZE) {
+      let refusal: unknown = null;
+      const chunks = await mapWithConcurrency(chunked(valid.map((entry) => entry.target), QUOTE_BATCH_SIZE), QUOTE_BATCHES_IN_FLIGHT,
+        async (chunk): Promise<QuoteBatchResult[]> => {
+          if (refusal) return chunk.map((target) => ({ target, quote: null, error: refusal }));
+          try {
+            return await this.getQuotesBatch(chunk, options);
+          } catch (error) {
+            if (!isRateLimited(error)) throw error;
+            refusal = error;
+            return chunk.map((target) => ({ target, quote: null, error }));
+          }
+        });
+      return [...rejected, ...chunks.flat()];
+    }
     const submitted = valid.map((entry) => entry.target);
     return withCloudFallback(async () => {
       const response = await apiClient.getCloudQuotesBatch(
@@ -577,15 +704,17 @@ export class GloomberbCloudProvider implements AssetDataProvider {
       const { matched, missing } = matchCloudBatchItems(submitted, payload.items);
       return [...rejected, ...matched.map(({ target, item }) => {
         // A successful batch can contain an expired cache fallback for only
-        // one listing. Match the single-quote freshness boundary and let the
-        // normal router retry that item without discarding its healthy peers.
-        // A listing that no longer trades has only that last quote: kept, flagged stale.
-        const delisted = !!parseListingDelisting(item.data?.delisting);
-        if (item.stale === true && !delisted) {
-          return { target, quote: null, error: createProviderMiss(`Cloud quotes are stale for ${target.symbol}`) };
-        }
+        // one listing: the last price the service has, flagged stale as the
+        // single-quote route flags it. No freshness check passes it, so the
+        // router asks for that listing alone and keeps this price only when
+        // that read brings none. A listing that no longer trades has only
+        // that last quote too.
         if ((item.status === "success" || item.status === "partial") && item.data) {
-          const quote = retainRequestedQuoteSymbol(mapQuote(item.data), target.symbol);
+          const answered = mapQuote(item.data);
+          if (pricesOtherListing(answered, cloudInstrumentTarget(target.symbol, target.exchange))) {
+            return { target, quote: null, error: otherListingMiss(target.symbol, answered) };
+          }
+          const quote = retainRequestedQuoteSymbol(answered, target.symbol);
           return { target, quote: item.stale === true ? { ...quote, stale: true } : quote };
         }
         return {
@@ -616,15 +745,18 @@ export class GloomberbCloudProvider implements AssetDataProvider {
   async search(query: string, context?: SearchRequestContext): Promise<InstrumentSearchResult[]> {
     // Perpetual markets are listings too, asked for beside the others. They are optional: a failed lookup leaves the
     // other results, and a keystroke waits for them only briefly once the listings are in, unless the query names one.
-    const pending = searchPerpetualMarkets(query).catch(logFailure("sources.gloomberb-cloud.index", "Searching perpetual markets failed", [] as InstrumentSearchResult[]));
+    const pending = isSymbolLookup(query, context) && this.knownUsStock?.(query) === true ? null
+      : searchPerpetualMarkets(query, apiClient, this.perpetualBoards).catch(logFailure("sources.gloomberb-cloud.index", "Searching perpetual markets failed", [] as InstrumentSearchResult[]));
+    // A crypto exchange's line of a coin pair, which no source quotes, is offered as the crypto venue's listing.
     const listings = await withCloudFallback(
-      () => apiClient.searchInstruments(query, context?.limit ?? 10),
+      async () => withExchangeLinesAsCoinListings(withCleanNames(
+        await apiClient.searchInstruments(query, context?.limit ?? 10, { interactive: context?.interactive }))),
       "Cloud search is unavailable",
     ).catch((error: unknown) => {
       // Rate limited or overloaded: the search was not run, which is not a search that found nothing.
       throw isRetryableApiError(error) ? new ProviderBusyError("Cloud search is busy", { cause: error }) : error;
     });
-    const perpetuals = await settleWithin(pending, namesPerpetualMarket(query) || !context?.interactive ? PERPETUAL_SEARCH_WAIT_MS : 250) ?? [];
+    const perpetuals = pending ? await settleWithin(pending, namesPerpetualMarket(query) || !context?.interactive ? PERPETUAL_SEARCH_WAIT_MS : 250) ?? [] : [];
     // Ahead of the listings, so a contract found by its plain name ("brent" for BZUSDT:BINANCE) is not cut
     // behind every warrant that names it; an exact symbol still leads.
     return perpetuals.length ? [...perpetuals, ...listings] : listings;
@@ -637,9 +769,12 @@ export class GloomberbCloudProvider implements AssetDataProvider {
     const name = venue ? context?.listingName?.trim() || await this.listingName(ticker, venue) || undefined : undefined;
     const filings = await withCloudFallback(async () => {
       const response = await apiClient.getCloudSecFilings({ ticker, exchange, name, limit: count, offset: 0 });
-      return response.filings.map(mapCloudSecFiling);
+      // A foreign line's filings read from its company's home line say whose, each of them.
+      const companyFrom = readCompanyFrom(response.companyFrom);
+      return response.filings.map((filing) => companyFrom ? { ...mapCloudSecFiling(filing), companyFrom } : mapCloudSecFiling(filing));
     }, `Cloud SEC filings are unavailable for ${ticker}`);
-    if (!venue || filings.length === 0) return filings;
+    // The service matched a line read from its company's home line to the company itself.
+    if (!venue || filings.length === 0 || filings[0]!.companyFrom) return filings;
     const symbol = parsePublicTickerKey(ticker).symbol;
     // Without the listing's company the filings cannot be told apart from another company's.
     if (!name) throw createProviderMiss(`SEC filings for ${symbol} could not be matched to its ${venue} listing`);
@@ -732,12 +867,13 @@ export class GloomberbCloudProvider implements AssetDataProvider {
   async searchBatch(queries: string[], options: { limit?: number; signal?: AbortSignal } = {}): Promise<Map<string, InstrumentSearchResult[]> | null> {
     const answers = await cloudSearchBatch(queries, options);
     if (!answers) return null;
+    for (const [query, rows] of answers) answers.set(query, withExchangeLinesAsCoinListings(withCleanNames(rows)));
     // Perpetual markets lead each answer, as `search` gives them, so a symbol in a list resolves as it does alone:
     // one read of the board answers every query's search of it. A query that found no listing is searched again
     // on its own, which finds them then; a board that does not answer leaves them out, as a search does.
     const found = queries.filter((query) => answers.get(query)?.length);
     const board = found.length
-      ? await settleWithin(apiClient.getCloudPerpsBoard().catch(logFailure("sources.gloomberb-cloud.index", "Reading the perpetual board failed", null)), PERPETUAL_BOARD_WAIT_MS)
+      ? await settleWithin(this.perpetualBoards.read(apiClient).catch(logFailure("sources.gloomberb-cloud.index", "Reading the perpetual board failed", null)), PERPETUAL_BOARD_WAIT_MS)
       : null;
     if (!board) return answers;
     const client = boardSearchesFrom(board);
@@ -785,10 +921,18 @@ export class GloomberbCloudProvider implements AssetDataProvider {
     exchange = target.exchange ?? "";
     const request = toHistoryRequest(range);
     const { response, extendedHours } = await withCloudFallback(
-      () => loadCloudHistory(request.interval, (session) => apiClient.getCloudHistory(target.symbol, exchange, { ...request, ...(session ? { session } : {}) }), _context),
+      () => loadCloudHistory(request.interval, (session) => apiClient.getCloudHistory(target.symbol, exchange, { ...request, ...(session ? { session } : {}) },
+        { batch: _context?.batch }), _context),
       `Cloud chart data is unavailable for ${ticker}`,
     );
-    return mapCloudPriceHistory(response, target.symbol, exchange, request.interval, subtractTimeRange(new Date(), range), undefined, extendedHours);
+    const now = new Date();
+    const windowStart = subtractTimeRange(now, range);
+    const result = mapCloudPriceHistory(response, target.symbol, exchange, request.interval, windowStart, undefined, extendedHours);
+    // ALL's bars filling its count, or beginning with its window, go further back: they are read on to ALL's reach.
+    if (range !== "ALL" || _context?.newestBars
+      || !(result.points.length >= request.outputsize || reachesWindowStart(result, windowStart, request.interval))) return result;
+    return withOlderBars(result, request.interval, calendarMonthsBefore(now, ALL_HISTORY_REACH_MONTHS), firstBarDate(result) ?? windowStart,
+      (from, to) => readCloudHistoryChunk(target.symbol, exchange, request.interval, from, to, _context, ticker));
   }
 
   async getPriceHistoryForResolution(
@@ -834,7 +978,14 @@ export class GloomberbCloudProvider implements AssetDataProvider {
     let answer = await load(knownEnd ?? now);
     const delistedEnd = delistedHistoryEnd(answer.response, listingKey);
     if (delistedEnd ? delistedEnd.getTime() < answer.endDate.getTime() : knownEnd) answer = await load(delistedEnd ?? now);
-    return mapCloudPriceHistory(answer.response, target.symbol, exchange, interval, answer.startDate, answer.endDate, answer.extendedHours);
+    const result = mapCloudPriceHistory(answer.response, target.symbol, exchange, interval, answer.startDate, answer.endDate, answer.extendedHours);
+    if (_context?.newestBars) return result;
+    // Asked as before; more only where the answer was cut: the bar cap, then ALL's bars beginning with its window.
+    const readChunk = (from: Date, to: Date) => readCloudHistoryChunk(target.symbol, exchange, interval, from, to, _context, ticker);
+    const cut = cappedAnswerStart(result, answer.startDate);
+    const whole = cut ? await withOlderBars(result, interval, answer.startDate, cut, readChunk) : result;
+    if (bufferRange !== "ALL" || whole.truncatedBefore || !reachesWindowStart(whole, answer.startDate, interval)) return whole;
+    return withOlderBars(whole, interval, calendarMonthsBefore(answer.endDate, ALL_HISTORY_REACH_MONTHS), answer.startDate, readChunk);
   }
 
   async getDetailedPriceHistory(
@@ -869,19 +1020,29 @@ export class GloomberbCloudProvider implements AssetDataProvider {
       }), historyRecovery ? undefined : _context),
       `Cloud detailed chart history is unavailable for ${ticker}`,
     );
-    return mapCloudPriceHistory(response, target.symbol, exchange, interval, startDate, endDate, extendedHours);
+    const result = mapCloudPriceHistory(response, target.symbol, exchange, interval, startDate, endDate, extendedHours);
+    // Asked as before; a window longer than the bar cap (daily bars from 1990) is read on back from where its answer starts.
+    const cut = historyRecovery || _context?.newestBars ? null : cappedAnswerStart(result, startDate);
+    return cut ? withOlderBars(result, interval, startDate, cut,
+      (from, to) => readCloudHistoryChunk(target.symbol, exchange, interval, from, to, _context, ticker)) : result;
+  }
+
+  /** Trailing history and dated expiries asked with others (`batch`) go out as batch requests while the service reads them so. */
+  batchesReads(method: BatchedReadMethod): boolean {
+    return apiClient.batchesReads(method === "getPriceHistory" ? "history" : "options");
   }
 
   async getOptionsChain(ticker: string, exchange?: string, expirationDate?: number, _context?: MarketDataRequestContext): Promise<OptionsChain> {
     rejectPerpetual(ticker, exchange, "options chains");
     const target = cloudInstrumentTarget(ticker, exchange);
     return withCloudFallback(async () => {
-      const response = await apiClient.getCloudOptionsChain(target.symbol, target.exchange, expirationDate);
+      const adjusted = _context?.adjustedOptions === true;
+      const response = await apiClient.getCloudOptionsChain(target.symbol, target.exchange, expirationDate, { batch: _context?.batch, adjusted });
       const chain = unwrapRequiredCloudResponse(
         response,
         `Cloud options chains are unavailable for ${ticker}`,
       );
-      return mapOptionsChain(chain);
+      return mapOptionsChain(chain, { adjusted });
     }, `Cloud options chains are unavailable for ${ticker}`);
   }
 
@@ -964,6 +1125,8 @@ export function createGloomberbCloudCapabilities(provider = createGloomberbCloud
           return {
             articles: cloudNewsReadArticles(read, query.ticker),
             nextCursor: read.nextCursor ?? null,
+            access: read.access ?? null,
+            companyFrom: readCompanyFrom(read.companyFrom),
           };
         },
         async fetchNews(query: NewsQuery): Promise<NewsArticle[]> {

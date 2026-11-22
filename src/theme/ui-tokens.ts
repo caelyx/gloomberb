@@ -1,5 +1,5 @@
-import { blendHex } from "./color-utils";
-import type { Theme } from "./themes";
+import { blendForContrast, blendHex, contrastRatio, higherContrast } from "./color-utils";
+import { SUBTLE_TEXT_MIN, type Theme } from "./themes";
 
 type Palette = Readonly<Omit<Theme, "name" | "description">>;
 
@@ -53,9 +53,74 @@ function surfaceSunkenColour(palette: Palette): string {
   return palette.bg;
 }
 
+/**
+ * Placeholder text in every field, the command bar's prompt included: the
+ * muted text, which a theme keeps at the subtle-text contrast against the page
+ * and its panels. A field on a surface of its own (the header, the command
+ * bar) passes that surface, and the colour is lifted only as far as it needs
+ * to keep the same contrast there.
+ */
+export function placeholderColour(palette: Palette, surface: string = palette.bg): string {
+  return blendForContrast(
+    palette.textMuted,
+    surface,
+    higherContrast(palette.text, palette.textBright, surface),
+    SUBTLE_TEXT_MIN,
+  );
+}
+
 /** A row or control under the pointer: halfway from the background to the selection. */
 export function hoverColour(palette: Palette): string {
   return blendHex(palette.bg, palette.selected, 0.5);
+}
+
+/**
+ * The least contrast the inactive selection keeps with the page and with a
+ * panel, either of which a list sits on: below it the row reads as a shadow
+ * in a theme whose selection sits close to its background (high contrast,
+ * blue, midnight).
+ */
+export const INACTIVE_SELECTION_MIN = 1.3;
+/** The least contrast any text keeps on the inactive selection, tones and muted text included. */
+export const INACTIVE_SELECTION_TEXT_MIN = 3;
+/** How far from the panel toward the selection the inactive selection starts, steps and stops. */
+const INACTIVE_SELECTION_BLEND = { from: 0.35, step: 0.01, to: 0.6 } as const;
+
+const inactiveSelectionCache = new Map<string, string>();
+
+/**
+ * The chosen row of a list or table whose pane does not have the keyboard:
+ * from a third of the way from the panel to the selection, as far on as it
+ * takes to stand apart from the page and a panel (INACTIVE_SELECTION_MIN),
+ * and never past 0.6, so the row still says where the cursor is without
+ * reading as the one the keys move.
+ */
+export function inactiveSelectionColour(palette: Palette): string {
+  const key = `${palette.panel}|${palette.bg}|${palette.selected}`;
+  const cached = inactiveSelectionCache.get(key);
+  if (cached) return cached;
+  const { from, step, to } = INACTIVE_SELECTION_BLEND;
+  let fill = blendHex(palette.panel, palette.selected, to);
+  for (let ratio = from; ratio < to; ratio = Math.round((ratio + step) * 100) / 100) {
+    const candidate = blendHex(palette.panel, palette.selected, ratio);
+    if (contrastRatio(candidate, palette.bg) >= INACTIVE_SELECTION_MIN && contrastRatio(candidate, palette.panel) >= INACTIVE_SELECTION_MIN) {
+      fill = candidate;
+      break;
+    }
+  }
+  if (inactiveSelectionCache.size > 64) inactiveSelectionCache.clear();
+  inactiveSelectionCache.set(key, fill);
+  return fill;
+}
+
+/**
+ * A row's text colour on the inactive selection: as it is where it reads at
+ * INACTIVE_SELECTION_TEXT_MIN, lifted toward black or white only as far as
+ * it takes where it does not (a muted label, a theme's down tone).
+ */
+export function inactiveSelectionTextColour(color: string, palette: Palette): string {
+  const fill = inactiveSelectionColour(palette);
+  return blendForContrast(color, fill, higherContrast("#000000", "#ffffff", fill), INACTIVE_SELECTION_TEXT_MIN);
 }
 
 /**
@@ -72,11 +137,15 @@ function roleColours(palette: Palette): Array<[string, string]> {
     ["--gloom-link-hover", palette.textBright],
     ["--gloom-error", palette.negative],
     ["--gloom-locked", palette.textDim],
+    ["--gloom-placeholder", placeholderColour(palette)],
   ];
 }
 
+/** A theme's own colours: the derived ones it may leave out (the tones in a selected row) are not variables. */
+type PaletteColour = { [K in keyof Palette]-?: undefined extends Palette[K] ? never : K }[keyof Palette];
+
 /** The palette entries styles.css reads as they are. */
-const PALETTE_VARIABLES: Array<[keyof Palette, string]> = [
+const PALETTE_VARIABLES: Array<[PaletteColour, string]> = [
   ["bg", "--gloom-bg"],
   ["panel", "--gloom-panel"],
   ["border", "--gloom-border"],

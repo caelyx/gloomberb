@@ -4,7 +4,6 @@ import {
   addPaneFloating,
   analyzeFloatingPaneVisibility,
   applyDrop,
-  findPaneLocation,
   floatAtRect,
   getDockResizeTargets,
   gridlockAllPanes,
@@ -14,7 +13,6 @@ import {
   getDockedPaneIds,
   getLeafRect,
   moveFloatingPane,
-  removePane,
   resizeFloatingPaneFromCorner,
   simulateDrop,
 } from "./index";
@@ -209,6 +207,82 @@ describe("pane-manager split-tree drops", () => {
     expect(getLeafRect(next, "sectors:main", BOUNDS)).toEqual({ x: 60, y: 0, width: 60, height: 40 });
   });
 
+  // At 52 columns Tidy made a 4x2 grid of eight panes about eleven columns wide.
+  test("below 80 columns Tidy puts every pane at the full width, in one column of at most two stacks", () => {
+    const ids = Array.from({ length: 8 }, (_, index) => `chat:${index}`);
+    const floating = ids.map((instanceId, index) => ({ instanceId, x: (index % 4) * 13, y: Math.floor(index / 4) * 20, width: 13, height: 20 }));
+    const layout: LayoutConfig = {
+      dockRoot: null, instances: ids.map((instanceId) => createPaneInstance("chat", { instanceId })), floating, detached: [],
+    };
+    const narrow = { x: 0, y: 0, width: 52, height: 40 };
+    const leaves = getDockLeafLayouts(gridlockAllPanes(layout, narrow), narrow);
+    // Reading order: the top row of windows is the upper stack.
+    expect(leaves.map((leaf) => [leaf.stack, leaf.rect.width, leaf.rect.height >= 18])).toEqual([
+      [ids.slice(0, 4), 52, true],
+      [ids.slice(4), 52, true],
+    ]);
+    // Too short for two, one stack holds them all; from 80 columns the grid stays.
+    const short = { x: 0, y: 0, width: 52, height: 20 };
+    expect(getDockLeafLayouts(gridlockAllPanes(layout, short), short).map((leaf) => leaf.stack)).toEqual([ids]);
+    expect(getDockLeafLayouts(gridlockAllPanes(layout, BOUNDS), BOUNDS)).toHaveLength(8);
+    // Tidied again once the terminal is wide, either column is a grid of every pane, in reading order, not two stacks.
+    for (const column of [gridlockAllPanes(layout, narrow), gridlockAllPanes(layout, short)]) {
+      const wide = getDockLeafLayouts(gridlockAllPanes(column, BOUNDS), BOUNDS);
+      expect(wide.map((leaf) => [leaf.instanceId, leaf.stack ?? null])).toEqual(ids.map((id) => [id, null]));
+      expect(new Set(wide.map((leaf) => leaf.rect.y)).size).toBe(2);
+    }
+  });
+
+  // At 80x24 six windows side by side were tidied into 12-column panes ("Main Port›", "WTI Cr...").
+  test("Tidy stacks the panes in one column where its grid would leave a pane under 30 columns", () => {
+    const ids = Array.from({ length: 6 }, (_, index) => `chat:${index}`);
+    const floating = ids.map((instanceId, index) => ({ instanceId, x: index * 13, y: 0, width: 13, height: 24 }));
+    const layout: LayoutConfig = {
+      dockRoot: null, instances: ids.map((instanceId) => createPaneInstance("chat", { instanceId })), floating, detached: [],
+    };
+    const terminal = { x: 0, y: 0, width: 80, height: 24 };
+    expect(getDockLeafLayouts(gridlockAllPanes(layout, terminal), terminal).map((leaf) => [leaf.stack, leaf.rect.width])).toEqual([
+      [ids.slice(0, 3), 80],
+      [ids.slice(3), 80],
+    ]);
+    // Where the grid's panes are 30 columns or more, it stays.
+    const wide = { x: 0, y: 0, width: 180, height: 40 };
+    expect(getDockLeafLayouts(gridlockAllPanes(layout, wide), wide).every((leaf) => !leaf.stack && leaf.rect.width >= 30)).toBe(true);
+  });
+
+  // Five panes in a row at 120 columns, six at 160, eight at 200 and a 14% sidebar were tidied into two stacks.
+  test("Tidy tiles an even grid where the panes' own arrangement leaves one under 30 columns", () => {
+    const tiled = (rects: Array<{ x: number; y: number; width: number; height: number }>, width: number) => {
+      const ids = rects.map((_, index) => `chat:${index}`);
+      const layout: LayoutConfig = {
+        dockRoot: null,
+        instances: ids.map((instanceId) => createPaneInstance("chat", { instanceId })),
+        floating: rects.map((rect, index) => ({ instanceId: ids[index]!, ...rect })),
+        detached: [],
+      };
+      const terminal = { x: 0, y: 0, width, height: 40 };
+      const leaves = getDockLeafLayouts(gridlockAllPanes(layout, terminal), terminal);
+      return { tiles: leaves.length, stacked: leaves.some((leaf) => leaf.stack), narrowest: Math.min(...leaves.map((leaf) => leaf.rect.width)) };
+    };
+    const row = (count: number, width: number) => Array.from({ length: count }, (_, index) => (
+      { x: Math.floor(index * width / count), y: 0, width: Math.floor(width / count), height: 40 }
+    ));
+    for (const [count, width] of [[5, 120], [6, 160], [8, 200], [7, 160]] as const) {
+      const result = tiled(row(count, width), width);
+      expect(result, `${count} at ${width}`).toMatchObject({ tiles: count, stacked: false });
+      expect(result.narrowest, `${count} at ${width}`).toBeGreaterThanOrEqual(30);
+    }
+    // A 28-column sidebar beside six panes at 200 columns.
+    const sidebar = [{ x: 0, y: 0, width: 28, height: 40 }, ...Array.from({ length: 6 }, (_, index) => (
+      { x: 28 + (index % 3) * 57, y: Math.floor(index / 3) * 20, width: 57, height: 20 }
+    ))];
+    const tidied = tiled(sidebar, 200);
+    expect(tidied).toMatchObject({ tiles: 7, stacked: false });
+    expect(tidied.narrowest).toBeGreaterThanOrEqual(30);
+    // Eight panes at 100 columns fit no grid (25-column tiles either way): one column of stacks.
+    expect(tiled(row(8, 100), 100).stacked).toBe(true);
+  });
+
   test("gridlock infers a matching tiled layout from arranged windows", () => {
     const config = createDefaultConfig("/tmp/gloomberb-test");
     let layout: LayoutConfig = {
@@ -307,41 +381,5 @@ describe("pane-manager split-tree drops", () => {
       { path: [1], axis: "vertical", leafBranch: 1 },
       { path: [], axis: "horizontal", leafBranch: 1 },
     ]);
-  });
-});
-
-describe("pane-manager with secondary windows", () => {
-  const leaf = (instanceId: string) => ({ kind: "pane" as const, instanceId });
-  function layout(): LayoutConfig {
-    return {
-      dockRoot: leaf("main"),
-      instances: ["main", "w2-a", "w2-b", "w2-float"].map((instanceId) => createPaneInstance("portfolio-list", { instanceId })),
-      floating: [],
-      detached: [],
-      windows: [{
-        id: "w2",
-        dockRoot: { kind: "split", axis: "horizontal", ratio: 0.5, first: leaf("w2-a"), second: leaf("w2-b") },
-        floating: [{ instanceId: "w2-float", x: 4, y: 4, width: 40, height: 12 }],
-      }],
-    };
-  }
-
-  test("finds a pane in its window", () => {
-    expect(findPaneLocation(layout(), "main")).toEqual({ window: "main", kind: "docked" });
-    expect(findPaneLocation(layout(), "w2-b")).toEqual({ window: "w2", kind: "docked" });
-    expect(findPaneLocation(layout(), "w2-float")).toEqual({ window: "w2", kind: "floating" });
-    expect(findPaneLocation(layout(), "missing")).toBeNull();
-  });
-
-  // Every move starts by taking the pane out of where it was; a pane left behind
-  // in its window would be placed twice and normalisation would keep the window copy.
-  test("moving a window pane into the main window takes it out of the window", () => {
-    const floated = floatAtRect(layout(), "w2-a", { x: 2, y: 2, width: 30, height: 10 });
-    expect(findPaneLocation(floated, "w2-a")).toEqual({ window: "main", kind: "floating" });
-    expect(floated.windows).toEqual([{ id: "w2", dockRoot: leaf("w2-b"), floating: [{ instanceId: "w2-float", x: 4, y: 4, width: 40, height: 12 }] }]);
-
-    const removed = removePane(layout(), "w2-float");
-    expect(removed.instances.some((instance) => instance.instanceId === "w2-float")).toBe(false);
-    expect(removed.windows?.[0]?.floating).toEqual([]);
   });
 });

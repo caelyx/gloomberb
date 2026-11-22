@@ -86,3 +86,13 @@ test("a server with the spread equivalent adds HY's beside its price, and a day 
     expect(frame).toMatch(new RegExp(`iTraxx Crossover .*(${today.slice(0, 5)})?${today.slice(5)} so far`));
   }
 });
+
+test("the CDX and SOVR footers name their source and date the newest row, not the moment the response was put together", async () => {
+  // The response is from Sunday 00:00 UTC; the newest prints are Friday's. The footer reads as `fn SOVR` ends.
+  for (const view of ["index", "sovereign"] as const) {
+    await openedOn(view, {});
+    const footer = tui.frame().split("\n").filter((line) => line.trim()).at(-1)!;
+    expect(footer).toContain("DTCC · Fri 9 Oct 2026");
+    expect(footer).not.toContain("10 Oct");
+  }
+});

@@ -79,6 +79,7 @@ Style with `var(--gloom-…)`, never a number of your own.
 | `--gloom-link`, `--gloom-link-hover` | text, bright text | links |
 | `--gloom-error` | negative | errors |
 | `--gloom-locked` | dim text | the lock of a locked or Pro state |
+| `--gloom-placeholder` | muted text, kept at the subtle-text contrast on its surface | the placeholder of every field, the command bar's prompt included |
 
 Levels step by at least about 15% in size (12, 14, 16, 20) or differ by
 weight and colour. 14 to 16 is 14%, so a reading heading is also bold,
@@ -90,10 +91,10 @@ column under 480px steps every reading level down together (13.2px body).
 | Family | The convention (component) |
 |---|---|
 | Buttons (`Button`, `IconButton`) | Four kinds, one radius (`md`), no shadow. Primary: accent fill, bold. Danger: the same in negative. Secondary: 1px control border, regular. Ghost (`ghost`, `plain`): text that takes the hover fill. Icon: 20×18, hover fill; a tab's close mark and a chart's tool are icon buttons. Height one row (18px), a bar's controls the bar's 20px. A chosen button takes the selection fill. What a settings row does when pressed is a secondary button; its current value is a chip. |
-| Tabs, segmented choices (`Tabs`, `SegmentedControl`, query bar choices) | One look: 12px text, 8px padding, no box and no radius; inactive dim, hover the text colour, active bright and bold on a 2px accent underline. Sub-tabs, the query bar's choices and segmented choices are the same. Title-bar tabs (a pane's primary strip, drawn in its title bar) are the same text and spacing in boxes instead of underlines: the active tab is a box with `md` top corners, open at the bottom, its top and sides the title bar's rule (the accent while the pane is focused), filled with the surface under it so it opens into the pane; an inactive one takes the hover fill in that shape. Their labels sit on the title's centre line. |
-| Chips (`Badge`, ticker chips) | 16px in an 18px row, `sm` radius, 8px padding, a subtle fill, the tone in the text. Regular weight; tickers bold. A chip that is chosen (a filter that is on) is the solid tone with the background colour in its text. A chip is a mark: a word drawn without a fill or a border is text, and a pressable one is a ghost button. |
-| Key caps | 14px tall, caption size, `sm` radius, a 1px ring and a faint fill mixed from the text colour around it. |
-| Fields and selects (`TextField`, `SelectField`, `SelectButton`) | One row tall, sunken fill, 1px control border, `md` radius, 8px padding; focused or open, the accent border (`fieldFrameStyle` for a field a pane frames itself, such as a text area). In a query bar they are its segments. A select in a form is `SelectButton variant="form"`: the label bold above the field, as a text field's. A search strip (`InputSearchBar` `strip`) is the band with the field's text at the inset. A block of code to copy is sunken too, `md` radius, 8 by 12px inside. |
+| Tabs, segmented choices (`Tabs`, `SegmentedControl`, query bar choices) | One look: 12px text, 8px padding, no box and no radius; inactive dim, hover the text colour, active bright and bold on a 2px accent underline. Sub-tabs, the query bar's choices and segmented choices are the same. Title-bar tabs (a pane's primary strip, drawn in its title bar) are the same text and spacing in boxes instead of underlines: the active tab is a box with `md` top corners, open at the bottom, its top and sides the title bar's rule (the accent while the pane is focused), filled with the surface under it and reaching a pixel past the rule so it opens into the pane; an inactive one ends on the rule and takes the hover fill in that shape. Their labels sit on the title's centre line. A strip wider than its pane scrolls and keeps the active tab whole and clear of the fades at its edges. |
+| Chips (`Badge`, ticker chips) | 16px in an 18px row, `sm` radius, 8px padding, a subtle fill, the tone in the text. Regular weight; tickers bold. A label's lowercase letters sit in the middle of the fill, and an icon in front of it centres with them. A chip that is chosen (a filter that is on) is the solid tone with the background colour in its text. A chip is a mark: a word drawn without a fill or a border is text, and a pressable one is a ghost button. |
+| Key caps | 14px tall, caption size, `sm` radius, a 1px ring and a faint fill mixed from the text colour around it. A key named outside a button is a `KeyHint`: a keycap before the whole words, the words `textMuted` and the keycap `textDim`, regular weight, 12px between two. A pane footer's hints, a dialog's (`KeyHints`) and the command bar prompt's keys are all one. A pressable one (a footer hint) brightens both under the pointer, with no fill. The terminal keeps its own forms: a footer's `[a]dd`, not bold, and a dialog's footer line. |
+| Fields and selects (`TextField`, `SelectField`, `SelectButton`) | One row tall, sunken fill, 1px control border, `md` radius, 8px padding, the placeholder in the placeholder colour; focused or open, the accent border (`fieldFrameStyle` for a field a pane frames itself, such as a text area). In a query bar they are its segments. A select in a form is `SelectButton variant="form"`: the label bold above the field, as a text field's. A search strip (`InputSearchBar` `strip`) is the band with the field's text at the inset. A block of code to copy is sunken too, `md` radius, 8 by 12px inside. |
 | Checkbox | 14px, `sm` radius, control border, sunken fill; checked, the accent. |
 | Links (`ExternalLinkText`) | The text around them, underlined; bright under the pointer or focus. |
 | Toolbars (`QueryBar`) | The band: 20px, hairline under it, segments split by hairlines with 8px padding, the first one at the inset. |
@@ -101,15 +102,15 @@ column under 480px steps every reading level down together (13.2px body).
 | Key-value rows (`KeyValueRow`, `StatGrid`, `FieldGrid`) | 18px rows, label dim, value regular or bold; no rule between rows. Grid bands keep their hairline below and between cells. |
 | Section headings (`SectionHeading`) | 12px bold bright in data panes; 16px in readers. |
 | Cards (`Card`, `cardSurfaceStyle`) | Raised surface, 1px hairline, `md` radius, 8px inside; chosen, the accent border. For a unit of content (a quote tile, a flow step, a company to pick), never for rows. A card that belongs to a colour (a relationship's role, a series) takes `accent`: a 2px rule down its left edge and the fill tinted toward it. A card that must be its own positioned box (a diagram node) draws `cardSurfaceStyle` and keeps its own rows. |
-| Quotes (`quoteBlockStyle`) | A quoted passage (a filing, a disclosure): the 2px rule of the colour it belongs to (the accent by default), a faint tint of it, 4 by 12px inside. |
+| Quotes (`quoteBlockStyle`) | A quoted passage (a filing, a disclosure, the question an Ask Gloom answer replies to): the 2px rule of the colour it belongs to (the accent by default), a faint tint of it, 4 by 12px inside. The terminal draws the rule as a heavy line down the first column over the same tint (`terminalAccentTint`), as a chat announcement does. |
 | Tooltips (`TOOLTIP_SURFACE_STYLE`) | What the pointer is over on a chart, map or heat map: the floating surface at its small size, raised fill, control border, `lg` radius, the elevation, 4 by 8px inside, 12px text. It never takes the pointer. A key that belongs to a chart (a legend's) is the same surface without the elevation (`FLAT_SURFACE_STYLE`). |
 | Lists (`ListView`) | Rows 18px, `md` radius, 8px padding, hover fill. The chosen row is filled; a list a dialog's keyboard walks also rings it in the accent (`selection="frame"`, the default), one inside the command bar is filled alone, as the command bar's rows are (`selection="fill"`). |
-| States (`EmptyState`, `PaneStatusBody`, `Spinner`, `Notice`, walls) | At the inset (8px from each edge); the message dim, an error in negative, actions under it. Loading is the one spinner and "Loading …". Locked: the lock in the locked colour, the action bright. An `EmptyState` that finds itself flush with its pane's edge (a tab body with no padding of its own) takes the inset itself, so a pane that already pads it is not padded twice. |
+| States (`EmptyState`, `PaneStatusBody`, `Spinner`, `Notice`, walls) | At the inset (8px from each edge); the message dim, an error in negative, actions under it. Loading is the one spinner and "Loading …". A line among text that is read saying what is happening now (an answer still coming in) takes the same spinner in the text colour (`emphasized`), so it does not pass for the metadata around it. Locked: the lock in the locked colour, the action bright. An `EmptyState` that finds itself flush with its pane's edge (a tab body with no padding of its own) takes the inset itself, so a pane that already pads it is not padded twice. |
 | Pane chrome | Title bar 20px, title 12px bold whatever the focus (focus changes colour, never weight), 8px inset, hairline below (accent when focused); title-bar tabs are boxes on that rule (see Tabs). Footer 20px, 12px, hairline above; hints are ghost buttons: key bright, word dim. Detail back row: the band, Back as its first segment. |
 | Shell | App header and status bar at 12px, theme text roles (no greys of their own); status bar items are ghost buttons. |
 | Dialogs, menus, popovers, toasts, command bar | One floating surface: raised fill, 1px control border, `lg` radius, the elevation shadow; 16px inside a dialog, 4px inside a menu; menu items a row with 4px above and below (26px), `md` radius, hover fill. |
 | Readers (`ArticleReader`, `DetailReader`, Docs, `MarkdownText`) | One column, centred at 66ch of the reading size, the pane's inset on each side, 12px above and 16px below; title 20, headings 16 bold bright (a list's label too), body and lead 14 at line height 1.6, metadata and label and value facts 12. One paragraph gap (0.9em) after every block; a section heading 0.9em of its size above and 0.4em below. Every prose bullet (an article's key facts and lists, markdown and Docs lists) is body text: 14, a dim dot, the text hanging 2ch in, no space between items. The pane chrome check `readers:` holds the three to this. |
-| Chart chrome | Legends and axes 12px dim; a legend over a map or chart sits at the inset. A chart drawn as a stretched SVG puts its labels in HTML over it, so they keep the app's type. Labels a heat map, treemap or map fits to its own shapes are allowed to size themselves. |
+| Chart chrome | Legends and axes 12px dim; a legend over a map or chart sits at the inset. A chart drawn as a stretched SVG puts its labels in HTML over it, so they keep the app's type. Labels a heat map, treemap or map fits to its own shapes are allowed to size themselves. Stacked panels that are a fixed set of scales (a chart you cannot pan) are split by a hairline across the plot and both gutters, and each panel's axis reads in its own unit (`x` on a ratio, `%`, `K`); the chart composer, whose panels the user arranges, has its resize line instead. A time-axis tag on the desktop and the web reads as the axis's end labels do (`Nov 3 2026`). A scatter has values on both axes and names each at its own axis: x at the end of the axis row (`AMD returns (%) →`), y above its values at the right (`NVDA returns (%) ↑`), as Relative Rotation does. |
 
 ### Exceptions
 
@@ -212,21 +213,37 @@ states, WebKit (Linux WebKit crashes on several panes; the local audit
 pictures it), signed-in and Pro panes beyond their walls, and the terminal
 (its own frames, held byte for byte by the terminal tests).
 
+Where a chip's icon and letters sit is measured from their ink, in the font
+in question, not judged from font metrics: `bun run ui:badge-ink` pictures
+the badge specimens (`scenario=badge-ink`) at 2x in Chromium and WebKit, and
+on a Mac in the system WebKit with SF Mono (`--engines wkwebview`), and
+gives each chip's icon, x-height letters and capitals against the centre of
+its fill in device pixels. Half a pixel is the line between centred and not.
+
 ## 1. Anatomy
 
 **App chrome** (the shell's, never a pane's): the header holds the command
 bar prompt, update notices and the market summary; the status bar at the
-bottom holds layout tabs, Tidy Windows, the version chip and the
-`status:widget` slot. A plugin puts a widget there only for app-wide state
+bottom holds layout tabs, Tidy Windows, the connection note (in the warning
+tone, only while the data service gives no answer at all), the `status:widget`
+slot and Feedback. A plugin puts a widget there only for app-wide state
 that matters outside its pane (unread count, account verification). Pane data
-never goes there.
+never goes there. Its right side stays short for someone new: the account
+(`Log in`, or the chat's `@name`), the plan (`◷ 15m delayed` signed out or on
+Free, pressed for the upgrade; `Pro trial 5d` on a trial; nothing on Pro) and
+Feedback. Sign-in and the upgrade never take a chip each. The version and the
+changelog are in Help's Basics tab (About), and so is the desktop download in
+the browser, which the command bar also lists (Download Desktop App).
 
 **Pane chrome**, one per instance:
 
 - Header: the title (pane def, template `createInstance`, or `usePaneTitle`
   for content-derived titles). The only place the pane names itself. Quick
   settings (`quickSettings`, `zap` icon) sit beside it; the `...` menu opens
-  settings, lock, share, close.
+  settings, lock, share, close. In a pane that shows one ticker (see
+  `tickerFollower`) the host draws the ticker in the title as a ghost button
+  with a chevron on the desktop and the web; it opens ticker search for the
+  pane (`layout/ticker-retarget.ts`). The terminal says the key in the footer.
 - Body: content only. Tabs, tables, details, forms, charts.
 - Header zone: the top of the body, in this order and nothing else: the
   `QueryBar` (search, filters, view), then a `StatGrid` of summary figures,
@@ -244,11 +261,12 @@ never goes there.
 |---|---|---|
 | A pane action (add, edit, open source, sync, save search) | Footer hint | `usePaneFooter({ hints })` |
 | Changing status (loading, error, live/delayed, stale, updated 2m ago, saving) | Footer info | `usePaneStatusFooter`, `loadingErrorFooterInfo` |
-| A message about one row of a list (a broker profile, an account, an alert, a plugin, an order, a team member): its state, an action running on it, what that action came to | On that row: a short state in its status cell, the full reason in its detail. Never the footer, never a toast | [Row messages](#row-messages), `useRowNotes`, a settings action's `setRowNote` |
+| A message about one row of a list (a broker profile, an account, an alert, a plugin, an order, a team member, a name a screen could not price): its state, an action running on it, what that action came to | On that row: a short state in its status cell, the full reason in its detail. Never the footer, never a toast | [Row messages](#row-messages), `useRowNotes`, `RowNote`, a settings action's `setRowNote` |
 | Summary figures for the whole pane or an open detail (VWAP, spread, percentile, range) | Header zone, under the query bar | `StatGrid` |
 | A control that changes what the pane shows (range, window, scope, level) | Query bar, never a cycling footer hint | `QueryBar` |
-| Non-blocking data limitation (missing period, fallback dates, partial source) | One amber `⚠` in the footer, `!` or click opens details | `usePaneNoticeFooter` |
-| Data a source delivers late (`15m delayed`, delayed options, a delayed feed) | One yellow clock in the footer, the detail in its tooltip; the terminal draws `◷15m` | `delayedFooterSegment`, `DELAYED_SEGMENT`, `splitDelayedStatus` for a `15m delayed · …` status |
+| Non-blocking data limitation (missing period, fallback dates, partial source) | One amber `⚠` in the footer, `!` or click opens details; once opened it is muted, and a new or changed warning is amber again | `usePaneNoticeFooter` |
+| Data a source delivers late (`15m delayed`, delayed options, a delayed feed) | One yellow clock in the footer, the detail in its tooltip; the terminal, which has no tooltip, draws `◷15m` | `delayedFooterSegment`, `DELAYED_SEGMENT`, `splitDelayedStatus` for a `15m delayed · …` status |
+| A price an account without Pro sees late, signed out included | Said once per screen, never beside every price: the status bar's note (`◷ 15m delayed`) for the app, the footer clock for a pane's prices. A price outside a footer, such as a quote's headline, carries the mark, the clock and `15m` in the dim tone of the meta text around it, only where the note is not on screen: the status bar hidden (presentation mode, `SB`) or a capture of the pane alone. Onboarding's preview, which covers the status bar, always does. The header's market never does, whether or not the status bar is shown. Pro and trial accounts see none of them | `useQuoteDelayFooter`, `DelayedMark` with `useDelayedMarkMinutes` (`useFreeQuoteDelay` where nothing else can say it) |
 | Nothing can render yet (first load, hard failure, no data) | Body, replacing content below the tab strip and query bar, which stay | `PaneStatusBody`, a table's `status` |
 | No ticker, no selection, empty result | Body | `EmptyState` |
 | Refresh failed but last data exists | Keep the data, failure in footer info | `loading={loading && !data}`, `error={!data ? error : null}` |
@@ -290,13 +308,56 @@ the origin of a number. The one count the kit draws is the
   `o` hint opening the current item's URL), `usePaneNoticeFooter` (warnings).
 - Info is what changes. If a segment reads the same on every render of every
   instance, delete it.
+- Static pane captures print warning text instead of an icon that opens a
+  dialog, as one note line (`noteLineParts`): the first note, whole or cut
+  after its last whole word that fits, and how many more there are (`+3
+  more`), which the app opens from the ⚠. A note never cuts a word, and
+  neither does a status a narrow row shortens. Beside a capture's status
+  line the note keeps at least 60% of the row while it needs it; the status
+  line steps down to its shorter forms first, and as a last resort drops
+  whole words from its middle (`Newest filing Fri 6 Nov … (Form 4
+  filings)`). `usePaneNoticeFooter` supplies the notices (`notes`).
+  Warnings remain visible with `--no-status` too. A pane whose capture
+  segments already say what some notices explain at length (what its
+  numbers leave out) passes the rest as `captureNotes`; the dialog still
+  lists every notice.
+- A note is plain words for a reader: never a reason code (`node_limit`,
+  `UPSTREAM_ERROR`), a CLI flag (`--spot`) or a back-end term
+  (`quarantined`). Say what is missing and, where it helps, what to do in
+  the pane. A note about one row is that row's, not the footer's
+  ([Row messages](#row-messages)).
+- The footer sets info segments apart with a muted ` · ` (`PANE_FOOTER_SEPARATOR`),
+  and an icon (`⚠`, `◷15m`) with one column, so two segments never read as one
+  sentence. A pane neither adds its own `·` between segments nor starts one
+  with it; what reads as one fact (`close 2026-09-25`) is one segment. A row
+  too narrow cuts from its end.
 - A short status (up to 24 cells, as much as a warning keeps) is never cut
   against the hints: the hints that no longer fit go under More first. A
   longer one gives way to the hints. This is the footer's own layout
   (`layoutPaneFooterHintRow`); a pane does not shorten its status for it.
-- Hints are actions with keys. `{ key: "a", label: "dd" }` renders `[a]dd`,
-  `{ key: "Ctrl+S", label: "save" }` renders `[Ctrl+S]save`. Every hint is
-  clickable. Hints follow the selection: a different array when a row is
+- Data a failed refresh left answering from its saved copy says so with
+  `savedCopyFooterInfo` (or `savedCopyFooterSegment`): `saved copy from
+  14:37`. The footer draws it first, wherever the pane registers it, and
+  once: the oldest copy when a list and the report it opens each show one.
+  The copy answers only a failure asking again may get past (no connection,
+  a timeout, 408, 429, 5xx, `isTransientFailure`), and a reply saying its
+  source did not answer this time (a board's `unavailable`,
+  `sourceDidNotAnswer`). A permanent reason (a route not served yet, an
+  unsupported symbol or series, sign-in or entitlement) and a reply that
+  fails validation are the pane's error, saved copy or not.
+- Hints are actions with keys. `label` is what the terminal writes after
+  `[key]`: the rest of the word when the key is its first letter
+  (`{ key: "a", label: "dd" }` is `[a]dd`), and a space and the words when it
+  is not (`{ key: "x", label: " remove" }` is `[x] remove`). A key that is
+  not one letter is followed by its words: `{ key: "Ctrl+S", label: "save" }`
+  is `[Ctrl+S]save`, and `[⌃S]save` on a Mac. The desktop and the web draw
+  every hint the same way (`KeyHint`, the one key hint with the dialogs' and
+  the command bar's): the key in a keycap before the whole words (`a` add,
+  `x` remove), the words muted and the keycap a step brighter, nothing bold,
+  brighter under the pointer. `keyHintWords` reads the words from the
+  label; a hint written another way (`{ key: "m", label: "re-arm" }`) needs
+  a `title` or `id` that names it (`title: "Re-arm"`), or it reads `mre-arm`.
+  Every hint is clickable. Hints follow the selection: a different array when a row is
   selected, a detail is open, a tab changes. A hint with no target is omitted
   or `disabled`, never a no-op.
 - A key that only repeats what Enter already does, or that adjusts the
@@ -332,6 +393,11 @@ the origin of a number. The one count the kit draws is the
   lines: a short label, the value, muted `detail` (percentile, date,
   window). Drop sample sizes ("252 obs"), dates the footer already carries,
   and anything the title, the active tab or the selected row shows.
+- A figure that spans its row (a `wide` one, or any in a one-column band)
+  and does not fit one line takes a second, never more: the detail under the
+  value, cut where it has no date, so a date is never what gives way. A pane
+  that sizes the content below by `statGridRows` passes the same `maxLines`
+  to both, the rows that content's least leaves, so a wrap never spills it.
 - Compact controls: `Button compact` with `displayLabel`, `Tabs dense` in
   narrow panes, `KeyValueRow`, `Badge` for a state word.
 - Empty states are one line plus an optional `hint`.
@@ -366,6 +432,21 @@ each is that row's.
 - Only when the row is gone (removed, left the list) is what became of it a
   toast. A failure of the whole pane (its feed is down, it is signed out)
   goes in its footer.
+
+The same holds for what the data says about one row of a list of names
+(a screen, a comparison, a portfolio's holdings): a name the screen could
+not price, a peer whose fundamentals are stale, a holding whose evidence has
+gaps. The row says it in a few words (`no price` in its first column with
+room, `Estimated 3 gaps`, its symbol in the warning colour), and the whole
+reason goes in its detail or under the table while the row is selected
+(DataTableView's and MarketBoardStack's `rowNote`, drawn as `RowNote`). A
+pane that is no table says it where its selection is: a correlation cell's
+symbols under the matrix, a series' limitation above its chart. The
+footer's notes are the pane's: what concerns every row, and names with no
+row of their own (a ticker with no trades in the window). A payload that
+repeats its rows' notes among its own (EXPO's `AAPL: …`) is filtered before
+the footer. CSP, EXPO, RV, VIX, PORT, BI, RRG, BTMM, CBR, VAL, CORR, WEI,
+CAT and PF do this.
 
 `useRowNotes` (`gloomberb/components`) keeps the notes: `setNote(key,
 note)` after an action, `noteFor(row)` in the status cell and the detail.
@@ -409,6 +490,46 @@ so the selected row reads in the selection color without each cell checking
 goes in a cell's `leading` or a column's `headerLeading`: the terminal skips
 it, the text keeps its own selection color, and exports read only the text.
 
+**Moving columns.** Every kit table's columns move. A header dragged
+sideways (past a few pixels on the desktop and the web, two cells in the
+terminal; a click still sorts, on the release) drops its column where the
+accent line shows,
+a `│` in the terminal's header row, and the pane keeps the order in its
+settings (`pane.columnOrder`), saved and synced with the layout. "Move Column…"
+in the pane menu does the same from the keyboard, and "Reset Columns" puts
+the pane's own order back. The columns that name the row stay first: the
+first column, with a narrow mark before it (a status dot, a rank). Exports
+and reports read the columns in the reader's order. A pane does nothing for
+this, except:
+
+- Columns that are one ordered axis or a fixed format keep their order:
+  `columnReorder={false}`. Today that is FA's fiscal periods and ratios,
+  revenue breakdown's quarters, SEAS's months, the FX matrix, OMON's calls and
+  puts around the strike, the option scenario's dates, the rate path's
+  targets, OVDV's grids, reverse DCF's and Kelly's sensitivity grids, 13F's
+  quarterly returns, the world curves' maturities and PERP's depth by
+  distance. A tool's answer in Ask Gloom keeps the tool's columns too: it is
+  read once, not a layout to keep with the pane.
+- A pane whose settings choose and order its columns (an ordered-multi-select,
+  PF's and FUT's Columns) passes them as `columnReorder={{ control }}`, so a
+  drag rewrites that setting and Settings lists the columns as the table
+  shows them. Back in the pane's default order, the setting goes, so columns
+  added to the defaults later still show.
+- `anchored` keeps more leading columns in place (the session mark and
+  symbol in FUT and WEI); `key` separates two tables in one pane that name
+  their rows with the same column but are otherwise unrelated.
+
+**Unavailable table columns.** Check the source before treating an empty column
+as missing coverage: fix a dropped field rather than hiding it. A value waiting
+on an event, such as reported EPS and its basis before earnings, uses
+`DataTableColumn.mayBeBlank`. For structurally unavailable coverage, opt that
+column into `omitWhenEmpty: true`: it leaves the pane only while every data row
+renders a missing value, and returns as soon as any row has one. Zero and N/M
+are values, not missing data. A chronological history with coverage only in
+older reports can use `omitWhenEmpty: "visible"`, so scrolling into those
+reports restores their column. This changes presentation only; JSON reports
+and CSV exports retain the fields and missing values.
+
 **Country flags.** Wherever a row or a field names a country (ECO's country,
 a balance's or a board's country or jurisdiction, a venue's market, an IPO's
 exchange, a filing's country), the desktop and the web lead it with the
@@ -448,26 +569,39 @@ puts a row-size `CompanyLogoMark` in the cell's `leading`, the same
 `LogoMark` tile as a broker's, with the logo Gloom Cloud serves for the
 ticker (`CRYPTO` reads the coin's), on a white plate since logos are drawn for
 a light page (a black coin mark on a clear field would vanish on a dark
-theme). A company with no logo gets its initial on the same tile, so a missing logo moves nothing, and a logo that failed to load
-is not asked for again while the app runs. The logo sits in the name cell, not
+theme). The plate is drawn only behind a logo that has loaded: until then, and
+for a company with no logo or a logo that failed to load, the tile shows the
+initial, so a missing or late logo moves nothing and no row shows a blank white
+square on a dark theme. A logo that failed to load is not asked for again while
+the app runs. The logo sits in the name cell, not
 the ticker's: the ticker column keeps its width and the name gives up the
 tile's room, so no column moves and no row grows. The terminal draws none and
 gets the cell as it was. Lists of people, funds, indices and sectors, and
 columns of securities without a company behind them (options, cash), have no
 logo.
 
+**A ticker column and its name.** A table that lists a company beside its ticker gives the ticker its own fixed column of `TickerBadgeList` chips and lets the name column take the spare width (`flexGrow`), so a name is cut only when the pane is out of room, never beside blank columns. Every row of the ticker column has one look: a chip for each symbol that resolves to a listing the app can look up and open, plain bold text for one it cannot. A number-only listing (`2330`) reads as money, so a source that names the venue passes the listing through `listings` (`{ "2330": "2330:TWSE" }`) and the chip shows the symbol as written and opens the listing; a source that names none passes `null` and gets plain text, never a chip of another look.
+
 **A table set inline.** A short table that sits in a page between prose (keys in Help, a plan comparison) takes `fitRows` with `virtualize={false}`: the terminal gives it its rows, the desktop and the web make it exactly as tall as its header and rows, where a count of rows is short by the taller header bar. Its box takes no height there either.
 
 **The body under a bar.** What sits under a pane's tabs, query bar and figures takes the rest of the pane by flex on the desktop and the web: spread `FILL_REST` (`components/ui/fill.ts`) on its box, and on the pane's own root box, instead of the rows the terminal counts. A chrome bar is taller than a row there, so a body given `height - 1` rows runs past the footer by the difference. Tables, charts and the 3D surface in that box fill it to the footer. `SeriesListDetail` does this for a series list beside its detail. A pane that shows other panes as views under its own bars (Fixed Income) puts each in a box with `data-gloom-role="nested-pane-content"`, and the view's root takes that box the way a pane's root takes the pane.
 
-**Text that may not fit.** One line that can run past its room (a name in a table cell, a heading) is `ClippedText`, or `SectionHeading` with a `width`: the terminal cuts it at a count of cells, the desktop and the web at the box's edge in CSS with an ellipsis. Siblings that must stay whole (a ticker, a kind badge) keep their room and the text gives way. Never pass a string already cut with `truncateToDisplayWidth` to a DOM render. `ClippedText` takes the caller's own terminal cut (`cut={truncateWithEllipsis}`) so the terminal frame stays as it was, a `lead` kept whole before the text, and `wrap` for a message or description the desktop should wrap rather than cut. An optional item that shows only when it fits beside the rest (a ticker after a name) goes in a row with `flexWrap: "wrap"`, one line tall and clipped: the browser moves what does not fit to the hidden line, as the terminal's count of columns dropped it.
+**Text that may not fit.** One line that can run past its room (a name in a table cell, a heading) is `ClippedText`, or `SectionHeading` with a `width`: the terminal cuts it at a count of cells, the desktop and the web at the box's edge in CSS with an ellipsis. Siblings that must stay whole (a ticker, a kind badge) keep their room and the text gives way. Never pass a string already cut with `truncateToDisplayWidth` to a DOM render. `ClippedText` takes the caller's own terminal cut (`cut={truncateWithEllipsis}`) so the terminal frame stays as it was, a `lead` kept whole before the text, `keepEnd` for the end that tells it apart from its neighbours (an undisclosed customer's number or letter: "Cus… 1"), kept whole in both renderers while what comes before it is cut, and `wrap` for a message or description the desktop should wrap rather than cut. An optional item that shows only when it fits beside the rest (a ticker after a name) goes in a row with `flexWrap: "wrap"`, one line tall and clipped: the browser moves what does not fit to the hidden line, as the terminal's count of columns dropped it.
+
+A table cell's optional `note` adds muted context after its `text`, such as a reference contract and price. It appears whole only when both fit; otherwise the primary text keeps its room and normal ellipsis. Use it through `DataTableCell` or `TickerTableCell`, so the terminal, desktop and web share the same behavior. It does not change the exported cell value.
+
+A cell's optional `keepEnd` names the end of its `text` that a column too narrow for it keeps whole, such as a contract's month: the cut shortens what comes before it, so the FUT board reads "Brent Crude Oil Last Day… Jan 2027" rather than losing the month. The terminal, the desktop and the web cut it that way; exports and reports read the whole `text`.
+
+**Figures in a column.** A right-aligned column is a column of figures, and its compact numbers keep their decimals so they line up: 12.00M over 10.73M, 10.0k over 12.5k. `DataTable` formats every right-aligned cell inside `inFigureColumn`, where `formatCompact` keeps them unless the caller passes `fixedDecimals: false` (a bracket label such as $1k-15k). Prose, figures above the table and labels keep the short 12M. A cell built before the table renders it (a row of strings) passes `fixedDecimals: true` itself. A column measured to the short figures keeps the short one wherever the decimals would not fit, rather than cut it; measure in `inFigureColumn` to give it the room.
 
 **Against the right edge.** On the desktop and the web, whatever sits against a row's right edge (a track between two figures, a hint at the end of the footer, a figure at the end of a line) is placed by CSS in the box the row gives it. A box sized in cells keeps the cells its pane last rendered at until the next catch-up, so its right edge stays where the pane's was, past the new edge or short of it, for up to a tenth of a second of a resize, and the row jumps then. `RangeTrack` takes `fill` for a track that takes the room of its box; short pairs that wrap (a return strip) are a row with `flexWrap: "wrap"`, not rows packed by a count of cells. `check:pane-chrome` steps jump a pane's edge in one move and fail on a piece that is not where CSS puts it on the first frame.
 
 **Table + detail.** `DataTableStackView` is the "list, then open one" shape:
 Enter or click calls `onActivate`, the pane sets the open item, the stack
 shows `← Back` plus `detailTitle` and the detail. Esc, Backspace, the mouse
-back button or clicking Back pops it. Rules:
+back button or clicking Back pops it. The title is one line at any width: a
+long one ends in an ellipsis (the desktop's tooltip holds the whole title), so
+write it to lead with what names the item. Rules:
 
 - The open item is keyed by a stable id (symbol + date, accession, id),
   never an index, and lives in `usePluginPaneState` with the selected row so
@@ -537,8 +671,31 @@ is named in the table's words (`Short %`, `US HY OAS`, `5Y spread`) and shows
 its value, the latest one until the cursor moves. Units live in the axis
 labels. No loose title line above a chart, no `yAxisLabel` row, no unnamed
 single line. A chart that follows the selected row names that row. When the
+legend compacts multi-company series of the same metric, the metric stays
+once at its start (`Revenue`, then each company's value), never only in
+tooltips. Different metrics stay whole in their own entries instead of
+sharing a caption. `ResolvedSeries.legendContext` supplies that context;
+security series carry their field's label through resolution, including
+unavailable and hidden series. Custom labels are left as authored. A wide
+legend keeps the full names. Compact company names use the available row
+width together: keep every company name when they all fit; otherwise use
+clean tickers for all of them, never a mix of names and ticker ellipses.
+If even the wrapped legend cannot fit every series, its last scrolling line
+keeps the total series count visible; no drawn series disappears silently.
+Static captures give the legend the space of its hidden add-series control.
+Values, units and the shared metric stay visible. When the
 legend runs short of width, a curve's caption gives way before any series
-name does.
+name does. A series read against the right axis of a panel whose other
+series read against the left says so after its value, dim: `51.57 USD / troy
+oz -2.13% (right axis)`; names lose words before the note goes, and it gives
+way, to the tooltip, only where every name is down to its first word. In G, prices in one unit an order of magnitude apart (silver beside
+gold) take an axis each: the smaller goes right, with what is drawn in its
+price. Each is read at the median of its loaded bars, and the split is kept
+for that set of prices, so the axes never trade places on a new high or a
+pan.
+
+An open-ended date window ends at its latest observation, not the viewer's
+clock. An explicit end date or a panned viewport keeps its requested bounds.
 
 **The chart earns its rows.** It shows what the table cannot: a trend, a
 curve's shape, how a level moved (look-back curves, trails). The table adds
@@ -564,15 +721,18 @@ the same way:
 
 | Pane body | Figures | Band | Table |
 |---|---|---|---|
-| Room for the chart (six rows: legend, four plot rows, axis) and the table's header plus four rows | up to a quarter of the body, trimmed from the end | the chart, 40% of what the figures leave, or all the rows a short table does not need | the rest; all its rows when they fit |
-| Less room, but the whole table fits with four rows to spare | up to a quarter of the body | a compact chart in the spare rows | all its rows |
-| Too short for either | one row | one row: `● label` sparkline value | the rest |
-| Shorter still, or narrower than 24 columns | one row | none | the rest |
+| Room for the chart (six rows: legend, four plot rows, axis) and the table's header plus four rows | required figures, optional figures up to a quarter of the body | the chart, 40% of what the figures leave, or all the rows a short table does not need | the rest; all its rows when they fit |
+| Less room, but the whole table fits with four rows to spare | required figures first | a compact chart in the spare rows | all its rows |
+| Too short for either | required figures before optional ones | one row: `● label` sparkline value | the rest |
+| Shorter still, or narrower than 24 columns | figures that fit above the table's header and one row | none | the rest |
 
-- The table keeps its header and four rows (all of them when it has fewer)
-  at every size; the chart gives way first, then the second row of figures.
-- Figures are listed most important first; the ones at the end go when rows
-  run short, and the strip leaves out what the remaining figures already say.
+- Figures are optional by default. Only figures marked `essential: true` are
+  required: they take room from the chart before the table, which keeps its
+  header and at least one row. Optional figures never push the table below its
+  header and four rows.
+- Figures are listed most important first. When even required figures cannot fit,
+  captures report the missing figures and do not certify the picture complete.
+  The strip leaves out what the remaining figures already say.
 - A short table never leaves a blank band: the chart grows into its spare rows.
 - Custom charts (curves, scatters) pass their own `minRows` and a `strip`;
   content with a natural height (a few bars) passes `maxRows` and the table
@@ -634,7 +794,15 @@ header, with the detail's height.
 - A strip inside content that already has a title-bar strip (a Ticker
   Research tab, a stack detail) becomes a `QueryBar` view (`usePaneTabs`
   with `queryBarWidth`) or inline filter on the desktop; the terminal keeps
-  its `Tabs` row.
+  its `Tabs` row. Right under the title bar (a research tab's views, a Fixed
+  Income section's) the view starts its bar, where the terminal's row
+  starts; a level deeper (Holders' Table and Chart under Ownership's views)
+  it is the view's own switch and sits at the right. A stack detail takes
+  the pane's place (`NestedPaneTabs detail`), so its strip is the view's
+  own, and one under it is that strip's choices. `{` and `}` walk the
+  choices of the outermost focused strip inside `NestedPaneTabs`, either
+  kind; the pane adds nothing. Their `[{}]view` hint joins the pane's own
+  hints and never adds a footer row of its own.
 - The active tab is `usePluginPaneState`. A user-configurable tab set is a
   pane setting, with `hideTabs` for panes locked to one view.
 - Content, one of two ways: one body reloaded per tab when tabs are views
@@ -657,8 +825,19 @@ header, with the detail's height.
   A `select` filter takes a `defaultValue` when it narrows (the chip shows a
   reset while it differs); omit it when it picks what is shown. `inline` for
   four or fewer short exclusive options, `multi`, `toggle`, `text` for a second
-  field. One terminal row; on the desktop it scrolls sideways when narrow.
-  Status never goes in the bar; units and as-of context may use `meta`.
+  field. One terminal row. Status never goes in the bar. The date the data is
+  as of goes in `asOf`, its own segment that never shrinks; other context
+  (units, a growth basis) goes in `meta`, which gives way first. On the
+  desktop, when the controls no longer fit, the bar gives way in one order
+  and no control is ever drawn over another: inline filters drop their label
+  ("Range"), toggles take their `short` label, the `view` folds into its menu
+  chip, then inline filters fold into theirs (bringing the view back while it
+  fits). Only a bar too narrow even for that scrolls sideways. A long list
+  that is meant to run past the edge (an option chain's expiries) sets
+  `scrolls` and is a strip that scrolls by itself instead of folding; it keeps
+  its label and its chosen choice whole, and the rest of the bar gives way
+  before it narrows past that. Name the `view` with `label` ("Interval"), the
+  name a screen reader and its folded menu give it.
   The inline filter or view that picks a chart's range sets `chartRange`:
   choosing the selected range again sends the pane's charts back to it, as `0`
   does, so every chart's range strip behaves the same. Bind the range's number
@@ -673,7 +852,7 @@ header, with the detail's height.
 - Calculators and sizers: mode switches in the `QueryBar` (inline filters),
   inputs in a `FieldGrid`. Icon-only actions are `IconButton`s from the shared
   icon set. A long strip of choices above content (expiries, chart ranges) is
-  an inline filter in the bar, not a raw `Tabs` row; `Tabs` stays for a
+  an inline filter in the bar (`scrolls` for expiries), not a raw `Tabs` row; `Tabs` stays for a
   pane's primary strip and for section switches inside content.
 - On the desktop, pane headers, query bars, detail bars and table header rows
   share one chrome height (`chromeRowPx()`, `--chrome-h`). Tables and details
@@ -732,6 +911,17 @@ header, with the detail's height.
   `gloomberb/quotes` and `LIVE_STREAMING_QUICK_SETTING`. Fetching lives in
   `client.ts`, projection in `view.ts`/`model.ts`, shared with the `headless`
   definition.
+- Docking, floating, stacking or fullscreening a pane draws it in another
+  place in the tree, so it mounts again. Its first frame after must show what
+  the last one did, with the same selection, open item, draft and scroll
+  target. What the user chose belongs in pane state (`usePluginPaneState`,
+  `usePaneSettingValue`), never component state. An effect that clears or
+  moves the selection acts on a loaded list only: rows that have not come in
+  yet (they load after every mount) say nothing about it. What cannot be
+  saved with the pane or travel in a shared layout (a live conversation with
+  an answer coming in, a transcript, a draft) goes in `usePaneSession` or
+  `usePaneSessionState` (`src/state/pane-session.ts`): in memory, per pane,
+  released a moment after the pane closes.
 - Live data: gate timers, polls and streams on `usePaneVisible()` (app
   visible and pane not covered), not on focus; `useAppVisible()` is for work
   that must continue while the pane is covered. A covered pane keeps its
@@ -750,7 +940,7 @@ header, with the detail's height.
   `preventDefault()` when it acts). Reserved: `j`/`k`/arrows move, Enter
   opens, Esc/Backspace back, `r` refresh, `Shift+R` refresh all, `!`
   warnings, `o` open source, `/` search, `.` pane menu, Tab/Shift+Tab next
-  pane or field, `h`/`l` tabs, `<`/`>` the width of a resizable sidebar, `?` help, F1 the pane's help card, `` ` `` ticker search, `q` quit (terminal),
+  pane or field, Ctrl+PageDown/Ctrl+PageUp a stack's tabs, `h`/`l` tabs, `{`/`}` a nested strip's views, `<`/`>` the width of a resizable sidebar, `?` help, F1 the pane's help card, `` ` `` ticker search (changes the focused pane's ticker), `q` quit (terminal),
   `u` restart into a downloaded update or retry a failed one, `$` Pro upgrade, Ctrl+P command bar. `q`, `u`, `r`,
   `Shift+R`, `?` and `` ` `` reach the app before any pane. Table keys go
   through `onRootKeyDown` and `onDetailKeyDown` (return `true` when handled);
@@ -765,11 +955,41 @@ header, with the detail's height.
   keys, `j`/`k`, `+`/`-`), and a footer hint repeats only for those; a pane
   key that opens a dialog, writes the clipboard, downloads or sends ignores
   `event.repeat` itself.
-- Esc Esc closes the focused pane, and only an Esc nobody consumed counts
-  as the first press. Consume Esc only when it backs out of something (a
-  detail, a menu, a selection, a draft); with nothing to back out of, let it
-  through. An Esc that only leaves an empty text field still counts: call
-  `countEscapeTowardClose(event)` and consume it.
+- Esc Esc closes the focused pane, and focus moves to the next floating
+  pane. Any Esc counts as the first press, whatever the pane did with it
+  (back out of a detail, clear a selection, leave a chart), so a quick
+  second Esc closes a pane that could still go back. Three never count: an
+  Esc in a text field or while the pane is editing, unless it leaves an
+  empty field (call `countEscapeTowardClose(event)`, as the chat composer
+  does) and so no typed draft is lost; an Esc while a menu, dialog or
+  overlay is open, and one that closes a menu or popover of the pane's own
+  (call `keepEscapeFromClosing(event)`); and a held Esc, which closes one
+  pane. Closing pane after pane has no wait: the desktop app and the web
+  tell a held key from separate presses with `event.repeat`, and a terminal
+  that cannot say ignores only the Esc that follows another within 110 ms
+  right after a close, which is a held key's repeat. A scoped `before` handler (a form,
+  key capture) runs ahead of the counting, so its Esc never counts. An
+  unscoped `before` handler can run ahead of it too (a pane restored at
+  launch), so one that goes back calls `countEscapeTowardClose(event)`
+  itself.
+- One Esc closes a focused floating window, as it does a dialog, when
+  nothing took it: no handler called `preventDefault()` or
+  `stopPropagation()`, and no `keepEscapeFromClosing(event)`. Focus goes to
+  the next floating window, or back where it was. A locked window stays, and
+  the Esc that follows at a double press's pace closes nothing more, so Esc
+  Esc still closes one window. A pane keeps its Esc by handling it: backing
+  out of a detail, closing its own menu (then also
+  `keepEscapeFromClosing(event)`, so it does not count toward Esc Esc),
+  leaving a field.
+- No Esc, one or two, closes a pane that holds work Esc would throw away: a
+  draft that lives only as long as the pane, an answer still coming in. The
+  pane says so with `usePaneUnsentWork(holds)` (Ask Gloom passes its draft
+  and its running answer); Ctrl+W, the close button and the pane menu still
+  close it. A draft saved elsewhere (the chat composer's, saved with its
+  channel), a note saved when editing ends and a form that takes Esc as
+  Cancel have nothing to report. `countEscapeTowardClose`,
+  `keepEscapeFromClosing` and `usePaneUnsentWork` come from
+  `gloomberb/react`.
 - The pane menu (`.`, Shift+F10, the `...` button) is where the keyboard
   finds everything: it lists the footer hints with their keys, what kit
   controls add (table sort, query-bar filters, tab add/close/move, empty-state
@@ -778,7 +998,9 @@ header, with the detail's height.
   hint's `title` when its key is not the action's first letter. A pane that
   shows one ticker sets `tickerFollower` on its `PaneDef`, and the menu gains
   "Link to" each visible list, scanner, or other single-ticker pane and "Unlink from" the one it follows;
-  the title then reads `OPX NVDA  ⧉ Linked to Watchlist`. Such a pane changes
+  the title then reads `OPX NVDA  ⧉ Linked to Watchlist`, and once the link is
+  cut (an unlink, the list closing) `OPX NVDA  ⧉ Unlinked`, the host's only
+  link-state marks. Such a pane changes
   ticker while mounted, so it keys its view by symbol and keeps saved
   per-ticker choices (expiry, strike) per symbol.
 - One component renders in the terminal, the desktop app and the web. Import
@@ -856,7 +1078,7 @@ template, or add it with its reason.
 8. Forms use kit fields, one Save per form at its bottom, Enter/Esc, busy and result in the footer, destructive actions confirmed. What concerns one row of a list is said on that row ([Row messages](#row-messages)).
 9. Per-instance configuration is a pane setting; important toggles are `quickSettings`.
 10. Methodology and usage text is in `docs/`.
-11. Data panes have a `headless` definition; fetching is in `client.ts`. It declares `freshness` (source, status, schedule) wherever "Gloom Cloud" and the status read from the rows would be wrong, so the report's source, as-of and status line is true.
+11. Data panes have a `headless` definition; fetching is in `client.ts`. It declares `freshness` (source, status, schedule) wherever "Gloom Cloud" and the status read from the rows would be wrong, so the report's source, as-of and status line is true. A pane of the user's own state (notes, connections, documentation, an account) adds `local: true` to its `reportFreshness`: a `gloom shot` of it draws no status line, since it has no market or feed to date, and a capture of any pane with nothing loaded (a sign-in wall, an empty state) draws none either.
 12. No `@opentui`, Electrobun or DOM imports; no cell-drawn chrome on the desktop.
 13. A missing repeated pattern went into the kit with its callers migrated, not into the pane.
 14. On the desktop and the web nothing is sized in cells: boxes fill with flex, percentages or CSS units, text wraps in CSS at the width it sits in (a reading measure is a CSS `max-width` in `ch`), and sizes are read from the laid-out page. Nothing ends in a dead band above the footer or a gap at the right edge. `bun run check:pane-layout` measures every function; `src/architecture/dom-cell-metrics.test.ts` keeps cell metrics out of DOM-only code, and its allowlist says for every file why the uses left stay (a shared API that speaks cells to every renderer, or a size the terminal shares by design).

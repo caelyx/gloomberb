@@ -9,6 +9,7 @@ import type {
 import type { TickerRecord } from "../../../types/ticker";
 import type { Quote } from "../../../types/financials";
 import { formatNumber, formatPercentRaw } from "../../../utils/format";
+import { displayTickerKey } from "../../../utils/exchanges";
 import {
   collectionQuoteHeadline,
   dayMoveLine,
@@ -20,22 +21,26 @@ import {
   listingLabel,
   loadCollectionQuotes,
   holdsFutures,
+  marketsStillTrading,
   portfolioDayMove,
+  valuationBasisText,
   valuationTimeText,
   valuePortfolioAllocation,
   valuePortfolioPositions,
   costAtTodaysRateNotes,
+  unpricedCashNote,
   type CollectionMatch,
   type PortfolioValuation,
 } from "./cli/render";
-import { valuationBasisLabel, type PortfolioValuationBasis } from "../../../portfolio/valuation-basis";
+import type { PortfolioValuationBasis } from "../../../portfolio/valuation-basis";
 import { futuresQuantityText, isFuturesTicker } from "../../../portfolio/futures-positions";
 import { dailyFuturesHistory, loadPortfolioFuturesTerms } from "../../../portfolio/futures-terms";
 import { loadPurchaseDateCostFx } from "../../../portfolio/cost-fx";
-import { EXTENDED_SESSION_LABELS, quoteHeadlineTime, type ExtendedSession } from "../../../market-data/market/status";
+import { EXTENDED_SESSION_LABELS, getCompletedRegularSessionDisplay, quoteHeadlineTime, type ExtendedSession } from "../../../market-data/market/status";
 import {
   BROKER_ACCOUNT_MISSING_NOTE,
   CASH_SYMBOL,
+  cashLineLabel,
   describeTargetSum,
   formatAllocationDrift,
   formatAllocationWeight,
@@ -50,6 +55,15 @@ import { importedFromText } from "./imported-from";
 import { describeCollections } from "../../../portfolio/collection-name";
 import { currentListingName } from "../../../tickers/listing-name";
 import { REPORT_ROWS } from "../shared/headless-options";
+import { readPriceWindow, type PriceWindow } from "../../../utils/price-window";
+import { loadPeriodPnl, periodBasisText, periodBoughtText, periodCurrencyParts, periodFxLabel, periodUnpricedText } from "./period-pnl";
+
+/** An extended print without a known regular close cannot supply a regular-session change. */
+function regularChangeFields(quote: Quote | undefined, change: unknown) {
+  const known = quote && (!quote.marketState || quote.marketState === "REGULAR" || getCompletedRegularSessionDisplay(quote));
+  const value = known && typeof change === "number" && Number.isFinite(change) ? change : null;
+  return { changePercent: value, changeBasis: value == null ? null : "regular-session" };
+}
 
 const DEFAULT_ROW_LIMIT = 50;
 const MAX_ROW_LIMIT = 200;
@@ -92,11 +106,19 @@ const POSITION_COLUMNS: HeadlessPaneColumn[] = [
   { key: "avgCost", header: "Avg Cost", align: "right", format: unitMoney("positionCurrency"), description: "Per unit, in the position's currency." },
   { key: "price", header: "Last", align: "right", format: unitMoney("priceCurrency"), description: "In the quote's currency." },
   { key: "priceCurrency", header: "Ccy" },
-  { key: "changePercent", header: "Chg", align: "right", format: percent },
+  { key: "changePercent", header: "Regular %", align: "right", format: percent },
   { key: "marketValue", header: "Mkt Val", align: "right", format: wholeAmount, description: "In the portfolio's currency; negative for shorts." },
   { key: "unrealizedPnl", header: "P&L", align: "right", format: amount, description: "Unrealized, in the portfolio's currency." },
   { key: "weight", header: "Weight", align: "right", format: weight, description: "Percent of the total value, cash included; unpriced holdings are left out." },
 ];
+
+/** Columns whose amounts are in the portfolio's currency, whatever the listing's. */
+const BOOK_CURRENCY_KEYS: ReadonlySet<string> = new Set(["marketValue", "unrealizedPnl", "tradeValue", "pnl"]);
+
+/** `columns` with the portfolio's currency in the header of each column in it: Mkt Val (CAD) beside a USD Last. */
+function withBookCurrency(columns: HeadlessPaneColumn[], currency: string): HeadlessPaneColumn[] {
+  return columns.map((column) => BOOK_CURRENCY_KEYS.has(column.key) ? { ...column, header: `${column.header} (${currency})` } : column);
+}
 
 /** The weight of a book that holds a short: a share of its gross exposure. */
 const GROSS_WEIGHT_DESCRIPTION = "Percent of gross exposure, longs plus shorts at their absolute value, as the book holds a short; negative for a short, cash and unpriced holdings left out.";
@@ -106,7 +128,8 @@ const VALUATION_TIME_COLUMN: HeadlessPaneColumn = {
   key: "valuationAsOf",
   header: "As of (UTC)",
   // Exports keep the ISO time.
-  textFormat: (value, row) => valuationTimeText(value, undefined, row.valuationPriceKind === "settle" ? "settle" : undefined),
+  textFormat: (value, row) => valuationTimeText(value, undefined,
+    row.valuationPriceKind === "settle" || row.valuationPriceKind === "nominal" ? row.valuationPriceKind : undefined),
   shrink: false,
   description: "When the price the row is valued at is from: its print, or the regular close with --close (a future's settlement).",
 };
@@ -145,7 +168,7 @@ const WATCHLIST_COLUMNS: HeadlessPaneColumn[] = [
   { key: "exchange", header: "Exchange" },
   { key: "price", header: "Last", align: "right" },
   { key: "priceCurrency", header: "Ccy" },
-  { key: "changePercent", header: "Chg", align: "right", format: percent },
+  { key: "changePercent", header: "Regular %", align: "right", format: percent },
 ];
 
 /**
@@ -199,7 +222,7 @@ function resolveTarget(rawArgument: string, ctx: HeadlessPaneContext): Collectio
     if (watchlist) return { kind: "watchlist", id: watchlist.id, name: watchlist.name };
     throw new Error("No portfolios or watchlists are set up.");
   }
-  const match = findCollection(config, raw);
+  const match = findCollection(config, raw, { prefix: true });
   if (match) return match;
   const collections = [...config.portfolios, ...config.watchlists];
   throw new Error(
@@ -240,23 +263,40 @@ function unavailableFigureErrors(
 const POSITION_LINE_KEYS = new Set(["symbol", "shares", "marketValue", "weight", "targetWeight", "drift", "tradeShares", "tradeValue"]);
 
 /**
- * The text report of a ticker held in several lots. Each lot weighs by its own
- * value, and a line under its lots gives the whole position: its shares, value,
- * weight, target, drift and trade, which no single lot owns. Null when no
- * ticker has several lots, so the report is the rows as they are. JSON and CSV
- * keep one row per lot.
+ * The text report of a ticker held in several lots, or of cash held in
+ * several currencies. Each lot weighs by its own value, and a line under its
+ * lots gives the whole position: its shares, value, weight, target, drift and
+ * trade, which no single lot owns. Each currency's cash (`CASH HKD`) weighs by
+ * its own value too, and the `CASH` line under them is the whole cash line,
+ * with its target. Null when there is neither, so the report is the rows as
+ * they are. JSON and CSV keep one row per lot and per currency.
  */
 function withPositionLines(
   rows: readonly HeadlessPaneRow[],
   columns: HeadlessPaneColumn[],
   positions: ReadonlyMap<string, PortfolioAllocation["rows"][number]>,
+  cash: PortfolioAllocation["cash"],
 ): { rows: HeadlessPaneRow[]; columns: HeadlessPaneColumn[] } | null {
   const lotted = (row: HeadlessPaneRow): row is HeadlessPaneRow & { lots: number } => typeof row.lots === "number";
-  if (!rows.some(lotted)) return null;
+  const cashPart = (row: HeadlessPaneRow): row is HeadlessPaneRow & { balances: number } => typeof row.balances === "number";
+  if (!rows.some(lotted) && !rows.some(cashPart)) return null;
   const lastLot = new Map<string, number>();
   rows.forEach((row, index) => { if (lotted(row)) lastLot.set(String(row.symbol), index); });
+  const lastCash = rows.findLastIndex(cashPart);
+  // What a line under several rows is called: AAPL (2 lots), or CASH under its currencies.
+  const lineLabel = (row: HeadlessPaneRow) => typeof row.positionLots === "number" ? `(${row.positionLots} lots)` : null;
+  const isLine = (row: HeadlessPaneRow) => typeof row.positionLots === "number" || row.cashLine === true;
   return {
     rows: rows.flatMap((row, index): HeadlessPaneRow[] => {
+      if (cashPart(row)) {
+        const part = { ...row, cashLabel: cashLineLabel(String(row.priceCurrency ?? ""), "", true), weight: row.balanceWeight,
+          targetWeight: null, drift: null, tradeShares: null, tradeValue: null };
+        if (!cash || index !== lastCash) return [part];
+        return [part, {
+          cashLine: true, symbol: CASH_SYMBOL, marketValue: cash.value, weight: cash.weight, targetWeight: cash.targetWeight,
+          drift: cash.drift, tradeShares: null, tradeValue: cash.tradeValue,
+        }];
+      }
       if (!lotted(row)) return [row];
       const symbol = String(row.symbol);
       const lot = { ...row, weight: row.lotWeight, targetWeight: null, drift: null, tradeShares: null, tradeValue: null };
@@ -271,9 +311,12 @@ function withPositionLines(
     columns: columns.map((column) => {
       const text = (value: unknown, row: HeadlessPaneRow) => (column.textFormat ?? column.format)?.(value, row) ?? textOf(value) ?? formatNumber(undefined);
       if (column.key === "symbol") {
-        return { ...column, textFormat: (value, row) => typeof row.positionLots === "number" ? `${text(value, row)} (${row.positionLots} lots)` : text(value, row) };
+        return { ...column, textFormat: (value, row) => typeof row.cashLabel === "string" ? row.cashLabel
+          : lineLabel(row) ? `${text(value, row)} ${lineLabel(row)}` : text(value, row) };
       }
-      return POSITION_LINE_KEYS.has(column.key) ? column : { ...column, textFormat: (value, row) => typeof row.positionLots === "number" ? "" : text(value, row) };
+      // The cash line counts no units: its quantity is blank, as everything else it does not fill in is.
+      const blank = (row: HeadlessPaneRow) => isLine(row) && (!POSITION_LINE_KEYS.has(column.key) || (row.cashLine === true && column.key === "shares"));
+      return { ...column, textFormat: (value, row) => blank(row) ? "" : text(value, row) };
     }),
   };
 }
@@ -310,6 +353,7 @@ async function portfolioHoldings(
     basis,
     futures,
     purchaseDateFx,
+    previousRate: toBase.previousRate,
   });
   const { allocation, cash } = await valuePortfolioAllocation({ valuation, portfolio: resolved.portfolio, account: resolved.account, toBase });
   ctx.signal.throwIfAborted();
@@ -357,7 +401,8 @@ async function portfolioHoldings(
         // Last and Chg are the regular session; market value and P&L are at `valuationPrice`.
         price: finite(row.quotePrice),
         priceCurrency: row.quoteCurrency ?? null,
-        changePercent: finite(headline?.changePercent),
+        ...regularChangeFields(quotes.get(ticker.metadata.ticker), headline?.changePercent),
+        extendedChangeBasis: extended ? "from-regular-close" : null,
         ...extendedQuoteFields(extended),
         marketValue,
         unrealizedPnl: finite(row.unrealizedPnl),
@@ -374,19 +419,41 @@ async function portfolioHoldings(
       };
     });
   const shown: HeadlessPaneRow[] = rows.slice(0, limit);
-  // The cash line follows the positions, whatever the limit.
+  // The cash line follows the positions, whatever the limit. Cash in several currencies is a row per currency, the whole
+  // line's weight, target, drift and trade on the first as a ticker's lots carry their position's; `balanceWeight` is each
+  // currency's own share.
   if (allocation.cash) {
-    shown.push({
-      symbol: CASH_SYMBOL,
-      name: cash?.source === "broker" ? "Cash (broker account)" : "Cash",
-      priceCurrency: cash?.currency ?? null,
-      marketValue: finite(allocation.cash.value),
-      weight: allocation.cash.weight,
-      targetWeight: allocation.cash.targetWeight,
-      drift: allocation.cash.drift,
-      tradeShares: null,
-      tradeValue: allocation.cash.tradeValue,
-    });
+    const name = cash?.source === "broker" ? "Cash (broker account)" : "Cash";
+    const line = allocation.cash;
+    const balances = cash && cash.balances.length > 1 ? cash.balances : null;
+    if (balances) {
+      balances.forEach((balance, index) => shown.push({
+        symbol: CASH_SYMBOL,
+        name,
+        priceCurrency: balance.currency,
+        cashAmount: balance.amount,
+        marketValue: finite(balance.value),
+        weight: index === 0 ? line.weight : null,
+        targetWeight: index === 0 ? line.targetWeight : null,
+        drift: index === 0 ? line.drift : null,
+        tradeShares: null,
+        tradeValue: index === 0 ? line.tradeValue : null,
+        balances: balances.length,
+        balanceWeight: balance.weight,
+      }));
+    } else {
+      shown.push({
+        symbol: CASH_SYMBOL,
+        name,
+        priceCurrency: cash?.currency ?? null,
+        marketValue: finite(line.value),
+        weight: line.weight,
+        targetWeight: line.targetWeight,
+        drift: line.drift,
+        tradeShares: null,
+        tradeValue: line.tradeValue,
+      });
+    }
   }
   const errors = unavailableFigureErrors(valuation);
   const broker = !!(target.portfolio.brokerId || target.portfolio.brokerInstanceId);
@@ -397,7 +464,7 @@ async function portfolioHoldings(
   const notices = [
     ...(imported ? [imported] : []),
     // At the close, Mkt Val is Last times the shares; the day's move from the close before gets its own line.
-    ...(basis === "regular-close" ? [dayMoveLine(dayMove, currency)] : []),
+    ...(basis === "regular-close" ? [dayMoveLine(dayMove, currency, undefined, undefined, { cashExcluded: !!allocation.cash })] : []),
     ...(held.length > 0 ? [exposureLine(valuation.exposure, currency)] : []),
     ...[weightBasisLine(allocation, currency)].filter((line): line is string => !!line),
     ...(rows.length > limit
@@ -405,6 +472,7 @@ async function portfolioHoldings(
       : []),
     ...(targetNote ? [targetNote] : []),
     ...(target.portfolio.brokerInstanceId && !resolved.account ? [BROKER_ACCOUNT_MISSING_NOTE] : []),
+    ...[unpricedCashNote(allocation.unpricedCash, currency)].filter((line): line is string => !!line),
     ...costAtTodaysRateNotes(valuation, (symbols) => [...symbols].join(", ")),
   ];
 
@@ -412,10 +480,10 @@ async function portfolioHoldings(
     ? POSITION_COLUMNS.map((column) => column.key === "weight" ? { ...column, description: GROSS_WEIGHT_DESCRIPTION } : column)
     : POSITION_COLUMNS;
   const columns = withListingLabels(
-    withExtendedColumns([...positionColumns, ...(showTargets ? TARGET_COLUMNS : []), VALUATION_TIME_COLUMN], extendedSessions),
+    withExtendedColumns(withBookCurrency([...positionColumns, ...(showTargets ? TARGET_COLUMNS : []), VALUATION_TIME_COLUMN], currency), extendedSessions),
     tickers,
   );
-  const lotted = withPositionLines(shown, columns, allocationBySymbol);
+  const lotted = withPositionLines(shown, columns, allocationBySymbol, allocation.cash);
 
   return {
     // Dated by the prices the value uses, and the oldest of them in exports, with the basis in the closing line.
@@ -423,7 +491,7 @@ async function portfolioHoldings(
       source: broker ? "Your broker account and Gloom Cloud" : "Local portfolio and Gloom Cloud",
       observedKey: "valuationAsOf",
       citeOldest: true,
-      note: `priced at ${valuationBasisLabel(basis, { futures: holdsFutures(valuation) })}`,
+      note: `priced at ${valuationBasisText(basis, holdsFutures(valuation), marketsStillTrading(valuation))}`,
     },
     columns,
     rows: shown,
@@ -447,14 +515,144 @@ async function portfolioHoldings(
         cash: allocation.cash ? finite(allocation.cash.value) : null,
         total: allocation.total,
         // At the regular close, the holdings' move from the close before.
-        ...(basis === "regular-close" ? { dayChange: dayMove?.change ?? null, dayChangePercent: dayMove?.changePercent ?? null, dayChangeBasis: dayMove?.basis ?? null } : {}),
+        ...(basis === "regular-close" ? { dayChange: dayMove?.change ?? null, dayChangePercent: dayMove?.changePercent ?? null, dayChangeBasis: dayMove?.basis ?? null,
+          dayChangeFx: dayMove?.fx ?? null } : {}),
       },
       // Only on a book that holds a short: its weights are shares of `weightBase`, its gross exposure, not of the total.
       ...(allocation.weightBasis === "gross" ? { weightBasis: allocation.weightBasis, weightBase: allocation.weightBase } : {}),
       ...(cash ? { cash } : {}),
       ...(showTargets ? { targetSum: allocation.targetSum } : {}),
       unpricedCount: allocation.unpriced.length,
+      // Only while a currency's cash has no rate into the portfolio's: left out of the total and weights as an unpriced holding is.
+      ...(allocation.unpricedCash.length > 0 ? { unpricedCashCurrencies: allocation.unpricedCash } : {}),
       ...(notices.length > 0 ? { notices } : {}),
+    },
+  };
+}
+
+/** `fn PF --from`: a position's P&L between two closes and its share of the book, then the FX line and the total. */
+const PERIOD_COLUMNS: HeadlessPaneColumn[] = [
+  { key: "symbol", header: "Ticker" },
+  { key: "shares", header: "Qty", align: "right", format: quantity },
+  { key: "startPrice", header: "Start", align: "right", format: unitMoney("priceCurrency"), description: "The close before the window, in the quote's currency." },
+  { key: "endPrice", header: "End", align: "right", format: unitMoney("priceCurrency"), description: "The last close in the window, in the quote's currency." },
+  { key: "changePercent", header: "Period %", align: "right", format: percent },
+  { key: "pnl", header: "P&L", align: "right", format: amount, description: "The price move times the units held now, in the portfolio's currency at the end's rate." },
+  { key: "contribution", header: "Contribution", align: "right", format: percent, description: "P&L over the book's value at the start, gross when it holds a short, in percent." },
+];
+
+/** `fn PF --from` on a book in more than one currency: each currency's price P&L, FX and total, and the book's. */
+const PERIOD_CURRENCY_COLUMNS: HeadlessPaneColumn[] = [
+  { key: "currency", header: "Currency" },
+  { key: "local", header: "Local", align: "right", format: amount, description: "Its holdings' price P&L, in the portfolio's currency at the end's rate." },
+  { key: "fx", header: "FX", align: "right", format: amount, description: "The currency's move on its holdings' start value." },
+  { key: "total", header: "Total", align: "right", format: amount },
+  { key: "contribution", header: "Contribution", align: "right", format: percent, description: "The total over the book's value at the start, in percent." },
+  { key: "leftOut", header: "Left out", description: "Its holdings with no P&L over the window, which the figures leave out." },
+];
+
+/**
+ * PF over a period (`--from`, `--to`): P&L and contribution by position
+ * between two closes, as `portfolio show --from` reads them, on the
+ * holdings held now, largest at the start first; the FX line and the total
+ * cover every position, whatever the limit.
+ */
+async function portfolioPeriodHoldings(
+  target: Extract<CollectionMatch, { kind: "portfolio" }>,
+  limit: number,
+  ctx: HeadlessPaneContext,
+  window: PriceWindow,
+): Promise<HeadlessRowsResult> {
+  const resolved = await ctx.resolvePortfolio?.(target.id);
+  if (!resolved) throw new Error(`Holdings for ${target.id} are not available here.`);
+  const tickers = [...resolved.tickers].sort(bySymbol);
+  const currency = resolvePortfolioTotalsCurrency(target.portfolio, ctx.config.baseCurrency);
+  const futuresHeld = tickers.filter((ticker) => isFuturesTicker(ticker)
+    && ticker.metadata.positions.some((position) => position.portfolio === target.id && position.shares !== 0));
+  const [quotes, futures] = await Promise.all([
+    loadCollectionQuotes(tickers, target, ctx.marketData),
+    loadPortfolioFuturesTerms(futuresHeld, { settlement: true, sources: { history: dailyFuturesHistory(ctx.marketData) } }),
+  ]);
+  ctx.signal.throwIfAborted();
+  const result = await loadPeriodPnl({ tickers, portfolioId: target.id, currency, window, provider: ctx.marketData, fxHistory: ctx.apiClient, quotes, futures });
+  ctx.signal.throwIfAborted();
+  const bySymbolTicker = new Map(tickers.map((ticker) => [ticker.metadata.ticker, ticker]));
+  // Largest at the start first, as PF lists its positions; a holding without a start close after them.
+  const ordered = [...result.rows].sort((a, b) => Math.abs(b.startValue ?? -1) - Math.abs(a.startValue ?? -1) || a.symbol.localeCompare(b.symbol));
+  const rows: HeadlessPaneRow[] = ordered.slice(0, limit).map((row) => {
+    const ticker = bySymbolTicker.get(row.symbol);
+    const shares = ticker?.metadata.positions.filter((position) => position.portfolio === target.id).reduce((sum, position) => sum + position.shares, 0) ?? null;
+    return {
+      symbol: row.symbol,
+      exchange: ticker?.metadata.exchange || null,
+      assetCategory: ticker?.metadata.assetCategory ?? null,
+      shares,
+      ...(ticker && isFuturesTicker(ticker) ? { contractSize: futures.get(row.symbol)?.size?.size ?? null } : {}),
+      priceCurrency: row.currency,
+      startDay: row.start?.day ?? null,
+      startPrice: row.start?.price ?? null,
+      endDay: row.end?.day ?? null,
+      endPrice: row.end?.price ?? null,
+      changePercent: row.changePercent,
+      pnl: row.pnl,
+      fx: row.fx,
+      contribution: row.contribution,
+    };
+  });
+  // An FX line per currency, then the total; the book by currency under them, as portfolio show --from prints it.
+  const parts = periodCurrencyParts(result);
+  for (const part of parts) if (!part.own) rows.push({ symbol: periodFxLabel(part.currency), pnl: part.fx, contribution: part.fxContribution });
+  rows.push({ symbol: "TOTAL", pnl: result.total, contribution: result.totalContribution });
+  // A holding by the listing it is (ES3:SGX), not the key it is saved under (ES3:XSES).
+  const listing = (symbol: string) => { const ticker = bySymbolTicker.get(symbol); return ticker ? listingLabel(ticker) : displayTickerKey(symbol); };
+  const byCurrency = parts.length > 1 ? [
+    ...parts.map((part) => ({ currency: part.currency, local: part.local, fx: part.own ? null : part.fx, total: part.total, contribution: part.contribution,
+      ...(part.unpriced.length ? { leftOut: part.unpriced.map(listing).join(", ") } : {}) })),
+    { currency: "TOTAL", local: result.total - result.fx, fx: result.fx, total: result.total, contribution: result.totalContribution,
+      ...(result.unpriced.length ? { leftOut: result.unpriced.map(listing).join(", ") } : {}) },
+  ] : [];
+  // The Left out column only when a holding is: each currency's figures name the ones they leave out.
+  const byCurrencyColumns = PERIOD_CURRENCY_COLUMNS.filter((column) => column.key !== "leftOut" || result.unpriced.length > 0)
+    .map((column) => column.align === "right" && column.key !== "contribution" ? { ...column, header: `${column.header} (${currency})` } : column);
+  const futuresHeldNow = result.rows.some((row) => { const ticker = bySymbolTicker.get(row.symbol); return !!ticker && isFuturesTicker(ticker); });
+  const bought = periodBoughtText(result, listing);
+  const notices = [
+    `${periodBasisText(result, { futuresHeld: futuresHeldNow })}, in ${currency}.`,
+    ...(result.contributionBase == null ? [] : [`Contribution is P&L over the book's ${result.contributionBasis === "gross" ? "gross exposure" : "value"} at the start, longs plus shorts at their absolute value when it holds a short; cash excluded.`]),
+    ...(bought ? [bought] : []),
+    ...(ordered.length > limit ? [`${ordered.length - limit} more position${ordered.length - limit === 1 ? "" : "s"} not shown; the FX line and the total include every position.`] : []),
+  ];
+  const unpricedText = periodUnpricedText(result, listing);
+  const errors = unpricedText ? [unpricedText] : [];
+  return {
+    freshness: {
+      source: resolved.portfolio.brokerId || resolved.portfolio.brokerInstanceId ? "Your broker account and Gloom Cloud" : "Local portfolio and Gloom Cloud",
+      observedKey: "endDay",
+      status: "not-a-feed",
+      basis: `daily closes, ${window.from} to ${window.to}`,
+    },
+    columns: withListingLabels(withBookCurrency(PERIOD_COLUMNS, currency), tickers),
+    rows,
+    ...(byCurrency.length ? {
+      textSections: [{ title: "By currency", columns: byCurrencyColumns, rows: byCurrency }],
+      exportTables: [{ title: "By currency", columns: byCurrencyColumns, rows: byCurrency, unit: currency }],
+    } : {}),
+    complete: errors.length === 0,
+    ...(errors.length ? { errors, incompleteDetail: `the total leaves out ${result.unpriced.map(listing).join(", ")}` } : {}),
+    metadata: {
+      collection: { kind: "portfolio", id: target.id, name: target.name },
+      currency,
+      from: window.from,
+      to: window.to,
+      fx: result.fx,
+      total: result.total,
+      totalContribution: result.totalContribution,
+      contributionBase: result.contributionBase,
+      contributionBasis: result.contributionBasis,
+      notices,
+      boughtInWindowSymbols: result.boughtInWindow,
+      // The whole reading, as the PF pane draws it over the same period (a capture's).
+      periodPnl: result,
     },
   };
 }
@@ -481,7 +679,8 @@ async function watchlistHoldings(
       exchange: ticker.metadata.exchange || null,
       price: finite(headline?.price ?? quote?.price),
       priceCurrency: quote?.currency ?? null,
-      changePercent: finite(headline ? headline.changePercent : quote?.changePercent),
+      ...regularChangeFields(quote, headline ? headline.changePercent : quote?.changePercent),
+      extendedChangeBasis: extended ? "from-regular-close" : null,
       ...extendedQuoteFields(extended),
     };
   });
@@ -511,7 +710,7 @@ async function watchlistHoldings(
 export const collectionHoldingsHeadless: HeadlessPaneDefinition<"rows"> = {
   shape: "rows",
   description:
-    "Positions held in a portfolio, broker or manual: symbol, exchange, shares, average cost, last price, market value, unrealized P&L, weight of the total with cash (of the gross exposure for a book that holds a short) and when each row's price is from, largest first, then the cash line and totals. Values are at the latest print, extended hours included, or at the regular close with close. With target weights set, each row adds its target, drift and the trade to reach it. For a watchlist, its tickers with quotes. Takes a portfolio or watchlist ID; the first portfolio when omitted.",
+    "Positions held in a portfolio, broker or manual: symbol, exchange, shares, average cost, last price, market value, unrealized P&L, weight of the total with cash (of the gross exposure for a book that holds a short) and when each row's price is from, largest first, then the cash line (a row per currency when it is held in several, the line's weight, target, drift and trade on the first) and totals. Values are at the latest print, extended hours included, or at the regular close with close. With target weights set, each row adds its target, drift and the trade to reach it. For a watchlist, its tickers with quotes. Takes a portfolio or watchlist ID; the first portfolio when omitted.",
   discovery: {
     dataRequirements: ["Local portfolios, watchlists and synced broker positions; current quotes"],
     limitations: ["Unrealized P&L on current positions; excludes realized trades, distributions and cash flows."],
@@ -539,14 +738,48 @@ export const collectionHoldingsHeadless: HeadlessPaneDefinition<"rows"> = {
       settingKey: "valueAtClose",
       description: "Value the portfolio at the regular close, not the latest print: Value is Last times the shares.",
     },
+    {
+      key: "from",
+      type: "string",
+      defaultValue: "",
+      placeholder: "date",
+      settingKey: "pnlFrom",
+      example: "--from 2026-10-26 --to 2026-10-30",
+      description: "P&L and contribution by position from the close before this date, as portfolio show --from reads them, instead of P&L since cost.",
+    },
+    {
+      key: "to",
+      type: "string",
+      defaultValue: "",
+      placeholder: "date",
+      settingKey: "pnlTo",
+      description: "The period's last day, with from; the latest close when left out.",
+    },
   ],
   columns: POSITION_COLUMNS,
   describe: (args) => (args.rawArgument ? `Holdings | ${args.rawArgument}` : "Holdings"),
   async load(args, ctx) {
     const target = resolveTarget(args.rawArgument, ctx);
     const limit = rowLimit(args.options.limit);
-    return target.kind === "portfolio"
+    const from = typeof args.options.from === "string" && args.options.from.trim() ? args.options.from.trim() : undefined;
+    const to = typeof args.options.to === "string" && args.options.to.trim() ? args.options.to.trim() : undefined;
+    const window = readPriceWindow(from, to);
+    if (window) {
+      if (target.kind !== "portfolio") throw new Error("--from reads a portfolio's P&L between two closes; a watchlist holds no positions.");
+      if (args.options.close === true) throw new Error("--from values each position at its closes already; leave out --close.");
+      return portfolioPeriodHoldings(target, limit, ctx, window);
+    }
+    const result = await (target.kind === "portfolio"
       ? portfolioHoldings(target, limit, ctx, args.options.close === true ? "regular-close" : "latest-print")
-      : watchlistHoldings(target, limit, ctx);
+      : watchlistHoldings(target, limit, ctx));
+    if (args.rawArgument.trim() || result.rows.length > 0) return result;
+    // Left out, PF reads the first collection; an empty one says which it was and how to name another.
+    return { ...result, empty: emptyDefaultText(target, ctx) };
   },
 };
+
+/** `The first portfolio, Main, holds nothing. Name one: gloom fn PF <portfolio or watchlist>, such as Plan (plan).` */
+function emptyDefaultText(target: CollectionMatch, ctx: HeadlessPaneContext): string {
+  const others = [...ctx.config.portfolios, ...ctx.config.watchlists].filter((collection) => collection.id !== target.id);
+  return `The first ${target.kind}, ${target.name}, holds nothing. Name one: gloom fn PF <portfolio or watchlist>${others.length ? `, such as ${describeCollections(others)}` : ""}.`;
+}

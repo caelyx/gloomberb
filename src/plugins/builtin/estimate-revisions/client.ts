@@ -9,10 +9,10 @@ import {
   unavailableOnServer,
 } from "../shared/cloud-resource";
 import { canonicalExchange, normalizeSymbol, parsePublicTickerKey } from "../../../utils/exchanges";
-import { publicListingVenue } from "../../../sources/listing-target";
 import { AmbiguousContractError, AmbiguousTickerError } from "../../../tickers/search";
 import { bareListingExchange } from "../../../tickers/listing-venues";
 import type { DataProvider } from "../../../types/data-provider";
+import { publicListingVenue } from "../../../sources/listing-target";
 
 export const estimateRevisionsCache =
   createPluginCache<EstimateRevisionsPayload>({
@@ -221,6 +221,12 @@ export function validateEstimates(
     return invalid();
   return data;
 }
+
+function notListedOn(ticker: string): Error {
+  const { symbol, exchange } = parsePublicTickerKey(ticker);
+  return new Error(`${symbol} does not trade on ${exchange}.`);
+}
+
 /**
  * The venue the route needs for a bare symbol: the listing `quote SYM` and the
  * command bar resolve it to (`bareListingExchange`). Only a symbol whose
@@ -243,31 +249,17 @@ async function bareSymbolVenue(symbol: string, marketData: DataProvider | undefi
   }
   throw new Error(`No ticker match found for "${typed}".`);
 }
-type EstimateListing = NonNullable<ReturnType<typeof publicListingVenue>>;
-type EstimatesClient = Pick<typeof apiClient, "getCloudEstimateRevisions">;
-
-function notListedOn(ticker: string): Error {
-  const { symbol, exchange } = parsePublicTickerKey(ticker);
-  return new Error(`${symbol} does not trade on ${exchange}.`);
-}
-
-export function fetchEstimates(
+export async function fetchEstimates(
   ticker: string,
   savedExchange: string,
-  client: EstimatesClient = apiClient,
+  client: Pick<typeof apiClient, "getCloudEstimateRevisions"> = apiClient,
   /** Resolves a symbol typed with no exchange; a listing named by the caller never asks it. */
   marketData?: DataProvider,
 ) {
   const listing = publicListingVenue(ticker, savedExchange);
-  return listing ? fetchListingEstimates(listing, client, marketData) : Promise.reject(notListedOn(ticker));
-}
-
-async function fetchListingEstimates(
-  { symbol, exchange }: EstimateListing,
-  client: EstimatesClient,
-  marketData: DataProvider | undefined,
-) {
-  const venue = canonicalExchange(exchange) || (await bareSymbolVenue(symbol, marketData));
+  if (!listing) throw notListedOn(ticker);
+  const { symbol } = listing;
+  const venue = canonicalExchange(listing.exchange) || (await bareSymbolVenue(symbol, marketData));
   try {
     return validateEstimates(
       await client.getCloudEstimateRevisions(symbol, venue),
@@ -297,7 +289,7 @@ export function loadEstimates(ticker: string, savedExchange: string, force = fal
   return loadCloudResource(
     estimateRevisionsCache,
     key(symbol, exchange),
-    () => fetchListingEstimates(listing, apiClient, marketData),
+    () => fetchEstimates(symbol, exchange, undefined, marketData),
     {
       force,
       validate: (payload) =>

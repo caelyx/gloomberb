@@ -6,18 +6,22 @@ Tests ([full policy](CONTRIBUTING.md#what-to-test)): be selective. Add or keep a
 
 Public text ([full rule](CONTRIBUTING.md#pull-requests)): pull request titles, descriptions, comments, commit messages and branch names are public. No internal tracker ids or links, no private repository names or links, no internal notes (deals, pricing plans, people, infrastructure); a change that needs a server change says "needs the matching server change".
 
+Review screenshots and evidence images for a PR go through `scripts/pr-assets.sh <slug> <file>...`, which pushes them to `refs/pr-assets/<slug>` and prints the markdown links for the description: never a branch, and never committed to the tree.
+
 Use tmux to test terminal TUI changes (see the `tui-testing` skill). Always kill the tmux session when done.
 
 Shared machine: several agents often work on one host at the same time.
 - Run at most one typecheck or full `bun test` at a time. Each full run takes 1-3 GB, and parallel runs get OOM-killed.
-- Never run bare `gloomberb`, `bun start` or `bun dev` from a non-interactive shell: the TUI never exits without a TTY, so the call hangs. Use a subcommand or `--help`, prefix risky commands with `timeout 60`, and run interactive checks only in tmux.
-- Throwaway profiles (`GLOOMBERB_HOME`) go on disk under `~/.cache/gloom-smoke/<task>`, never under `/tmp` (one profile is ~29k files and `/tmp` is a small tmpfs). Remove the profile and kill tmux when done.
+- Bound test and other risky commands with `timeout -k 10 <seconds> ...`. A hung `bun` ignores the plain SIGTERM from `timeout` and keeps its memory for hours. Before you finish, check that nothing of yours is still running: `pwdx $(pgrep -f 'bun test') 2>/dev/null | grep -F "$PWD"`.
+- Never run bare `gloomberb`, `bun start` or `bun dev` from a non-interactive shell: the TUI never exits without a TTY, so the call hangs. Use a subcommand or `--help`, prefix risky commands with `timeout -k 10 60`, and run interactive checks only in tmux.
+- Throwaway profiles (`GLOOMBERB_HOME`) go on disk under `~/.cache/gloom-smoke/<task>`, never under `/tmp` (one profile is ~29k files and `/tmp` is a small tmpfs). Launch every one with `GLOOMBERB_NO_TELEMETRY=1 DO_NOT_TRACK=1`, or it counts as a new install. Remove the profile and kill tmux when done.
 - Never message, stop, archive or kill other agents or their processes, and never ask them to wait. If the host is busy, retry later or report it.
 - Never use `git stash`: all worktrees of a repo share one stash list, so a pop or clear can take another agent's entries. Commit work in progress to your own branch instead.
 
 Pane footers/status bars show changing status such as loading, error, live/delayed, stale, or auth state. Preserve existing pane-specific action shortcuts there instead of duplicating them in body toolbars. Do not add fixed pane labels, row counts, or generic keyboard hints. Never show internal provider or source identifiers (`provider:*`, raw feed names) anywhere in a pane; say what the data is (real-time, 15m delayed, settlement, as of) instead. Gloom Cloud is the public market-data service. See `pane-conventions`.
 Recurring methodology, model assumptions, and usage explanations belong in docs, not always-visible pane text or new info buttons. Keep units, source dates, and active data failures in context. Use existing actions instead of adding duplicate toolbars.
 Information density matters: never repeat the same information in a pane title/header and again in the body. If a stack/detail title already names the item, start the body with metadata or content.
+Desktop work, `bun run typecheck` and `bun test` need Electrobun's SDK in `.hutch/devkit`: run `bun run desktop:sync` after `bun install` (it also applies `patches/electrobun-devkit@*.patch`).
 For Electrobun/desktop-web-only work, do not load the OpenTUI or tui-testing skills unless the change also touches terminal OpenTUI behavior or explicitly needs tmux coverage. The OpenTUI skill is not checked in: if `.agents/skills/opentui` is missing, restore it with `bunx skills experimental_install`.
 For desktop/Electrobun/web UI, do not draw GUI primitives with terminal cell characters. Use real DOM/CSS/canvas/SVG primitives for lines, markers, shapes, overlays, and interaction affordances; reserve cell-character drawing for the OpenTUI terminal renderer only.
 Add mouse/cursor interactivity for everything interactive.

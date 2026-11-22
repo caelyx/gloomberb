@@ -2,6 +2,57 @@
 export const KPI_FIELDS = ["kpiArr", "kpiNrrPercent", "kpiRpo", "kpiCrpo", "kpiSubscribers", "kpiDau", "kpiMau", "kpiGmv", "kpiTakeRatePercent", "kpiSameStoreSalesPercent", "kpiStores", "kpiBacklog", "kpiBookToBill", "kpiNimPercent", "kpiCet1Percent", "kpiCombinedRatioPercent", "kpiOccupancyPercent", "kpiLoadFactorPercent", "guideRevenueChangePercent", "guideEpsChangePercent"] as const;
 /** Payout ratio and dividend growth; listed only when asked (`include=dividends`), and omitted by a server from before them. */
 export const DIVIDEND_FIELDS = ["payoutRatioPercent", "dividendGrowth1YPercent", "dividendGrowth3YPercent"] as const;
+/**
+ * Technical readings of the stored daily bars at the last completed session; listed only when asked
+ * (`include=technical`), and omitted by a server from before them.
+ */
+export const TECHNICAL_FIELDS = [
+  "rsi14",
+  "priceVsSma20Percent", "priceVsSma50Percent", "priceVsSma200Percent",
+  "macdBullishCrossDays", "macdBearishCrossDays", "goldenCrossDays", "deathCrossDays",
+  "newHigh20dDays", "newLow20dDays", "newHigh52wDays", "newLow52wDays",
+  "bollingerWidthPercentile",
+] as const;
+/**
+ * IV30, its 52-week percentile and its moves in volatility points, and 20-session realized volatility with its
+ * 52-week rank; listed only when asked (`include=option-volatility`), and omitted by a server from before them.
+ */
+export const OPTION_VOLATILITY_FIELDS = ["iv30Percent", "ivPercentile", "iv30Change1d", "iv30Change5d", "hv20Percent", "hvRank"] as const;
+/**
+ * Shares outstanding, float, short % of float and 13F institutional ownership, each with the day it describes;
+ * listed only when asked (`include=ownership`), and omitted by a server from before them.
+ */
+export const OWNERSHIP_FIELDS = ["sharesOutstanding", "floatShares", "shortPercentOfFloat", "institutionalOwnershipPercent"] as const;
+/**
+ * ROIC, FCF yield, leverage, revenue and EPS CAGRs and consensus growth, on the bases `FA` and `EE` use; listed only
+ * when asked (`include=quality`), and omitted by a server from before them.
+ */
+export const QUALITY_FIELDS = [
+  "roicPercent", "fcfYieldPercent", "netDebtToEbitda", "debtToEquity",
+  "revenueCagr3YPercent", "revenueCagr5YPercent", "epsCagr3YPercent", "epsCagr5YPercent",
+  "forwardRevenueGrowthPercent", "forwardEpsGrowthPercent",
+] as const;
+/**
+ * Classic scores: Piotroski F, Altman Z, the Graham number and Lynch fair value with their upside, Greenblatt's
+ * earnings yield, return on capital and Magic Formula rank, the 1Y total return and its RS rating, years of profit,
+ * revenue growth and dividend growth, and S&P 500 and Dow membership; listed only when asked (`include=scores`), and
+ * omitted by a server from before them.
+ */
+export const SCORE_FIELDS = [
+  "piotroskiFScore", "altmanZScore", "grahamNumber", "grahamUpsidePercent", "lynchFairValue", "lynchUpsidePercent",
+  "earningsYieldPercent", "returnOnCapitalPercent", "magicFormulaRank", "totalReturn1YPercent", "rsRating",
+  "profitableYears", "revenueGrowthYears", "dividendGrowthYears", "sp500Member", "dowMember",
+] as const;
+/** Index membership, 1 for a member and 0 for a US listing that is not one. */
+export const MEMBERSHIP_FIELDS = ["sp500Member", "dowMember"] as const;
+/** The factor grades, each ranked within the company's sector: 1 is F and 13 is A+. */
+export const LETTER_GRADE_FIELDS = ["valueGrade", "growthGrade", "profitabilityGrade", "momentumGrade", "revisionsGrade"] as const;
+/**
+ * The factor grades, their 1-5 composite, and the next fiscal year's EPS and the current year's revenue revisions the
+ * Revisions grade reads beside EPS revision 30D; listed only when asked (`include=grades`), and omitted by a server
+ * from before them.
+ */
+export const GRADE_FIELDS = [...LETTER_GRADE_FIELDS, "gradeComposite", "nextYearEpsRevision30dPercent", "revenueRevision30dPercent"] as const;
 export const NUMERIC_FIELDS = [
   ...KPI_FIELDS,
   "price",
@@ -42,6 +93,7 @@ export const NUMERIC_FIELDS = [
   "fromHigh52WPercent",
   "beta",
   "atrPercent",
+  ...TECHNICAL_FIELDS,
   "priceToBook",
   "evToEbitda",
   "roePercent",
@@ -49,6 +101,11 @@ export const NUMERIC_FIELDS = [
   "analystUpsidePercent",
   "ivRank",
   "ivToHv",
+  ...OPTION_VOLATILITY_FIELDS,
+  ...OWNERSHIP_FIELDS,
+  ...QUALITY_FIELDS,
+  ...SCORE_FIELDS,
+  ...GRADE_FIELDS,
   "hiringOpenRoles", "hiringNetAddsWeek", "hiringRemotePercent", "hiringZScore",
   "appAttentionScore", "appRankVelocity7d", "appRatingDrift7d", "appRatingCountGrowth7d",
 ] as const;
@@ -151,6 +208,21 @@ export interface ScreenSnapshot {
   sourceOldestAt: string | null;
   sourceNewestAt: string | null;
 }
+/**
+ * How a symbol criterion read one of its values. One named with its venue (a
+ * watchlist member, BN:TSX) matches the company, so the listing and the
+ * company's other screened listings; a bare one (PM) matches the code.
+ */
+export interface ScreenListingRead {
+  /** The value as the criterion gives it: RCI.B:TSX, PM. */
+  value: string;
+  /** Whether the listing itself (a bare value: its code) is in the screened universe. */
+  covered: boolean;
+  /** The same company's other screened listings, which the value also matches: RCI on the NYSE. */
+  others: Array<{ symbol: string; exchange: string }>;
+  /** When the screen has a currency and every listing the value matched is quoted in another: those listings, which it leaves out. */
+  outsideCurrency?: Array<{ symbol: string; exchange: string; currency: string }>;
+}
 export interface ScreenPayload {
   version: 1;
   status: "available" | "partial" | "unavailable";
@@ -160,6 +232,8 @@ export interface ScreenPayload {
   rows: ScreenRow[];
   nextCursor: string | null;
   warnings: string[];
+  /** On the first page of a screen with a symbol criterion: what each of its values read. */
+  listings?: ScreenListingRead[];
 }
 interface ScreenCriterionCheck {
   criterion: ScreenCriterion;

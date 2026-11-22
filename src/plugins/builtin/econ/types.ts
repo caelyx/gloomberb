@@ -25,10 +25,23 @@ export interface EconEvent {
   priorAsOf?: string | null;
   /** The period a release covers, as its publisher names it. */
   referencePeriod?: string | null;
+  /**
+   * The currency the row's amounts are in (`JPY` for Japan's current account, `USD` for its reserves), shown beside
+   * them (`figureWithCurrency`); the figures never name it. Absent from an older server, which shows them bare.
+   */
+  currency?: string | null;
   /** Who publishes it (Freddie Mac for the 30-year mortgage rate), and its page when one is named. */
   source?: { name: string; url?: string };
   /** The indicator this release is of, the same from one release to the next; `id` is this row's alone. */
   indicatorId?: string | null;
+  /** Which feed the forecast was read from (`week-feed`, `release-calendar`) and when that feed was read. */
+  consensus?: { source: string; readAt: string } | null;
+  /**
+   * A central bank's next decision, or a country's next CPI release, Gloom Cloud lists past the end of the listing,
+   * which ends on `listedThrough` (UTC).
+   */
+  pastListing?: boolean;
+  listedThrough?: string;
 }
 
 /** Whether a row's time is blank because its publisher states none (a bank whose calendar gives the day only). */

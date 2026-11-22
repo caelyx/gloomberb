@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import type { Quote } from "../../../types/financials";
 import type { BoardQuoteMap } from "../shared/use-quote-board";
 import {
@@ -9,10 +9,12 @@ import {
 } from "../../../market-data/futures-board";
 import { FUTURES_SERIES } from "./series";
 import type { FuturesTermsMap } from "./use-board-terms";
-import type { FuturesColumnId, FuturesTableRow } from "./model";
+import { futuresBoardQuotes, type FuturesColumnId, type FuturesTableRow } from "./model";
+import type { FrontReturnsMap } from "./use-front-returns";
 import {
   createFuturesColumns,
   FUTURES_COLUMN_DEFS,
+  FUTURES_REPORT_COLUMNS,
   renderFuturesCell,
   resolveFuturesColumnIds,
   type FuturesColumn,
@@ -30,7 +32,7 @@ function cellText(
 ): string {
   const contract = { ...contractFor(sector), tick };
   const row: FuturesTableRow = { type: "row", contract };
-  const column = createFuturesColumns(100).find((candidate) => candidate.id === id) as FuturesColumn;
+  const column = createFuturesColumns(120).find((candidate) => candidate.id === id) as FuturesColumn;
   const quotes: BoardQuoteMap = new Map([
     ["X=F", { quote: quote as Quote, loading: false, error: null, stale: false }],
   ]);
@@ -93,16 +95,20 @@ describe("futures price formatting", () => {
 describe("futures unit", () => {
   test("says what a price counts, as quote does, and waits for the terms before saying nothing", () => {
     const crude = FUTURES_CONTRACTS.find((contract) => contract.symbol === "CL=F")!;
-    const unit = (terms: FuturesTermsMap) => {
+    const index = FUTURES_CONTRACTS.find((contract) => contract.symbol === "ES=F")!;
+    const unit = (terms: FuturesTermsMap, contract = crude) => {
       const column = createFuturesColumns(160).find((candidate) => candidate.id === "unit")!;
-      return renderFuturesCell({ type: "row", contract: crude }, column, new Map(), { terms }).text;
+      return renderFuturesCell({ type: "row", contract }, column, new Map(), { terms }).text;
     };
     const spec = { unit: "USD / barrel", size: "1,000 barrels", pointValue: 1000, tick: 0.01, tickValue: 10, settlement: "physical" as const };
     const terms = { symbol: "CL=F", root: "CL", name: "WTI Crude Oil", contract: "CLZ26", contractSymbol: "CLZ26.NYM", deliveryMonth: "2026-12",
       spec, lastTrade: "2026-11-20", firstNotice: null, inDelivery: false, settlement: null };
     expect(unit(new Map([["CL=F", { loading: false, terms }]]))).toBe("USD / barrel");
-    expect(unit(new Map([["CL=F", { loading: true, terms: null }]]))).toBe("…");
-    expect(unit(new Map([["CL=F", { loading: false, terms: null }]]))).toBe("—");
+    // Crude's unit is the catalog's while its terms load or when they fail; a root the catalog gives none waits, then says nothing.
+    expect(unit(new Map([["CL=F", { loading: true, terms: null }]]))).toBe("USD / barrel");
+    expect(unit(new Map([["CL=F", { loading: false, terms: null }]]))).toBe("USD / barrel");
+    expect(unit(new Map([["ES=F", { loading: true, terms: null }]]), index)).toBe("…");
+    expect(unit(new Map([["ES=F", { loading: false, terms: null }]]), index)).toBe("—");
   });
 });
 
@@ -125,9 +131,20 @@ describe("futures columns", () => {
   });
 
   test("drops the extra columns a narrow board cannot fit instead of clipping them", () => {
+    // A floating board at 80x24 (53 cells) showed SYM CONTRACT LAST UNIT and hid CHG% past a scroll Right cannot
+    // reach (it switches tabs). The move outranks the unit.
+    const floating = createFuturesColumns(53).map((column) => column.id);
+    expect(floating).toEqual(["status", "code", "name", "price", "changePercent"]);
+    expect(createFuturesColumns(78).map((column) => column.id)).toEqual(["status", "code", "name", "price", "changePercent", "return1w"]);
     // The unit a price counts outranks the change in points, which the change in percent still gives.
-    const narrow = createFuturesColumns(80).map((column) => column.id);
-    expect(narrow).toEqual(["status", "code", "name", "price", "unit", "changePercent"]);
+    expect(createFuturesColumns(106).map((column) => column.id)).toContain("unit");
+    expect(createFuturesColumns(106).map((column) => column.id)).not.toContain("change");
+    // CONTRACT keeps 24 cells at every width that can hold them: at 100 to 116 the unit and the change cut it to 15-18,
+    // "WTI Crude Oil Dec 2026" with it.
+    for (let width = 62; width <= 210; width += 1) {
+      const name = createFuturesColumns(width).find((column) => column.id === "name")!;
+      expect(name.width, `CONTRACT at ${width} cells`).toBeGreaterThanOrEqual(24);
+    }
 
     // Returns outrank volume and time, and those the previous close, as the board narrows.
     const medium = createFuturesColumns(130).map((column) => column.id);
@@ -197,4 +214,62 @@ describe("futures catalog", () => {
     expect(new Set(symbols).size).toBe(symbols.length);
     for (const symbol of symbols) expect(symbol).toMatch(/^[A-Z0-9]+=F$/);
   });
+});
+
+describe("futures board exports and the reopen", () => {
+  const es = FUTURES_CONTRACTS.find((contract) => contract.symbol === "ES=F")!;
+  const cattle = FUTURES_CONTRACTS.find((contract) => contract.symbol === "LE=F")!;
+  const quote = (overrides: Partial<Quote> = {}): Quote => ({
+    symbol: "ES=F", name: "E-Mini S&P 500 Dec 2026", instrumentType: "FUTURE", listingExchangeName: "CME", exchangeName: "CME",
+    currency: "USD", price: 7734.5, change: 14, changePercent: 0.18, previousClose: 7720.5, changeSessionDate: "2026-11-05", volume: 6713,
+    marketState: "CLOSED", lastUpdated: Date.parse("2026-11-04T21:59:00Z"), ...overrides,
+  } as Quote);
+  const board = (symbol: string, value: Quote): BoardQuoteMap => new Map([[symbol, { quote: value, loading: false, error: null, stale: false }]]);
+  afterEach(() => setSystemTime());
+  const cell = (contract: FuturesContract, id: FuturesColumnId, quotes: BoardQuoteMap, now?: number, returns?: FrontReturnsMap) =>
+    renderFuturesCell({ type: "row", contract }, ([...createFuturesColumns(220), ...FUTURES_REPORT_COLUMNS]).find((column) => column.id === id)!,
+      quotes, { sessionText: true, now, returns });
+
+  test("JSON and CSV cells carry the numbers behind the text, the 3M, 6M and 1Y returns included", () => {
+    const quotes = board("ES=F", quote({ change: 137.75000000001 }));
+    const values = { "1W": -0.71, "1M": -0.63, "3M": 2.5, "6M": 7.25, "1Y": 14.1, YTD: 12 };
+    const returns: FrontReturnsMap = new Map([["ES=F", { loading: false, values }]]);
+    // The change at the precision the cell shows, never a difference's float noise.
+    expect(cell(es, "change", quotes)).toMatchObject({ text: "+137.75", value: 137.75 });
+    expect(cell(es, "volume", quotes).value).toBe(6713);
+    expect(cell(es, "prevClose", quotes).value).toBe(7720.5);
+    for (const [id, value] of [["return1w", -0.71], ["return3m", 2.5], ["return6m", 7.25], ["return1y", 14.1], ["returnYtd", 12]] as const) {
+      expect(cell(es, id, quotes, undefined, returns).value).toBe(value);
+    }
+    // The drawn table keeps its columns: the three are for the exports alone.
+    expect(createFuturesColumns(400).map((column) => column.id)).not.toContain("return3m");
+  });
+
+  test("a contract that trades Globex's whole day reads open from the 17:00 Central reopen, before its feed's first print", () => {
+    // The machine's clock is in the weekend gap, when Globex is closed: the cell reads the time it is given, not this.
+    setSystemTime(new Date("2026-11-07T15:00:00Z"));
+    const reopened = Date.parse("2026-11-04T23:10:00Z");
+    // Its last print is from before the daily break, and the delayed feed still calls it closed.
+    expect(cell(es, "status", board("ES=F", quote()), reopened).text).toBe("OPEN");
+    // In the daily break it is closed, whatever its last print says.
+    expect(cell(es, "status", board("ES=F", quote({ marketState: "REGULAR" })), Date.parse("2026-11-04T22:30:00Z")).text).toBe("CLOSED");
+    // Live cattle keeps its own shorter hours: the quote's state stands.
+    expect(cell(cattle, "status", board("LE=F", quote({ symbol: "LE=F" })), reopened).text).toBe("CLOSED");
+    // Thanksgiving, whose Globex hours vary by contract, is the quote's to say too.
+    expect(cell(es, "status", board("ES=F", quote()), Date.parse("2026-11-26T15:00:00Z")).text).toBe("CLOSED");
+  });
+
+  test("each row's move is measured as quote measures it: from the session before's settlement of the same contract, else the source's", () => {
+    const quotes = board("ES=F", quote());
+    const terms = (settlement: { price: number; date: string }, deliveryMonth = "2026-12"): FuturesTermsMap =>
+      new Map([["ES=F", { loading: false, terms: { settlement, deliveryMonth, spec: { tick: 0.25 } } as never }]]);
+    const shown = futuresBoardQuotes(quotes, terms({ price: 7722.25, date: "2026-11-04" }));
+    expect(shown.get("ES=F")!.quote).toMatchObject({ change: 12.25, previousClose: 7722.25 });
+    expect(cell(es, "change", shown).text).toBe("+12.25");
+    // Tuesday's settlement is two sessions back, and March's is another contract: the source's +14 stands.
+    expect(futuresBoardQuotes(quotes, terms({ price: 7596.75, date: "2026-11-03" }))).toBe(quotes);
+    expect(futuresBoardQuotes(quotes, terms({ price: 7722.25, date: "2026-11-04" }, "2027-03"))).toBe(quotes);
+    expect(futuresBoardQuotes(quotes, new Map())).toBe(quotes);
+  });
+
 });

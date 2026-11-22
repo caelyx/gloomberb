@@ -63,7 +63,8 @@ function statusColor(status: IpoBoardStatus, colors: ThemeColors): string {
     case "upcoming":
     case "offering": return colors.warning;
     // Its listing day went by with no word: no longer next, not called off either.
-    case "overdue": return colors.textDim;
+    case "overdue":
+    case "delayed": return colors.textDim;
     case "priced": return colors.textBright;
     case "listed": return colors.positive;
     case "withdrawn": return colors.negative;
@@ -88,7 +89,7 @@ export function IpoCalendarPane({ focused, width, height }: PaneProps) {
   const { active: searching, focus: focusSearch, blur: blurSearch, searchProps } = useQueryBarSearch();
 
   useAutoRefresh(resource.updatedAt, resource.load);
-  usePaneRefreshKey(() => void resource.reload(), { focused, enabled: !searching });
+  usePaneRefreshKey(() => resource.reload(), { focused, enabled: !searching });
 
   // One clock per board, so a deal's status, its place and a search for it agree.
   const now = useMemo(() => new Date(), [deals, resource.updatedAt]);

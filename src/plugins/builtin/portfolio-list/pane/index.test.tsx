@@ -7,6 +7,7 @@ import { createOpenTuiTestHarness } from "../../../../renderers/opentui/test-uti
 import { AppPersistence } from "../../../../data/app-persistence";
 import { TickerRepository } from "../../../../data/ticker-repository";
 import { appReducer, createInitialState, type AppAction } from "../../../../state/app/context";
+import { resolveTickerForPane } from "../../../../core/state/app/layout";
 import { AssetDataRouter } from "../../../../sources/provider-router";
 import {
   createDefaultConfig,
@@ -17,7 +18,7 @@ import {
 import type { BrokerAdapter, BrokerConnectionStatus } from "../../../../types/broker";
 import type { DataProvider } from "../../../../types/data-provider";
 import type { Quote, TickerFinancials } from "../../../../types/financials";
-import type { TickerRecord } from "../../../../types/ticker";
+import type { Portfolio, TickerRecord } from "../../../../types/ticker";
 import { MarketDataCoordinator, setSharedMarketDataCoordinator } from "../../../../market-data/coordinator";
 import { instrumentFromTicker } from "../../../../market-data/request-types";
 import { createTestPluginRuntime } from "../../../../test-support/plugin-runtime";
@@ -27,6 +28,7 @@ import { PluginRegistry, setSharedMarketDataForTests, setSharedRegistryForTests 
 import { portfolioListModule } from "..";
 import { TestPaneProvider, createTestTicker, createTestPaneConfig } from "../../../../test-support/pane";
 import { AGE_CLOCK_MS } from "../use-column-clock";
+import { CASH_ROW_KEY } from "../allocation-rows";
 import { createTempDbPath, removeTempDbFiles } from "../../../../test-support/temp-db";
 import { apiClient } from "../../../../api-client";
 import type { PerpEquityListing } from "../../../../api-client/perps";
@@ -34,6 +36,52 @@ import { perpsListCache, perpsMarketCache } from "../../perps/client";
 import { equitiesPayload, perpBoard, venueRow } from "../../perps/test-fixture";
 
 const TEST_PANE_ID = "portfolio-list:test";
+const FOLLOWER_PANE_ID = "quote-monitor:follower";
+
+test.each([true, false])("deferred and continuous futures share a front reference without replacing their prices (streaming %s)", async (liveStreaming) => {
+  const symbols = ["NGF27", "NG2", "NGX26"];
+  const config = createManualCollectionConfig("watchlist");
+  config.layout.instances.find((pane) => pane.instanceId === TEST_PANE_ID)!.settings = { columnIds: ["ticker", "price", "change_pct"], liveStreaming };
+  const terms = spyOn(apiClient, "getCloudFuturesContract").mockImplementation(async (symbol) => ({
+    symbol, root: "NG", name: "Natural Gas", contract: symbol === "NG2" ? "NGZ26" : symbol,
+    contractSymbol: symbol, deliveryMonth: "2027-01", spec: null, settlement: null,
+    firstNotice: null, lastTrade: null, inDelivery: false,
+    front: symbol === "NGX26" ? null : { contract: "NGX26", contractSymbol: "NGX26", deliveryMonth: "2026-11", lastTrade: null },
+  }));
+  let frontPrice = 3.116;
+  const quoteFor = (symbol: string) => makeQuote({ symbol, name: "Natural Gas", instrumentType: "FUTURE",
+    price: symbol === "NGX26" ? frontPrice : symbol === "NG2" ? 3.482 : 4.221 });
+  const batches: string[][] = [];
+  const provider = createTestDataProvider({
+    async getQuote(symbol) { return quoteFor(symbol); },
+    async getQuotesBatch(targets) {
+      batches.push(targets.map((target) => `${target.symbol}@${target.exchange}`));
+      return targets.map((target) => ({ target, quote: quoteFor(target.symbol) }));
+    },
+    async getTickerFinancials(symbol) { return createTestFinancials({ quote: quoteFor(symbol) }); },
+  });
+  sharedCoordinator = new MarketDataCoordinator(provider);
+  setSharedMarketDataCoordinator(sharedCoordinator);
+  try {
+    await tui.render(<PortfolioHarness config={config} collectionId="watchlist" paneWidth={110} stateMutator={(state) => {
+      state.tickers = new Map(symbols.map((symbol) => [symbol, createTestTicker(symbol, "Natural Gas", {
+        assetCategory: "FUTURE", exchange: "NYMEX", watchlists: ["watchlist"], portfolios: [], positions: [],
+      })]));
+      state.financials = new Map(symbols.map((symbol) => [symbol, createTestFinancials({ quote: quoteFor(symbol) })]));
+    }} />, { width: 110, height: 12 });
+    const frame = await tui.waitForFrameToContain("front NGX26 3.116");
+    expect(frame.match(/front NGX26 3\.116/g)).toHaveLength(2);
+    expect(frame).toContain("4.221");
+    expect(frame).toContain("3.482");
+    expect(batches.flat().filter((target) => target === "NGX26@")).toHaveLength(1);
+    frontPrice = 3.127;
+    await act(async () => { await sharedCoordinator!.loadQuotesBatch([{ symbol: "NGX26", exchange: "" }], { forceRefresh: true }); });
+    await tui.waitForFrameToContain("front NGX26 3.127");
+    expect(tui.frame()).not.toContain("front NGX26 3.116");
+  } finally {
+    terms.mockRestore();
+  }
+});
 
 const tui = createOpenTuiTestHarness();
 let harnessDispatch: React.Dispatch<AppAction> | null = null;
@@ -455,8 +503,8 @@ describe("PortfolioListPane cash and margin UI", () => {
       });
       for (let index = 0; index < 6; index++) await flushFrame();
       const frame = tui.frame();
-      expect(frame).toContain(source === "unknown currency" ? "Net Liq —" : "Net Liq 15.0k");
-      expect(frame).toContain(source === "CAD" ? "Cash 13.5k" : "Cash —");
+      expect(frame).toContain(source === "unknown currency" ? "Net Liq —" : "Net Liq 15,000");
+      expect(frame).toContain(source === "CAD" ? "Cash 13,500" : "Cash —");
       expect(frame).not.toContain("Cash 0");
       if (source !== "unknown currency") expect(requested).toContain("CAD");
       else expect(frame).toContain("⚠");
@@ -496,6 +544,25 @@ describe("PortfolioListPane cash and margin UI", () => {
       await tui.setup().renderOnce();
     });
     expect(pinned).toEqual([{ symbol: "AAPL", options: { floating: true, paneType: TICKER_RESEARCH_PANE_ID } }]);
+  });
+
+  test.each(["watchlist", "main"])("an empty %s names its add row once and points at the key that reaches it", async (collectionId) => {
+    installQuickAddRegistry(createQuickAddProvider(true));
+    await tui.render(
+      <PortfolioHarness
+        config={createManualCollectionConfig(collectionId)}
+        collectionId={collectionId}
+        ticker={makeTicker({ portfolios: [], watchlists: [], positions: [] })}
+        paneHeight={12}
+      />,
+      { width: 100, height: 12 },
+    );
+    await flushFrame();
+    const frame = tui.frame();
+    expect(frame).toContain("No tickers.");
+    expect(frame).toContain("Press a to add one.");
+    // The add row is the one "+ ticker"; the empty table does not offer a second.
+    expect(frame.match(/\+ ticker/g)).toHaveLength(1);
   });
 
   test("quick-add validates and adds an exact watchlist ticker", async () => {
@@ -550,6 +617,24 @@ describe("PortfolioListPane cash and margin UI", () => {
       type: "success",
       body: "Added MSFT to Watchlist.",
     });
+    // The add is done: the row closes, empty, and typing no longer goes into it.
+    expect(tui.frame()).toContain("+ ticker");
+    await act(async () => {
+      await tui.setup().mockInput.typeText("x");
+      await tui.setup().renderOnce();
+    });
+    expect(tui.frame()).toContain("+ ticker");
+    // Opened again, a longer symbol shows whole, its first letter not scrolled away ("+ SDTRY=X").
+    await act(async () => {
+      tui.setup().mockInput.pressKey("a");
+      await tui.setup().renderOnce();
+    });
+    await act(async () => {
+      await tui.setup().mockInput.typeText("USDTRY=X");
+      await tui.setup().renderOnce();
+    });
+    await flushFrame();
+    expect(tui.frame()).toContain("+ USDTRY=X");
   });
 
   test("quick-add adds an exact ticker to a manual portfolio", async () => {
@@ -636,6 +721,171 @@ describe("PortfolioListPane cash and margin UI", () => {
     await flushFrame();
   }
 
+  /**
+   * Main Portfolio, $10,000: AAPL $2,600 and SPY $6,400 held, $1,000 cash, targets AAPL 20%, SPY 70%, CASH 10%,
+   * and a quote pane following PF. `cashHolding` adds a stock whose symbol is CASH.
+   */
+  async function renderTargetBook(
+    notifications: Array<{ type?: string; body: string }>,
+    { cashHolding = false, cash = { cash: { amount: 1000, currency: "USD" } } }: { cashHolding?: boolean; cash?: Pick<Portfolio, "cash" | "otherCash"> } = {},
+  ) {
+    const config = createManualCollectionConfig("main");
+    config.portfolios = config.portfolios.map((portfolio) => portfolio.id === "main"
+      ? { ...portfolio, ...cash, targetWeights: { AAPL: 20, SPY: 70, CASH: 10 } }
+      : portfolio);
+    config.layout.instances.push({ instanceId: FOLLOWER_PANE_ID, paneId: "quote-monitor", binding: { kind: "follow", sourceInstanceId: TEST_PANE_ID } });
+    const held = (symbol: string, shares: number) => makeTicker({
+      ticker: symbol, name: symbol, watchlists: [], portfolios: ["main"],
+      positions: [{ portfolio: "main", shares, avgCost: 50, currency: "USD", broker: "manual" }],
+    });
+    await tui.render(<PaneFooterProvider>{(footer) => <Box flexDirection="column">
+      <PortfolioHarness
+        config={config}
+        collectionId="main"
+        stateMutator={(state) => {
+          const symbols = cashHolding ? ["AAPL", "SPY", "CASH"] : ["AAPL", "SPY"];
+          state.tickers = new Map(symbols.map((symbol) => [symbol, held(symbol, symbol === "SPY" ? 64 : symbol === "AAPL" ? 26 : 1)]));
+          state.financials = new Map(symbols.map((symbol) => [symbol,
+            createTestFinancials({ quote: makeQuote({ symbol, price: 100, change: 0, changePercent: 0, previousClose: 100 }) })]));
+          state.paneState[TEST_PANE_ID] = { ...state.paneState[TEST_PANE_ID], cursorSymbol: "AAPL" };
+        }}
+        runtime={createTestPluginRuntime({ notify: (notification) => { notifications.push(notification); } })}
+        paneHeight={14}
+        paneWidth={160}
+      />
+      <PaneFooterBar footer={footer} focused width={160} />
+      <PaneFooterKeys paneId={TEST_PANE_ID} footer={footer} focused />
+    </Box>}</PaneFooterProvider>, { width: 160, height: 24 });
+    for (let index = 0; index < 3; index++) await flushFrame();
+  }
+
+  async function pressTargetKey(key: string) {
+    await act(async () => {
+      if (key === "enter") tui.setup().mockInput.pressEnter();
+      else tui.setup().mockInput.pressKey(key);
+      await Promise.resolve();
+      await tui.setup().renderOnce();
+    });
+    await flushFrame();
+  }
+
+  const mainTargets = () => harnessState?.config.portfolios.find((portfolio) => portfolio.id === "main")?.targetWeights;
+
+  test("t sets the cursor row's target weight in a dialog and Shift+T clears it, with no mouse", async () => {
+    const notifications: Array<{ type?: string; body: string }> = [];
+    await renderTargetBook(notifications);
+    await pressTargetKey("t");
+    expect(tui.frame()).toContain("Set Target Weight");
+    expect(tui.frame()).toContain("AAPL in Main Portfolio: weight 26.0%, target 20.0%.");
+    // The field starts at the current target: replace it.
+    await act(async () => {
+      for (let index = 0; index < 4; index++) tui.setup().mockInput.pressBackspace();
+      await tui.setup().mockInput.typeText("25");
+    });
+    await pressTargetKey("enter");
+    expect(mainTargets()).toEqual({ AAPL: 25, SPY: 70, CASH: 10 });
+    expect(notifications.at(-1)).toMatchObject({ type: "success" });
+    expect(notifications.at(-1)?.body).toStartWith("Set the target for AAPL in Main Portfolio to 25.0%.");
+
+    await pressTargetKey("T");
+    expect(mainTargets()).toEqual({ SPY: 70, CASH: 10 });
+    expect(notifications.at(-1)?.body).toStartWith("Cleared the target for AAPL in Main Portfolio.");
+  });
+
+  test("a book with cash or targets ends in CASH and TOTAL rows; CASH takes the cursor and a target, never a follower's ticker", async () => {
+    const notifications: Array<{ type?: string; body: string }> = [];
+    await renderTargetBook(notifications);
+    const line = (label: string) => tui.frame().split("\n").find((row) => row.trimStart().startsWith(label)) ?? "";
+    // Cash at its 10% target trades nothing: TRADE counts units, so its amount is in TRADE VAL alone. TOTAL adds up
+    // the allocation columns, AAPL's sale and SPY's purchase to nothing; its value, day and P&L stay in the header.
+    expect(line("CASH")).toMatch(/^ CASH +10\.0% +10\.0% +0\.0pp +0\.00 /);
+    expect(line("TOTAL")).toMatch(/^ TOTAL +100\.0% +100\.0% +0\.0pp +0\.00\s*$/);
+    expect(line("● AAPL")).toMatch(/AAPL +26\.0% +20\.0% +\+6\.0pp +-6 +-600\.00 /);
+    // The header's Cash is the row now.
+    expect(tui.frame()).not.toContain("Cash 1,000");
+    const rowY = (label: string) => tui.frame().split("\n").findIndex((row) => row.trimStart().startsWith(label));
+    const paneState = () => harnessState?.paneState[TEST_PANE_ID];
+    // Followers see the cursor once its throttle commits it.
+    const click = async (label: string) => {
+      await act(async () => {
+        await tui.setup().mockMouse.click(4, rowY(label));
+        await tui.setup().renderOnce();
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      });
+      await flushFrame();
+    };
+    // TOTAL takes no cursor.
+    await click("TOTAL");
+    expect(paneState()?.cursorSymbol).toBe("AAPL");
+    expect(paneState()?.cursorSummaryRow ?? null).toBeNull();
+    // On CASH the cursor is in its own key: cursorSymbol keeps AAPL, so the pane following PF keeps its ticker, and
+    // nothing that reads a ticker (recent tickers, the saved layout) ever holds the cash row.
+    await click("CASH");
+    expect(paneState()?.cursorSummaryRow).toBe("cash");
+    expect(paneState()?.cursorSymbol).toBe("AAPL");
+    expect(resolveTickerForPane(harnessState!, FOLLOWER_PANE_ID)).toBe("AAPL");
+    expect(harnessState!.recentTickers.every((symbol) => /^[A-Z]/.test(symbol))).toBe(true);
+    expect(JSON.stringify(harnessState!.config)).not.toContain(CASH_ROW_KEY);
+    await pressTargetKey("t");
+    expect(tui.frame()).toContain("Cash in Main Portfolio: weight 10.0%, target 10.0%.");
+    await pressTargetKey("enter");
+    expect(notifications.at(-1)?.body).toBe("Set the cash target in Main Portfolio to 10.0%.");
+    // Back on a ticker, the cash key clears and the follower moves with the cursor; j from the last holding is CASH.
+    await click("● SPY");
+    expect(paneState()?.cursorSummaryRow ?? null).toBeNull();
+    expect(resolveTickerForPane(harnessState!, FOLLOWER_PANE_ID)).toBe("SPY");
+    await click("● AAPL");
+    await pressTargetKey("j");
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 200)); });
+    expect(paneState()?.cursorSummaryRow).toBe("cash");
+    expect(resolveTickerForPane(harnessState!, FOLLOWER_PANE_ID)).toBe("AAPL");
+  });
+
+  test("cash in several currencies is a row each, and the CASH line under them takes the cursor and the one cash target", async () => {
+    // $500 and HK$4,000 at 8 to the dollar: the same $1,000 of cash, at its 10% target.
+    sharedCoordinator = new MarketDataCoordinator(createTestDataProvider({ getExchangeRate: async (currency) => (currency === "HKD" ? 0.125 : 1) }));
+    setSharedMarketDataCoordinator(sharedCoordinator);
+    const notifications: Array<{ type?: string; body: string }> = [];
+    await renderTargetBook(notifications, { cash: { cash: { amount: 500, currency: "USD" }, otherCash: [{ amount: 4_000, currency: "HKD" }] } });
+    await tui.waitForFrameToContain("CASH HKD");
+    const line = (label: string) => tui.frame().split("\n").find((row) => row.trimStart().startsWith(label)) ?? "";
+    // Each currency has its own value and weight; the target, drift and trade are the whole line's, counted once in TOTAL.
+    expect(line("CASH HKD")).toMatch(/^ CASH HKD +5\.0% +500\.00\s/);
+    expect(line("CASH USD")).toMatch(/^ CASH USD +5\.0% +500\.00\s/);
+    const rows = tui.frame().split("\n");
+    expect(rows.find((row) => /^ CASH +\d/.test(row))).toMatch(/^ CASH +10\.0% +10\.0% +0\.0pp +0\.00 +1\.0k\s/);
+    // In that order: the currencies, the whole line, then TOTAL.
+    expect(rows.filter((row) => /^ (CASH|TOTAL)/.test(row)).map((row) => row.trim().split(/ {2,}/)[0])).toEqual(["CASH USD", "CASH HKD", "CASH", "TOTAL"]);
+    expect(line("TOTAL")).toMatch(/^ TOTAL +100\.0% +100\.0% +0\.0pp +0\.00\s*$/);
+    // j from the last holding passes the currencies' rows to the CASH line, which t sets the cash target on.
+    await act(async () => {
+      await tui.setup().mockMouse.click(4, tui.frame().split("\n").findIndex((row) => row.trimStart().startsWith("● AAPL")));
+      await tui.setup().renderOnce();
+    });
+    await pressTargetKey("j");
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 200)); });
+    expect(harnessState?.paneState[TEST_PANE_ID]?.cursorSummaryRow).toBe("cash");
+    await pressTargetKey("t");
+    expect(tui.frame()).toContain("Cash in Main Portfolio: weight 10.0%, target 10.0%.");
+  });
+
+  test("a holding whose symbol is CASH takes no target, and t says why", async () => {
+    const notifications: Array<{ type?: string; body: string }> = [];
+    await renderTargetBook(notifications, { cashHolding: true });
+    await act(async () => {
+      await tui.setup().mockMouse.click(4, tui.frame().split("\n").findIndex((row) => row.trimStart().startsWith("● CASH")));
+      await tui.setup().renderOnce();
+    });
+    await flushFrame();
+    expect(harnessState?.paneState[TEST_PANE_ID]?.cursorSymbol).toBe("CASH");
+    for (const key of ["t", "T"]) {
+      await pressTargetKey(key);
+      expect(tui.frame()).not.toContain("Set Target Weight");
+      expect(notifications.at(-1)).toEqual({ type: "info", body: "The holding CASH takes no target: a target on CASH is the cash line's in Main Portfolio." });
+    }
+    expect(mainTargets()).toEqual({ AAPL: 20, SPY: 70, CASH: 10 });
+  });
+
   test("d asks before taking the selected ticker off a watchlist, then moves to the next row", async () => {
     const position = { portfolio: "main", shares: 2, avgCost: 40, currency: "USD", broker: "manual" as const };
     const watched = (symbol: string, overrides: Partial<TickerRecord["metadata"]> = {}) => makeTicker({
@@ -721,7 +971,7 @@ describe("PortfolioListPane cash and margin UI", () => {
 
     const frame = await tui.waitForFrameToContain("[b] reconnect");
     expect(frame).toContain("AAPL");
-    expect(frame).toContain("as of Oct 17 14:02");
+    expect(frame).toContain("as of 17 Oct 14:02");
     expect(frame).toContain("IBKR disconnected");
     expect(frame).not.toContain("Acct missing");
 
@@ -774,7 +1024,7 @@ describe("PortfolioListPane cash and margin UI", () => {
 
     const frame = await tui.waitForFrameToContain("[b] enable");
     expect(frame).toContain("AAPL");
-    expect(frame).toContain("as of Oct 17 14:02");
+    expect(frame).toContain("as of 17 Oct 14:02");
     expect(frame).toContain("IBKR disabled");
     expect(calls).toEqual([]);
 
@@ -808,6 +1058,28 @@ describe("PortfolioListPane cash and margin UI", () => {
       expect(notifications).toEqual([]);
     });
   }
+
+  // The watchlist read "Gloom Cloud · 12:25 UTC" the day after too: a time of the day before, without its day.
+  test("the watchlist footer names the quotes' source and time, and their day once that day has passed", async () => {
+    let clock = Date.parse("2026-11-12T23:59:59.700Z");
+    quoteClock = spyOn(Date, "now").mockImplementation(() => clock);
+    const config = createManualCollectionConfig("watchlist");
+    await tui.render(<PaneFooterProvider>{(footer) => <Box flexDirection="column">
+      <PortfolioHarness config={config} collectionId="watchlist" paneHeight={8}
+        ticker={makeTicker({ portfolios: [], watchlists: ["watchlist"], positions: [] })}
+        quote={makeQuote({ marketState: "CLOSED", dataSource: "delayed", providerId: "gloomberb-cloud",
+          lastUpdated: Date.parse("2026-11-12T12:25:00Z") })} />
+      <PaneFooterBar footer={footer} focused width={100} />
+    </Box>}</PaneFooterProvider>, { width: 100, height: 14 });
+    await flushFrame();
+    const today = await tui.waitForFrameToContain("Gloom Cloud · 12:25 UTC");
+    expect(today).not.toContain("12 Nov");
+    // Past midnight UTC, with no new quote, the same footer names the day.
+    clock = Date.parse("2026-11-13T00:00:03Z");
+    await act(async () => { await Bun.sleep(1_200); });
+    await flushFrame();
+    expect(await tui.waitForFrameToContain("Thu 12 Nov")).toMatch(/Gloom Cloud · Thu 12 Nov (2026 )?12:25 UTC/);
+  });
 
   test("quick-add rejects unresolved ticker input", async () => {
     const config = createManualCollectionConfig("watchlist");
@@ -980,7 +1252,7 @@ describe("PortfolioListPane cash and margin UI", () => {
       collectionId: "watchlist",
       collectionKind: "watchlist",
     });
-    expect(tui.frame()).not.toContain("Use a ticker symbol");
+    expect(tui.frame()).not.toContain("Type a ticker");
   });
 
   test("renders one-month sparkline column when price history is loaded", async () => {
@@ -1215,6 +1487,39 @@ describe("PortfolioListPane cash and margin UI", () => {
     expect(frame).not.toContain(occ);
   });
 
+  test("a followed ticker's tile reads its price and move, and takes no more room than the smallest holding", async () => {
+    const portfolioId = "broker:ibkr-flex:DU12345";
+    const config = createPortfolioConfig(portfolioId, [createBrokerInstance("flex")]);
+    const instance = config.layout.instances.find((entry) => entry.instanceId === TEST_PANE_ID);
+    if (instance) instance.settings = { ...(instance.settings ?? {}), viewMode: "grid" };
+    // Added in setup without shares: in the portfolio, no position.
+    const followed = createTestTicker("MSFT", "Microsoft", { portfolios: [portfolioId] });
+
+    await tui.render(
+      <PortfolioHarness
+        config={config}
+        collectionId={portfolioId}
+        stateMutator={(state) => {
+          state.tickers.set("MSFT", followed);
+          state.financials.set("MSFT", createTestFinancials({
+            quote: makeQuote({ symbol: "MSFT", name: "Microsoft", price: 420, change: -8, changePercent: -1.87, marketCap: 3.1e12 }),
+          }));
+        }}
+      />,
+      { width: 100, height: 12 },
+    );
+    await flushFrame();
+
+    // The tiles, under the collection tabs and the account summary.
+    const tiles = tui.frame().split("\n").slice(2).join("\n");
+    expect(tiles).toContain("420.00");
+    expect(tiles).toContain("-1.87%");
+    expect(tiles).not.toContain("—");
+    // Sized by its market cap, the followed tile would leave the holding no room for its value.
+    expect(tiles).toContain("AAPL");
+    expect(tiles).toContain("1.3k");
+  });
+
   test("keeps the grid's arrows on its tiles and leaves h and l to the collection tabs", async () => {
     const portfolioId = "broker:ibkr-flex:DU12345";
     const config = createPortfolioConfig(portfolioId, [createBrokerInstance("flex")]);
@@ -1365,9 +1670,9 @@ describe("PortfolioListPane cash and margin UI", () => {
 
     const frame = tui.frame();
     expect(frame).toContain("Cash & Margin");
-    expect(frame.match(/Cash -50.0k/g)).toHaveLength(1);
-    expect(frame.match(/Net Liq 125.0k/g)).toHaveLength(1);
-    expect(frame).toContain("Flex Mar 27");
+    expect(frame.match(/Cash -50,000/g)).toHaveLength(1);
+    expect(frame.match(/Net Liq 125,000/g)).toHaveLength(1);
+    expect(frame).toContain("Flex 27 Mar");
     expect(frame).toContain("-351,957.025");
     expect(frame).not.toContain("Avail");
     expect(frame).not.toContain("JPY");
@@ -1468,6 +1773,53 @@ describe("PortfolioListPane cash and margin UI", () => {
     expect(frame).toContain("2.00B");
     expect(frame).toContain("25.0");
     expect(frame).toContain("22.0");
+  });
+
+  test("warms the financials of all visible rows in one batch rather than three at a time", async () => {
+    const symbols = Array.from({ length: 80 }, (_, index) => `T${String(index).padStart(2, "0")}`);
+    const config = createManualCollectionConfig("watchlist");
+    config.layout.instances.find((pane) => pane.instanceId === TEST_PANE_ID)!.settings = { columnIds: ["ticker", "price", "pe"] };
+    const batches: number[] = [];
+    const provider = createTestDataProvider({
+      async getQuote(symbol) { return makeQuote({ symbol }); },
+      async getTickerFinancials(symbol) {
+        return createTestFinancials({ quote: makeQuote({ symbol }), fundamentals: { trailingPE: 25 } });
+      },
+      async getTickerFinancialsBatch(targets) {
+        batches.push(targets.length);
+        return targets.map((target) => ({
+          target,
+          financials: createTestFinancials({ quote: makeQuote({ symbol: target.symbol }), fundamentals: { trailingPE: 25 } }),
+        }));
+      },
+      subscribeQuotes() { return () => {}; },
+    });
+    sharedCoordinator = new MarketDataCoordinator(provider);
+    setSharedMarketDataCoordinator(sharedCoordinator);
+
+    await tui.render(
+      <PortfolioHarness
+        config={config}
+        collectionId="watchlist"
+        paneHeight={30}
+        stateMutator={(state) => {
+          state.tickers = new Map(symbols.map((symbol) => [symbol, createTestTicker(symbol, symbol, { watchlists: ["watchlist"] })]));
+          state.financials = new Map(symbols.map((symbol) => [symbol, createTestFinancials({ quote: makeQuote({ symbol }) })]));
+        }}
+      />,
+      { width: 100, height: 30 },
+    );
+    await flushFrame();
+    for (let wait = 0; wait < 40 && batches.length === 0; wait += 1) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+    }
+    await flushFrame();
+
+    // The rows on screen and the few under them, not three.
+    expect(batches[0]).toBeGreaterThanOrEqual(24);
+    expect(batches[0]).toBeLessThanOrEqual(100);
   });
 
   test("force-refreshes old visible quote data even when the pane is not focused", async () => {
@@ -2081,7 +2433,7 @@ describe("PortfolioListPane perpetual columns", () => {
     await flushFrame();
     const row = tui.frame().split("\n").find((line) => line.includes("AAPL"))!;
     expect(row).toContain("AAPL C $300 Dec'26");
-    expect(row).toContain("AAPL Dec 18 '26");
+    expect(row).toContain("AAPL 18 Dec '26");
     expect(row).not.toContain("261218C");
   });
 

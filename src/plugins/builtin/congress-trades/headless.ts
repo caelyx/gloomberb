@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type {
   HeadlessPaneColumn,
   HeadlessPaneContext,
@@ -14,6 +15,8 @@ import {
   formatCongressReturn,
   formatLag,
   FILING_DAY_FORMAT,
+  nextCongressPage,
+  previousCongressYearPage,
   sortedMembers,
   sortedTrades,
   sortedTickers,
@@ -51,6 +54,7 @@ const TRADE_COLUMNS: HeadlessPaneColumn[] = [
   { key: "owner", header: "Owner" },
   { key: "returnSinceTx", header: "Tx return", format: value => formatCongressReturn(typeof value === "number" ? value : null) },
   { key: "returnSinceFiling", header: "Filed return", format: value => formatCongressReturn(typeof value === "number" ? value : null) },
+  { key: "excessSinceFiling", header: "Vs SPY", format: value => formatCongressReturn(typeof value === "number" ? value : null) },
 ];
 
 const MEMBER_COLUMNS: HeadlessPaneColumn[] = [
@@ -73,7 +77,8 @@ const MEMBER_COLUMNS: HeadlessPaneColumn[] = [
   { key: "avgLagDays", header: "Avg", align: "right", format: (value) => formatLag(typeof value === "number" ? value : null) },
   { key: "medianReturn", header: "Median return", format: value => formatCongressReturn(typeof value === "number" ? value : null) },
   { key: "pricedTradeCount", header: "Priced trades" },
-  { key: "buyHitRate", header: "Buy hit", align: "right", format: value => typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(1)}%` : "--" },
+  { key: "medianExcessSinceFiling", header: "Median vs SPY", format: value => formatCongressReturn(typeof value === "number" ? value : null) },
+  { key: "buyHitRate", header: "Buy hit", align: "right", format: value => typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(1)}%` : MISSING_VALUE },
   { key: "pricedBuyCount", header: "Priced buys" },
 ];
 
@@ -108,6 +113,28 @@ function shotFilters(options: HeadlessPaneLoadArgs["options"], given: ReadonlySe
     const value = options[key];
     return value === "all" || (key === "minAmount" && !Number(value)) ? [] : [[key, key === "minAmount" ? Number(value) : String(value)]];
   }));
+}
+
+/**
+ * Why a page holds no trades, as the pane says it ("No matching trades in
+ * this filing window."): a ticker search reads one window of the year's
+ * filings, so none in it says nothing of the year, and never that Congress
+ * disclosures do not cover the ticker. Names the window read and the
+ * command that reads the next one, or the year before after the last.
+ */
+function emptyFilingWindow(payload: CloudCongressHousePayload, args: HeadlessPaneLoadArgs): string {
+  const symbol = args.symbols[0];
+  const from = payload.filingOffset ?? Number(args.options.filingOffset ?? 0);
+  const window = payload.filingsScanned > 0
+    ? `${payload.year} filings ${from + 1}-${from + payload.filingsScanned} of ${payload.filingCount}`
+    : `${payload.year} filings`;
+  const lines = [`No matching trades${symbol ? ` in ${symbol}` : ""} in this filing window (${window}).`];
+  const next = nextCongressPage(payload);
+  const asked = ["fn CG", symbol, args.options.tab && args.options.tab !== "trades" ? `--tab ${args.options.tab}` : null].filter(Boolean).join(" ");
+  const before = next ? null : previousCongressYearPage(payload);
+  if (next) lines.push(`An empty window does not mean none this year; the next: gloom ${asked} --year ${payload.year} --filingOffset ${next.filingOffset}`);
+  else if (before) lines.push(`That was the year's last window; the year before: gloom ${asked} --year ${before.year}`);
+  return lines.join("\n");
 }
 
 export function createCongressHeadless(
@@ -181,7 +208,10 @@ export function createCongressHeadless(
         filingsPaper: payload.filingsPaper ?? 0,
         senateUnavailable: payload.senateUnavailable ?? false,
       };
+      // None in this window is the window's answer for a covered ticker, not a gap in coverage.
+      const empty = (rows: unknown[]) => rows.length === 0 ? { empty: emptyFilingWindow(payload, args), unavailableSymbols: [] } : {};
       if (args.options.tab === "tickers") {
+        const rows = sortedTickers(payload.tickers ?? [], { columnId: "buyCount", direction: "desc" }).slice(0, limit).map((row) => ({ ...row }));
         return {
           columns: [
             { key: "ticker", header: "Ticker" }, { key: "buyCount", header: "Buys", align: "right" },
@@ -189,9 +219,10 @@ export function createCongressHeadless(
             { key: "estimatedLow", header: "Est Range", format: (_value, row) => formatAmountRange(row.estimatedLow as number | null, row.estimatedHigh as number | null) },
             { key: "lastFilingDate", header: "Last filed" },
           ],
-          rows: sortedTickers(payload.tickers ?? [], { columnId: "buyCount", direction: "desc" }).slice(0, limit).map((row) => ({ ...row })),
+          rows,
           // Tickers aggregate the filings scanned so far rather than paging rows.
           metadata: { ...metadata, aggregateScope: "filtered filing window", filingOffset: payload.filingOffset, filingsScanned: payload.filingsScanned },
+          ...empty(rows),
         };
       }
       const pagedMetadata = { ...metadata, nextOffset: payload.nextOffset, hasMore: payload.hasMore };
@@ -199,12 +230,12 @@ export function createCongressHeadless(
         const rows = sortedMembers(payload.members, { columnId: "trades", direction: "desc" })
           .slice(0, limit)
           .map((member) => ({ ...member }));
-        return { columns: MEMBER_COLUMNS, rows, metadata: pagedMetadata };
+        return { columns: MEMBER_COLUMNS, rows, metadata: pagedMetadata, ...empty(rows) };
       }
       const rows = sortedTrades(payload.trades, { columnId: "filed", direction: "desc" })
         .slice(0, limit)
         .map((trade) => ({ ...trade }));
-      return { columns: TRADE_COLUMNS, rows, metadata: pagedMetadata };
+      return { columns: TRADE_COLUMNS, rows, metadata: pagedMetadata, ...empty(rows) };
     },
   };
 }

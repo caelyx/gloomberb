@@ -12,16 +12,20 @@ import {
   type DataTableCell,
   type StatItem,
 } from "../../../components";
+import { ageFooterSegment } from "../../../components/layout/pane/footer";
 import { formatCompactAxis } from "../../../components/chart-table";
 import { useChartViewReset } from "../../../components/chart/core/view-reset";
 import { scalarPoint, staticSeries } from "../../../components/chart/static/series";
 import { handleRefreshKey, usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { useAsyncResource, useAutoRefresh, usePaneSettingValue, usePluginPaneState, useUpdatedAgo } from "../../../public/react";
+import { useUtcDay } from "../../../react/auto-refresh";
 import { colors } from "../../../theme/colors";
 import type { PaneProps } from "../../../types/plugin";
 import { Box } from "../../../ui";
 import { isPlainKeyboardEvent } from "../../../utils/keyboard";
 import { cachedCryptoEtfFlows, loadCryptoEtfFlows } from "./client";
+import { cryptoEtfFlowFreshness, cryptoEtfFlowsHeadless } from "./headless";
+import { reportFooterSegment } from "../shared/source-footer";
 import {
   CRYPTO_ETF_FLOW_ASSETS,
   CRYPTO_ETF_FLOW_RANGES,
@@ -36,6 +40,7 @@ import {
   flowColor,
   formatFlow,
   formatFlowAmount,
+  formatPriceChange,
   fundTickerOfColumn,
   pendingText,
   type CryptoEtfFlowColumn,
@@ -76,13 +81,15 @@ export function CryptoEtfFlowsPane({ focused, width, height }: PaneProps) {
   }, [asset, setSelectedByAsset]);
 
   const label = cryptoEtfFlowAssetLabel(asset);
-  // The running total since the first fund launched, drawn over the range the table lists.
+  // The running total since the first fund launched, drawn over the range the table lists. Its legend is the one
+  // place the total and the day it starts from are said; the figures above carry only the table's windows.
   const series = useMemo(() => {
     if (!data) return [];
     const first = days.at(-1)?.date ?? "";
     const points = cumulativeFlows(data).filter((point) => point.date >= first)
       .map((point) => scalarPoint(new Date(`${point.date}T00:00:00Z`), point.value * 1_000_000));
-    return [staticSeries(points, { id: `etf-flows:${asset}`, label: `${label} ETF net flows since launch`, color: colors.positive, calendarSpaced: true })];
+    const launch = data.days.at(-1)?.date;
+    return [staticSeries(points, { id: `etf-flows:${asset}`, label: `${label} ETF net flows since ${launch ?? "launch"}`, color: colors.positive, calendarSpaced: true })];
   }, [asset, data, days, label]);
   const link = useChartTableSelection({ rows: days, getId: rowId, getDate: rowDate, selectedId, onSelect: selectDay, focused });
 
@@ -91,23 +98,26 @@ export function CryptoEtfFlowsPane({ focused, width, height }: PaneProps) {
   const figures: StatItem[] = summary ? [
     { id: "latest", label: "Latest day", value: formatFlowAmount(latest?.total), color: flowColor(latest?.total, colors),
       detail: [latest?.date, pending].filter(Boolean).join(" · ") || undefined },
-    { id: "week", label: "5 days", value: formatFlowAmount(summary.week), color: flowColor(summary.week, colors) },
-    { id: "month", label: "20 days", value: formatFlowAmount(summary.month), color: flowColor(summary.month, colors) },
-    { id: "launch", label: "Since launch", value: formatFlowAmount(summary.sinceLaunch), color: flowColor(summary.sinceLaunch, colors),
-      detail: summary.firstDate ? `since ${summary.firstDate}` : undefined },
+    // The rolling sums leave out a day still pending, and say the day they end on.
+    { id: "week", label: "5 days", value: formatFlowAmount(summary.week), color: flowColor(summary.week, colors),
+      ...summary.through ? { detail: `through ${summary.through}` } : {} },
+    { id: "month", label: "20 days", value: formatFlowAmount(summary.month), color: flowColor(summary.month, colors),
+      ...summary.through ? { detail: `through ${summary.through}` } : {} },
   ] : [];
 
   const updatedAgo = useUpdatedAgo(resource.updatedAt);
+  const utcDay = useUtcDay();
+  // The publisher and the flows' day, as `fn ETFF` ends; how long ago it loaded goes first on a narrow row.
   const footerInfo = useMemo(() => data ? [
-    { id: "as-of", parts: [{ text: `as of ${data.asOf}`, tone: "muted" as const }] },
-    ...(updatedAgo ? [{ id: "updated", parts: [{ text: updatedAgo, tone: "muted" as const }] }] : []),
-  ] : [], [data, updatedAgo]);
+    reportFooterSegment(cryptoEtfFlowsHeadless, { rows: [], freshness: cryptoEtfFlowFreshness(data, data.asOf) }),
+    ...(updatedAgo ? [ageFooterSegment(updatedAgo)] : []),
+  ] : [], [data, updatedAgo, utcDay]);
   useAutoRefresh(resource.updatedAt, resource.load);
-  const refresh = useCallback(() => void resource.reload(), [resource.reload]);
+  const refresh = useCallback(() => resource.reload(), [resource.reload]);
   usePaneRefreshKey(refresh, { focused });
   usePaneStatusLinkFooter({
     registrationId: CRYPTO_ETF_FLOWS_PANE_ID, focused, loading: resource.loading, error: data ? null : resource.error,
-    url: data?.source.url ?? null, source: data?.source.publisher ?? null, label: "publisher", showOpenHint: true,
+    url: data?.source.url ?? null, showOpenHint: true,
     info: footerInfo, stale: !!data && (data.stale || !!current?.stale),
   });
   usePaneNoticeFooter({
@@ -135,6 +145,7 @@ export function CryptoEtfFlowsPane({ focused, width, height }: PaneProps) {
   const renderCell = useCallback((day: CryptoEtfFlowDay, column: CryptoEtfFlowColumn): DataTableCell => {
     if (column.id === "date") return { text: day.date, value: day.date, color: colors.text };
     if (column.id === "total") return { text: formatFlow(day.total), value: day.total, color: flowColor(day.total, colors) };
+    if (column.id === "price") return { text: formatPriceChange(day.priceChangePct), value: day.priceChangePct ?? null, color: flowColor(day.priceChangePct, colors) };
     const ticker = fundTickerOfColumn(column.id) ?? "";
     const value = day.flows[ticker] ?? null;
     // A fund that reported the day before and not yet today: its figure is to come, not none.

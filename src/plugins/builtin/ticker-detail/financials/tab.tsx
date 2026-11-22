@@ -14,32 +14,36 @@ import {
   type DataTableColumn,
 } from "../../../../components";
 import { colors, priceColor } from "../../../../theme/colors";
+import { notMeaningfulColor } from "../../../../components/ui/not-meaningful";
+import { isNotMeaningful } from "../../../../utils/growth";
 import { fiscalYearEndMonth } from "../../../../utils/fiscal-period";
-import { padTo } from "../../../../utils/format";
-import { filledPeriodsNote, stalePeriodNote } from "../../../../utils/financial-statements";
+import { displayWidth, padTo } from "../../../../utils/format";
+import { filledPeriodPublications, filledPeriodsNote, stalePeriodNote } from "../../../../utils/financial-statements";
 import {
   FINANCIAL_COL_W,
-  FINANCIAL_LABEL_W,
+  financialLabelWidth,
+  financialPeriodWidth,
   FINANCIAL_SUB_TABS,
   buildFinancialRows,
-  canCompareFinancialRow,
   collectDefaultCollapsedGroupIds,
   collectGroupIds,
-  computeGrowth,
-  financialColumnLabel,
+  financialCellParts,
+  financialColumnPeriod,
+  financialFiscalHeader,
   formatFinancialCell,
+  formatFinancialCellValue,
   financialStatementCurrency,
   financialStatementLimitations,
   financialStatementPeriods,
   financialSubTabFields,
-  formatFinancialValue,
   latestFinancialPeriodEnd,
+  notInYetNote,
   resolveFinancialPeriod,
   resolveFinancialPeriodOption,
   semanticGrowthValue,
   selectFinancialStatements,
   shareFinancialUnit,
-  statementMetricValue,
+  splitPeriodsNotInYet,
   type FinancialPeriod,
   type FinancialTableRow,
 } from "./model";
@@ -58,6 +62,7 @@ import {
   type RatioAmount,
 } from "./ratios";
 import { PeriodEndHistoryLoader, RatioTable, ratioMetricColumn, type PeriodEndHistoryState, type RatioTableColumn } from "./ratio-table";
+import { useExchangeResultsNotes } from "./exchange-results";
 import { latestBalanceSheetDate, useOfferingNote } from "./offerings";
 import { useBoundTicker } from "../../shared/ticker-request";
 import { createValuationCurrencyContext } from "../../../../time-series/valuation-currency";
@@ -69,6 +74,32 @@ type FinancialTableColumn = DataTableColumn & (
   | { id: string; kind: "statement"; statement: FinancialTableStatement }
 );
 
+const NO_COLLAPSED_GROUPS: ReadonlySet<string> = new Set();
+
+/**
+ * A group's name in the metric column. It draws its indent (an empty one still takes a cell), its disclosure
+ * and its name a cell apart, and says that width (`contentWidth`) so the table fits the column to it whole.
+ * The desktop draws the disclosure as a path, not a glyph.
+ */
+export function financialGroupNameCell(
+  row: Extract<FinancialTableRow, { kind: "group" }>,
+  color: string,
+  attributes: number,
+): Pick<DataTableCell, "text" | "contentWidth" | "content"> {
+  const indent = " ".repeat(row.depth * 2);
+  const marker = row.toggleable ? (row.expanded ? "\u25be" : "\u25b8") : " ";
+  return {
+    text: `${indent}${marker} ${row.unitLabel}`,
+    contentWidth: Math.max(1, displayWidth(indent)) + 1 + displayWidth(marker) + 1 + displayWidth(row.unitLabel),
+    content: (
+      <Box flexDirection="row" alignItems="center" gap={1}>
+        <Text fg={color}>{indent}</Text>
+        {row.toggleable ? <DisclosureMarker expanded={!!row.expanded} color={color} /> : <Text> </Text>}
+        <Text fg={color} attributes={attributes}>{row.unitLabel}</Text>
+      </Box>
+    ),
+  };
+}
 const financialRowKey = (row: FinancialTableRow) => row.id;
 const financialRowBackground = (row: FinancialTableRow) => (
   row.kind === "group" && row.depth === 0 ? colors.panel : undefined
@@ -81,7 +112,7 @@ function financialColumnHeader(
   yearEndMonth: number | null,
   sharedCurrency: string | undefined,
 ): string {
-  const header = financialColumnLabel(statement, kind, yearEndMonth);
+  const header = financialFiscalHeader(statement, kind, yearEndMonth);
   return !sharedCurrency && statement.currency ? `${header} ${statement.currency}` : header;
 }
 
@@ -120,10 +151,12 @@ export function ResolvedFinancialsTab({
   const [storedSubTab, setStoredSubTab] = usePaneStateValue<string>("financialSubTab", FINANCIAL_SUB_TABS[0]!.key);
   const resolvedSubTabKey = resolveFinancialSectionKey(storedSubTab);
   const subTabIdx = Math.max(0, FINANCIAL_SECTIONS.findIndex((tab) => tab.key === resolvedSubTabKey));
-  // Ratios open collapsed: the inputs behind each one show on demand.
+  // Ratios open collapsed: the inputs behind each one show on demand. A capture of a ratio tab opens them all
+  // (`financialRatiosExpanded`), so the picture holds the inputs the report lists.
+  const [ratiosExpanded] = usePaneStateValue<boolean>("financialRatiosExpanded", false);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set([
     ...collectDefaultCollapsedGroupIds(FINANCIAL_SUB_TABS.flatMap((tab) => tab.rows)),
-    ...RATIO_TABS.flatMap((tab) => tab.ratios.map((ratio) => ratio.id)),
+    ...ratiosExpanded ? [] : RATIO_TABS.flatMap((tab) => tab.ratios.map((ratio) => ratio.id)),
   ]));
   const [selectedRowId, setSelectedRowId] = useState<string | null>(null);
   const bodyScrollRef = useRef<ScrollBoxRenderable>(null);
@@ -291,44 +324,66 @@ export function ResolvedFinancialsTab({
 
   const resolvedPeriod = resolveFinancialPeriod(period, hasAnnualStatements, hasQuarterlyStatements);
   const isAnnual = resolvedPeriod === "annual";
-  const { statements: displayStatements, previousStatementMap } = useMemo(
-    () => selectFinancialStatements(resolvedPeriod, subTab.key, annualStatements, quarterlyStatements),
-    [annualStatements, quarterlyStatements, resolvedPeriod, subTab.key],
+  const selected = useMemo(
+    () => selectFinancialStatements(resolvedPeriod, subTab.key, annualStatements, quarterlyStatements, undefined, financials?.trailingStatement),
+    [annualStatements, quarterlyStatements, resolvedPeriod, subTab.key, financials?.trailingStatement],
   );
+  // A newest period with only some figures (an EPS alone) is left out of a statement table, and a line says so.
+  const { shown: displayStatements, notInYet } = useMemo(
+    () => ratioTab ? { shown: selected.statements, notInYet: [] } : splitPeriodsNotInYet(selected.statements, subTab),
+    [ratioTab, selected.statements, subTab],
+  );
+  const previousStatementMap = selected.previousStatementMap;
   // One currency for every column goes in the query bar with the growth basis;
   // a column in a different currency (or none) says so in its own header.
   const growthBasis = isAnnual ? "YoY" : "QoQ";
   const yearEndMonth = useMemo(() => fiscalYearEndMonth(annualStatements), [annualStatements]);
   const annualDates = useMemo(() => new Set(annualStatements.map(({ date }) => date)), [annualStatements]);
+  const { rows, unit } = useMemo(
+    () => shareFinancialUnit(buildFinancialRows(subTab.rows, displayStatements, collapsedGroups)),
+    [collapsedGroups, displayStatements, subTab.rows],
+  );
+  // The money unit most rows share heads the line names, so it is never cut with the query bar's text; rows in
+  // another unit say theirs ("Interest Exp (mn)"), which the header says it leaves to them.
+  const moneyUnit = [comparisonCurrency, unit].filter(Boolean).join(" ");
+  const unitMarked = !!unit && rows.some((row) => row.unitLabel !== row.label);
+  const metricHeader = moneyUnit ? `${moneyUnit}${unitMarked ? " unless marked" : ""}` : "Metric";
+  // The annual balance sheet leads with a newer quarter-end position.
+  const periodHeaders = useMemo(() => displayStatements.map((statement) => financialColumnHeader(
+    statement,
+    financialColumnPeriod(statement, resolvedPeriod, annualDates),
+    yearEndMonth,
+    comparisonCurrency,
+  )), [annualDates, comparisonCurrency, displayStatements, resolvedPeriod, yearEndMonth]);
+  // In the terminal a period is as wide as its widest value and growth, so each pair sits as far from the next
+  // as from its own growth and more periods fit. The ratio tabs keep the statement columns' width. Every line of
+  // the statement counts, a collapsed group's too, so opening or closing one leaves the periods where they are.
+  const periodWidth = useMemo(() => {
+    if (nativePaneChrome || ratioTab) return Math.max(FINANCIAL_COL_W, financialPeriodWidth([], periodHeaders));
+    const everyRow = shareFinancialUnit(buildFinancialRows(subTab.rows, displayStatements, NO_COLLAPSED_GROUPS)).rows;
+    const values = [...everyRow, ...rows].flatMap((row) => displayStatements.map((statement) => (
+      formatFinancialCellValue(row, statement)
+    )));
+    return financialPeriodWidth(values, periodHeaders);
+  }, [displayStatements, nativePaneChrome, periodHeaders, ratioTab, rows, subTab.rows]);
   const columns = useMemo<FinancialTableColumn[]>(() => [
     {
       id: "metric",
       kind: "metric",
-      label: "Metric",
-      width: FINANCIAL_LABEL_W,
+      label: metricHeader,
+      width: financialLabelWidth(width, periodWidth),
       align: "left",
     },
     ...displayStatements.map((statement, index): FinancialTableColumn => ({
       id: `statement:${statement.date}:${index}`,
       kind: "statement",
       statement,
-      // The annual balance sheet leads with a newer quarter-end position.
-      label: padTo(financialColumnHeader(
-        statement,
-        isAnnual && (statement.date === "TTM" || annualDates.has(statement.date)) ? "annual" : "quarterly",
-        yearEndMonth,
-        comparisonCurrency,
-      ), FINANCIAL_COL_W, "center"),
-      width: FINANCIAL_COL_W,
+      label: padTo(periodHeaders[index]!, periodWidth, "center"),
+      width: periodWidth,
       align: "right",
       headerColor: statement.date === "TTM" ? colors.textBright : colors.textDim,
     })),
-  ], [annualDates, comparisonCurrency, displayStatements, isAnnual, yearEndMonth]);
-  const { rows, unit } = useMemo(
-    () => shareFinancialUnit(buildFinancialRows(subTab.rows, displayStatements, collapsedGroups)),
-    [collapsedGroups, displayStatements, subTab.rows],
-  );
-  const moneyUnit = [comparisonCurrency, unit].filter(Boolean).join(" ");
+  ], [displayStatements, metricHeader, periodHeaders, periodWidth, width]);
   const periodEnd = latestFinancialPeriodEnd(displayStatements);
   const renderCell = useCallback((
     row: FinancialTableRow,
@@ -336,22 +391,12 @@ export function ResolvedFinancialsTab({
   ): DataTableCell => {
     if (column.kind === "metric") {
       if (row.kind === "group") {
-        const indent = " ".repeat(row.depth * 2);
-        const marker = row.toggleable ? (row.expanded ? "\u25be" : "\u25b8") : " ";
         const labelColor = row.depth === 0 ? colors.textBright : colors.textDim;
         const labelAttributes = row.depth === 0 ? TextAttributes.BOLD : TextAttributes.NONE;
         return {
-          text: `${indent}${marker} ${row.unitLabel}`,
+          ...financialGroupNameCell(row, labelColor, labelAttributes),
           color: labelColor,
           attributes: labelAttributes,
-          // The desktop draws the disclosure as a path, not a glyph.
-          content: (
-            <Box flexDirection="row" alignItems="center" gap={1}>
-              <Text fg={labelColor}>{indent}</Text>
-              {row.toggleable ? <DisclosureMarker expanded={!!row.expanded} color={labelColor} /> : <Text> </Text>}
-              <Text fg={labelColor} attributes={labelAttributes}>{row.unitLabel}</Text>
-            </Box>
-          ),
           onMouseDown: row.toggleable
             ? (event) => {
               event.preventDefault?.();
@@ -368,31 +413,18 @@ export function ResolvedFinancialsTab({
       };
     }
 
-    const key = row.kind === "group" ? row.summaryKey : undefined;
-    if (row.kind === "group" && !key) return {
+    if (row.kind === "group" && !row.summaryKey) return {
       text: "",
     };
 
-    const previous = previousStatementMap.get(column.statement.date);
-    const value = row.kind === "group"
-      ? column.statement[key!] as number | undefined
-      : statementMetricValue(row, column.statement);
-    const previousValue = previous
-      ? row.kind === "group"
-        ? previous[key!] as number | undefined
-        : statementMetricValue(row, previous)
-      : undefined;
-    const growth = (row.kind === "metric" && !row.showGrowth)
-      || !canCompareFinancialRow(row, column.statement, previous, comparisonCurrency)
-      ? undefined : computeGrowth(value, previousValue);
-    const formattedValue = formatFinancialValue(value, row);
-    const cell = formatFinancialCell(formattedValue, growth);
+    const { formattedValue, growth } = financialCellParts(row, column.statement, previousStatementMap.get(column.statement.date), comparisonCurrency);
+    const cell = formatFinancialCell(formattedValue, growth, column.width);
     const growthColorValue = semanticGrowthValue(growth, row.growthDirection);
 
     return {
       text: `${cell.valueText}${cell.growthText}`,
       content: (
-        <Box flexDirection="row" width={FINANCIAL_COL_W}>
+        <Box flexDirection="row" width={column.width}>
           <Text
             attributes={row.kind === "group" ? TextAttributes.BOLD : TextAttributes.NONE}
             fg={colors.text}
@@ -401,7 +433,8 @@ export function ResolvedFinancialsTab({
           </Text>
           <Text
             attributes={row.kind === "group" ? TextAttributes.BOLD : TextAttributes.NONE}
-            fg={growthColorValue != null ? priceColor(growthColorValue) : colors.text}
+            // N/M growth as every pane draws it.
+            fg={growthColorValue != null ? priceColor(growthColorValue) : isNotMeaningful(growth) ? notMeaningfulColor() : colors.text}
           >
             {cell.growthText}
           </Text>
@@ -440,12 +473,19 @@ export function ResolvedFinancialsTab({
     isValuation, quarterlyStatements, ratioTab, resolvedPeriod, financials?.profile,
   ]);
   const ratioColumns = useMemo<RatioTableColumn[]>(() => [
-    ratioMetricColumn(),
+    ratioMetricColumn(width),
     ...columns.flatMap((column, index) => column.kind === "statement" ? [{ ...column, index: index - 1 }] : []),
-  ], [columns]);
+  ], [columns, width]);
 
   // The Balance Sheet and Liquidity show cash, which an offering filed since the latest balance sheet is not in yet.
   const { symbol: boundSymbol, exchange: boundExchange } = useBoundTicker();
+  // Years filled from the listing's exchange, with the lines this table shows.
+  const filledFields = useMemo(() => ratioTab ? undefined : financialSubTabFields(subTab), [ratioTab, subTab]);
+  const filledPeriods = useMemo(() => filledPeriodsNote(displayStatements, filledFields), [displayStatements, filledFields]);
+  const filledDates = useMemo(() => filledPeriodPublications(displayStatements, filledFields), [displayStatements, filledFields]);
+  // An HKEX company's latest period dated by its results announcement, unless the filled periods already date it, and
+  // what was announced after it.
+  const exchangeResults = useExchangeResultsNotes(boundSymbol, boundExchange, latestBalanceSheetDate(financials), filledDates);
   const offeringNote = useOfferingNote(boundSymbol, boundExchange, latestBalanceSheetDate(financials),
     !!financials && (section.key === "balance" || section.key === "liquidity"));
 
@@ -454,14 +494,15 @@ export function ResolvedFinancialsTab({
     () => stalePeriodNote(financialStatementPeriods(displayStatements, subTab)),
     [displayStatements, subTab],
   );
-  // Years filled from the listing's exchange, with the lines this table shows.
-  const filledPeriods = useMemo(
-    () => filledPeriodsNote(displayStatements, ratioTab ? undefined : financialSubTabFields(subTab)),
-    [displayStatements, ratioTab, subTab],
+  const notInYetLine = useMemo(
+    () => notInYetNote(notInYet, subTab, resolvedPeriod, yearEndMonth),
+    [notInYet, resolvedPeriod, subTab, yearEndMonth],
   );
   usePaneNoticeFooter({
     registrationId: "financials-notices",
     notices: [
+      ...(notInYetLine ? [notInYetLine] : []),
+      ...exchangeResults,
       ...(stalePeriod ? [stalePeriod] : []),
       ...(filledPeriods ? [filledPeriods] : []),
       ...financialStatementLimitations(financials),
@@ -511,10 +552,9 @@ export function ResolvedFinancialsTab({
         ],
         onChange: (value: string) => setPeriod(value as FinancialPeriod),
       }}
-      meta={meta}
+      meta={meta || undefined}
     />
   );
-  const asOf = periodEnd ? `as of ${periodEnd}` : "";
 
   return (
     <Box
@@ -524,7 +564,6 @@ export function ResolvedFinancialsTab({
       // Desktop: the query bar and table run edge to edge like every other
       // pane; the table keeps its own inline padding.
       paddingX={nativePaneChrome ? 0 : 1}
-      paddingBottom={nativePaneChrome ? 0 : 1}
       overflow="hidden"
     >
       {isValuation && oldestPeriodEnd ? <PeriodEndHistoryLoader oldestPeriodEnd={oldestPeriodEnd} onChange={setHistory} /> : null}
@@ -544,7 +583,7 @@ export function ResolvedFinancialsTab({
             ...(periodEnd ? [["As of", periodEnd]] : []),
           ]}
           resetScrollKey={`${resolvedPeriod}:${section.key}:${displayStatements.length}`}
-          rootBefore={queryBar([comparisonCurrency, asOf].filter(Boolean).join(" · "))}
+          rootBefore={queryBar(comparisonCurrency ?? "")}
         />
       ) : (
         <DataTableView<FinancialTableRow, FinancialTableColumn>
@@ -555,6 +594,8 @@ export function ResolvedFinancialsTab({
           headerScrollId={headerScrollId}
           bodyScrollId={bodyScrollId}
           columns={columns}
+          // Fiscal periods, oldest to newest: an axis, not columns to arrange.
+          columnReorder={false}
           items={rows}
           selection={{
             kind: "id",
@@ -584,7 +625,7 @@ export function ResolvedFinancialsTab({
           ]}
           showHorizontalScrollbar
           resetScrollKey={`${resolvedPeriod}:${subTab.key}:${displayStatements.length}`}
-          rootBefore={queryBar([moneyUnit, growthBasis, asOf].filter(Boolean).join(" · "))}
+          rootBefore={queryBar(growthBasis ?? "")}
         />
       )}
     </Box>

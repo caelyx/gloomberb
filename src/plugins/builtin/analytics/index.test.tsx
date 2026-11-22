@@ -201,10 +201,10 @@ describe("PortfolioAnalyticsPane", () => {
           brokerAccounts={{ "ibkr-flex": [{ accountId: "DU12345", name: "Fixture", currency,
             netLiquidation: 20000, totalCashValue: 18000 }] }} />, { width: 100, height: 32 });
       });
-      const frame = await tui.waitForFrameToContain(currency ? "15.0k" : "Unavailable");
-      expect(frame).toMatch(figure("Net Liq", currency ? "15.0k" : "—"));
-      expect(frame).toMatch(figure("Cash", currency ? "13.5k" : "—"));
-      expect(frame).not.toMatch(figure("Net Liq", "20.0k"));
+      const frame = await tui.waitForFrameToContain(currency ? "15,000" : "Unavailable");
+      expect(frame).toMatch(figure("Net Liq", currency ? "15,000" : "—"));
+      expect(frame).toMatch(figure("Cash", currency ? "13,500" : "—"));
+      expect(frame).not.toMatch(figure("Net Liq", "20,000"));
       if (currency) expect(requested).toContain("CAD");
       else expect(frame).toMatch(figure("FX", "Unavailable"));
     });
@@ -228,10 +228,10 @@ describe("PortfolioAnalyticsPane", () => {
         brokerAccounts={withAccount ? { "ibkr-flex": [{ accountId: "DU12345", name: "Fixture", currency: "USD",
           netLiquidation: 6000, totalCashValue: 6000, grossPositionValue: 0 }] } : {}} />, { width: 100, height: 36 });
     });
-    const frame = await tui.waitForFrameToContain("Sep 1 2026");
+    const frame = await tui.waitForFrameToContain("1 Sep 2026");
     if (withAccount) {
-      expect(frame).toMatch(figure("Net Liq", "6.0k"));
-      expect(frame).toMatch(figure("Cash", "6.0k"));
+      expect(frame).toMatch(figure("Net Liq", "6,000"));
+      expect(frame).toMatch(figure("Cash", "6,000"));
     } else {
       expect(frame).not.toContain("Net Liq");
       expect(frame).not.toContain("Cash");
@@ -245,7 +245,7 @@ describe("PortfolioAnalyticsPane", () => {
     const lines = frame.split("\n");
     const legend = lines.findIndex((line) => line.includes("● Value (USD)"));
     expect(legend).toBeGreaterThan(0);
-    expect(lines.slice(legend).some((line) => line.includes("Sep 1 2026"))).toBe(true);
+    expect(lines.slice(legend).some((line) => line.includes("1 Sep 2026"))).toBe(true);
     expect(frame).not.toContain("Est. Sharpe");
     expect(frame).not.toContain("SECTOR");
   });
@@ -399,19 +399,19 @@ describe("PortfolioAnalyticsPane", () => {
     await flushFrame();
 
     const frame = tui.frame();
-    expect(frame).toMatch(figure("Net Liq", "125.0k"));
-    expect(frame).toMatch(figure("Gross", "113.6k"));
+    expect(frame).toMatch(figure("Net Liq", "125,000"));
+    expect(frame).toMatch(figure("Gross", "113,636"));
     expect(frame).toMatch(figure("Margin Lev", "0.9x"));
-    expect(frame).toMatch(figure("Cash", "-50.0k"));
+    expect(frame).toMatch(figure("Cash", "-50,000"));
     expect(frame).toMatch(figure("Day", "+900.00"));
     expect(frame).toMatch(figure("P&L", "+777.00"));
     expect(frame).toMatch(figure("Realized", "-25.00"));
-    expect(frame).toMatch(figure("Settled", "-45.0k"));
-    expect(frame).toMatch(figure("Avail", "15.0k"));
-    expect(frame).toMatch(figure("Excess", "12.0k"));
-    expect(frame).toMatch(figure("BP", "30.0k"));
-    expect(frame).toMatch(figure("As Of", "Mar 26"));
-    expect(frame).toMatch(figure("Source", "Flex Mar 26"));
+    expect(frame).toMatch(figure("Settled", "-45,000"));
+    expect(frame).toMatch(figure("Avail", "15,000"));
+    expect(frame).toMatch(figure("Excess", "12,000"));
+    expect(frame).toMatch(figure("BP", "30,000"));
+    expect(frame).toMatch(figure("As Of", "26 Mar"));
+    expect(frame).toMatch(figure("Source", "Flex 26 Mar"));
   });
 
   test("falls back from a Gateway portfolio to a configured Flex profile for IBKR history", async () => {
@@ -519,7 +519,7 @@ describe("PortfolioAnalyticsPane", () => {
     expect(frame).toContain("Flex DU12345");
     // No account for this broker portfolio: its equity is unknown, and its positions are only its gross.
     expect(frame).toMatch(figure("Net Liq", "—"));
-    expect(frame).toMatch(figure("Gross", "1.4k"));
+    expect(frame).toMatch(figure("Gross", "1,400"));
     expect(frame).toMatch(figure("P&L", "+400.00 +40.00%"));
     expect(frame).toContain("Technology               100.0%       1.4k    +400.00  +40.00%");
     expect(frame).not.toContain("1.3k");
@@ -571,11 +571,11 @@ for (const scenario of ["unknown currency", "dated correction", "empty observati
       if (scenario === "dated correction") {
         // The correction leaves Sep 10 without a value, so the line ends on Jan 2 and the footer says why.
         expect(frame).toContain("● Value (USD) 11.0k");
-        expect(frame).not.toContain("Sep 10 2026");
+        expect(frame).not.toContain("10 Sep 2026");
       } else {
         expect(frame).toContain("● Value (unknown currency) 21.0k");
-        expect(frame).toContain("Jan 1 2026");
-        expect(frame).toContain("Sep 10 2026");
+        expect(frame).toContain("1 Jan 2026");
+        expect(frame).toContain("10 Sep 2026");
       }
       expect(frame).not.toContain("Value (JPY)");
       if (scenario === "dated correction") {

@@ -1,5 +1,7 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { expect, test } from "bun:test";
 import type { Quote, TickerFinancials } from "../../../types/financials";
+import { fundamentalsBasisParts } from "./relative-valuation-basis";
 import { formatRelativePrice, relativeValuationValues, withLiveQuote } from "./relative-valuation-model";
 
 const snapshot: TickerFinancials = {
@@ -19,7 +21,7 @@ test("a missing price currency stays blank, and an explicit code still prints", 
   expect(formatRelativePrice(10, undefined)).toBe("10.00");
   expect(formatRelativePrice(10, "USD")).toBe("$10.00");
   expect(formatRelativePrice(10, "EUR")).toBe("€10.00");
-  expect(formatRelativePrice(null, "USD")).toBe("-");
+  expect(formatRelativePrice(null, "USD")).toBe(MISSING_VALUE);
 });
 
 test("a live quote moves price-based values with the price and keeps the fundamentals", () => {
@@ -67,4 +69,99 @@ test("values measured at a stale price or from stale fundamentals do not scale",
   expect(fromStaleQuote.price).toBe(110);
   expect(fromStaleQuote.marketCap).toBe(900);
   expect(fromStaleQuote.reportedMultiples.trailingPE).toBe(20);
+});
+
+test("a margin the source did not serve for the trailing year falls back to the latest fiscal year and names it", () => {
+  // CCL on 2026-10-25: the quarter ended 2026-08-31 was not in the statements yet, so no trailing margin was served.
+  const carnival: TickerFinancials = {
+    ...snapshot,
+    annualStatements: [
+      { date: "2024-11-30", totalRevenue: 25.02e9, operatingIncome: 3.57e9 },
+      { date: "2025-11-30", totalRevenue: 26.62e9, operatingIncome: 4.48e9 },
+    ],
+  };
+  const values = relativeValuationValues(carnival);
+  expect(values.operatingMargin).toBeCloseTo(4.48 / 26.62);
+  expect(values).toMatchObject({ operatingMarginPeriod: "FY25", operatingMarginPeriodEnd: "2025-11-30", gaps: {} });
+  // A trailing margin, when served, is the figure and names no year.
+  const trailing = relativeValuationValues({ ...carnival, fundamentals: { ...carnival.fundamentals, operatingMargin: 0.13 } });
+  expect(trailing).toMatchObject({ operatingMargin: 0.13, operatingMarginPeriod: null, operatingMarginPeriodEnd: null });
+  // The latest year without its operating income is a gap; an older year is not passed off for it.
+  const gap = relativeValuationValues({ ...carnival, annualStatements: [carnival.annualStatements[0]!, { date: "2025-11-30", totalRevenue: 26.62e9 }] });
+  expect(gap).toMatchObject({ operatingMargin: null, operatingMarginPeriod: null, gaps: { operatingMargin: "not reported" } });
+});
+
+test("a margin over revenue at or below zero, and growth off it, read N/M and say why", () => {
+  // An insurer whose fair value losses turned a year's revenue negative.
+  const negative: TickerFinancials = {
+    ...snapshot,
+    annualStatements: [{ date: "2025-12-31", totalRevenue: -2e9, operatingIncome: -3e9 }],
+    quarterlyStatements: [
+      { date: "2025-09-30", totalRevenue: -0.5e9 },
+      { date: "2026-09-30", totalRevenue: 1.2e9 },
+    ],
+    fundamentals: { ...snapshot.fundamentals, revenueGrowth: 3.4 },
+  };
+  const values = relativeValuationValues(negative);
+  expect(values).toMatchObject({ operatingMargin: null, revenueGrowth: null, gaps: {} });
+  expect(values.notMeaningful).toMatchObject({
+    operatingMargin: "FY25 revenue is at or below zero",
+    revenueGrowth: "revenue to 2025-09-30 is at or below zero",
+  });
+  // A trailing margin served over trailing revenue at or below zero is N/M too.
+  const trailing = relativeValuationValues({ ...negative, fundamentals: { ...negative.fundamentals, revenue: -1e9, operatingMargin: 1.5 } });
+  expect(trailing).toMatchObject({ operatingMargin: null, notMeaningful: { operatingMargin: "trailing revenue is at or below zero" } });
+  // Off a positive base the served growth stands.
+  const positive = relativeValuationValues({ ...negative, quarterlyStatements: [{ date: "2025-09-30", totalRevenue: 1e9 }, { date: "2026-09-30", totalRevenue: 1.2e9 }] });
+  expect(positive.revenueGrowth).toBe(3.4);
+});
+
+// fn RV of Tokyo's trading houses on 9 Nov 2026 read EV/S "revenue ccy unstated" and "no TTM FCF" for
+// Mitsubishi Corporation, whose statements are in yen with four quarters of free cash flow, and P/E 24.6 on its
+// year to March 2026 as if trailing.
+test("RV reads the statements' currency, the filed quarters' free cash flow, and names a P/E's fiscal year", () => {
+  const quarter = (date: string, freeCashFlow?: number) => ({ date, currency: "JPY", totalRevenue: 5e12, ...(freeCashFlow !== undefined ? { freeCashFlow } : {}) });
+  const mitsubishi: TickerFinancials = {
+    annualStatements: [{ date: "2025-03-31", currency: "JPY", eps: 235.8 }, { date: "2026-03-31", currency: "JPY", eps: 209.78 }],
+    quarterlyStatements: [quarter("2025-09-30", 235.935e9), quarter("2025-12-31", 6.692e9), quarter("2026-03-31", 864.825e9),
+      quarter("2026-06-30", 338.676e9), quarter("2026-09-30")],
+    priceHistory: [],
+    financialCurrency: "JPY",
+    quote: { symbol: "8058", price: 5170, change: 212, changePercent: 4.28, currency: "JPY", lastUpdated: Date.parse("2026-11-09T06:30:00Z"), marketCap: 18.93e12 },
+    // The filed EPS of the year to March 2026, no quarter after it filed with one.
+    fundamentals: { marketCap: 18.93e12, enterpriseValue: 23.82e12, revenue: 20.69e12, eps: 209.78, trailingPE: 24.64,
+      trailingEpsSource: "filed-quarters", trailingEpsPeriodEnd: "2026-03-31" },
+  };
+  const values = relativeValuationValues(mitsubishi);
+  expect(values.evSales).toBeCloseTo(23.82 / 20.69);
+  // The four quarters to June that carry it; September's came with its income ahead of its cash flow.
+  expect(values.fcfYield).toBeCloseTo(1.446128e12 / 18.93e12);
+  // The P/E names its year in the one form valuation and the overview use; the footer says whose FCF is the filed quarters'.
+  expect(values).toMatchObject({ fcfYieldThrough: "2026-06-30", trailingPEPeriod: "FY Mar-26", gaps: {} });
+  const served = { ...values, symbol: "8031:JPX", fcfYieldThrough: null };
+  expect(fundamentalsBasisParts([{ ...values, symbol: "8058:JPX" }], "Q REV%", "FCF%")).toContain("FCF%: filed quarters to 2026-06-30");
+  expect(fundamentalsBasisParts([{ ...values, symbol: "8058:JPX" }, served], "Q REV%", "FCF%"))
+    .toContain("FCF% of 8058:JPX: filed quarters to 2026-06-30");
+  // Gloom Cloud's figure states no period: the same 209.78 served is not named a fiscal year by its value.
+  const unstated = relativeValuationValues({ ...mitsubishi, fundamentals: { ...mitsubishi.fundamentals, trailingEpsSource: "served", trailingEpsPeriodEnd: undefined } });
+  expect(unstated.trailingPEPeriod).toBeNull();
+  // A quote in another currency than the statements' leaves both blank, saying why.
+  const dollars = relativeValuationValues({ ...mitsubishi, quote: { ...mitsubishi.quote!, currency: "USD" }, fundamentals: { ...mitsubishi.fundamentals, marketCapCurrency: "USD" } });
+  expect(dollars).toMatchObject({ evSales: null, fcfYield: null, gaps: { evSales: "revenue ccy unstated", fcfYield: "FCF in JPY" } });
+});
+
+// fn RV SMSN:LSE,SSNLF showed 27.34T USD for the GDR: its price x Samsung's ordinaries, from a stale quote's fallback.
+test("a receipt cap Gloom Cloud withheld is no cap, from the quote or the fundamentals, and says why", () => {
+  const receipt: TickerFinancials = {
+    ...snapshot,
+    quote: { symbol: "SMSN:LSE", price: 4298, change: 188, changePercent: 4.57, currency: "USD", lastUpdated: 1_000,
+      stale: true, marketCap: 27_342_862_889_112 },
+    fundamentals: { marketCap: 27_342_862_889_112, marketCapCurrency: "USD", sharesOutstanding: 5_792_563_304,
+      unavailableFields: ["marketCap"], marketCapUnavailable: "receipt-priced-as-ordinary" },
+  };
+  for (const values of [relativeValuationValues(receipt), relativeValuationValues({ ...receipt, quote: { ...receipt.quote!, stale: false } })]) {
+    expect(values.marketCap).toBeNull();
+    expect(values.gaps.marketCap).toBe("receipt, no ratio");
+    expect(values.marketCapWithheld).toBe("No market cap: a depositary receipt with no known ratio, whose source's cap is the receipt price x the company's ordinary shares.");
+  }
 });

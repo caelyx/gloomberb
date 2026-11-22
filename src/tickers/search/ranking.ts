@@ -4,9 +4,11 @@ import type {
 } from "./types";
 import { getListingSymbol, tickerHasListingSuffix } from "../../sources/listing-symbols";
 import { currencyPairCode } from "../../utils/currency-pair";
+import { typedCoinPairListing } from "../../utils/crypto-pair";
 import { canonicalExchange, exchangeCodeVenues, isUsListingExchange, parsePublicTickerKey, typedExchangeCode } from "../../utils/exchanges";
 import { assetClassKeeps, assetClassMarketSymbol, instrumentClassCode, parseAssetClassQuery } from "./asset-classes";
 import { futuresContractByCode } from "../../market-data/futures-board";
+import { sameCompany } from "../company-name";
 
 const FUND_TYPES = new Set(["ETF", "ETN", "ETP", "FUND", "MUTUALFUND", "CEF", "CLOSEDEND"]);
 const DERIVATIVE_TYPES = new Set(["OPT", "OPTION", "OPTIONS", "FUT", "FUTURE", "FUTURES", "PERP", "PERPETUAL", "WARRANT", "WARRANTS", "RIGHT", "RIGHTS"]);
@@ -322,9 +324,12 @@ export function rankTickerSearchItems<T extends Pick<TickerSearchRankableItem, "
       .map(({ item }) => getTickerSearchListingKey(item)),
   );
 
+  // BTC/GBP reads as a currency pair's spelling, and is the crypto venue's BTC-GBP.
+  const coinListing = typedCoinPairListing(query)?.symbol;
   const filtered = ranked.filter(({ item, textScore }) => {
     if (textScore <= 0) return false;
-    if (isExplicitMarketSymbol(query) && !isExplicitMarketSymbol(item.symbol || item.label)) return false;
+    if (isExplicitMarketSymbol(query) && !isExplicitMarketSymbol(item.symbol || item.label)
+      && parsePublicTickerKey(item.symbol || item.label).symbol !== coinListing) return false;
     if (item.kind !== "search") return true;
     return !matchedLocalListings.has(getTickerSearchListingKey(item));
   });
@@ -339,8 +344,21 @@ export function rankTickerSearchItems<T extends Pick<TickerSearchRankableItem, "
   // stocks over funds (GLD) put a thinly traded company first.
   const exactIssuerRank = new Map<string, number>();
   const exactIssuerKey = (entry: RankedEntry) => getIssuerGroupKey(entry.item.detail) || `item:${entry.index}`;
+  // A lettered symbol is first its US listing, as the app resolves a bare symbol (`quote AAL` is American
+  // Airlines): the companies under it that trade on a US exchange, then those with a line the service marks as
+  // their home, the listed companies it knows abroad (ISP is Intesa). A word written as a name (`Aeon`) may be the
+  // company of that name, so no US line goes ahead for it. A code of digits is one market's code (Hong Kong,
+  // Tokyo, Taipei), and the mark says nothing between markets there: BYD's home is Shenzhen, not its Hong Kong
+  // 1211, so the server's order of markets stands.
+  const exactIssuerUs = new Set<string>();
+  const exactIssuerHome = new Set<string>();
+  const lettered = /\p{L}/u.test(query);
+  const usFirst = readsAsUsTicker(query);
   for (const entry of filtered) {
-    if (entry.symbolMatchRank !== 4 || entry.item.providerRank == null) continue;
+    if (entry.symbolMatchRank !== 4) continue;
+    if (usFirst && isUsLine(entry.item)) exactIssuerUs.add(exactIssuerKey(entry));
+    if (lettered && entry.item.homeListing === true) exactIssuerHome.add(exactIssuerKey(entry));
+    if (entry.item.providerRank == null) continue;
     const key = exactIssuerKey(entry);
     exactIssuerRank.set(key, Math.min(entry.item.providerRank, exactIssuerRank.get(key) ?? Number.POSITIVE_INFINITY));
   }
@@ -354,17 +372,17 @@ export function rankTickerSearchItems<T extends Pick<TickerSearchRankableItem, "
       const bIssuerRank = exactIssuerRank.get(exactIssuerKey(b)) ?? Number.POSITIVE_INFINITY;
       if (aIssuerRank !== bIssuerRank) return aIssuerRank - bIssuerRank;
     }
-    if (b.score !== a.score) return b.score - a.score;
-    const aSaved = isSavedSearchItem(a.item);
-    const bSaved = isSavedSearchItem(b.item);
-    if (aSaved !== bSaved) return aSaved ? -1 : 1;
-    // Rows that answer to the same typed name (GOOGL and GOOG for "Google")
-    // keep the order the server gave them rather than the shorter symbol first.
-    if (a.symbolMatchRank === 2) {
+    // Rows the server sent for the name as typed (GOOGL and GOOG for "Google"; Microsoft, Micron and
+    // Microchip for "micro", largest first) keep its order, rather than the shorter name or symbol first.
+    if (a.symbolMatchRank === 2 && !isSavedSearchItem(a.item) && !isSavedSearchItem(b.item)) {
       const aProviderRank = a.item.providerRank ?? Number.POSITIVE_INFINITY;
       const bProviderRank = b.item.providerRank ?? Number.POSITIVE_INFINITY;
       if (aProviderRank !== bProviderRank) return aProviderRank - bProviderRank;
     }
+    if (b.score !== a.score) return b.score - a.score;
+    const aSaved = isSavedSearchItem(a.item);
+    const bSaved = isSavedSearchItem(b.item);
+    if (aSaved !== bSaved) return aSaved ? -1 : 1;
     if (a.item.label.length !== b.item.label.length) return a.item.label.length - b.item.label.length;
     return a.index - b.index;
   };
@@ -446,6 +464,35 @@ export function rankTickerSearchItems<T extends Pick<TickerSearchRankableItem, "
       if (aProviderRank !== bProviderRank) return aProviderRank - bProviderRank;
       return compareFallbackEntries(a, b);
     }
+    // A symbol typed whole asks for a listing under it, not a name. The companies listed under it go saved
+    // first, then the ones trading on a US exchange (`exactIssuerUs`), then the ones the service marks a home
+    // line of (`exactIssuerHome`), then in the server's order (`exactIssuerRank`). A company whose name only is
+    // or starts with the letters gets no head start (AXP Energy for AXP, CAT Strategic Metals for CAT), and a
+    // line with no name or venue of its own (a Toronto `JNJ` named JNJ, an old line of ISP) follows the
+    // companies.
+    if (aExactSymbolRank === 4) {
+      const aSaved = isSavedSearchItem(a.item);
+      const bSaved = isSavedSearchItem(b.item);
+      if (aSaved !== bSaved) return aSaved ? -1 : 1;
+      const aPlaceholder = isPlaceholderLine(a.item);
+      const bPlaceholder = isPlaceholderLine(b.item);
+      if (aPlaceholder !== bPlaceholder) return aPlaceholder ? 1 : -1;
+      const aUs = exactIssuerUs.has(exactIssuerKey(a));
+      const bUs = exactIssuerUs.has(exactIssuerKey(b));
+      if (aUs !== bUs) return aUs ? -1 : 1;
+      const aHome = exactIssuerHome.has(exactIssuerKey(a));
+      const bHome = exactIssuerHome.has(exactIssuerKey(b));
+      if (aHome !== bHome) return aHome ? -1 : 1;
+      const aIssuerRank = exactIssuerRank.get(exactIssuerKey(a)) ?? Number.POSITIVE_INFINITY;
+      const bIssuerRank = exactIssuerRank.get(exactIssuerKey(b)) ?? Number.POSITIVE_INFINITY;
+      if (aIssuerRank !== bIssuerRank) return aIssuerRank - bIssuerRank;
+      // Of one company's lines, its US line leads (RACE is Ferrari on NYSE, before Milan).
+      if (aUs && exactIssuerKey(a) === exactIssuerKey(b)) {
+        const aLine = isUsLine(a.item);
+        const bLine = isUsLine(b.item);
+        if (aLine !== bLine) return aLine ? -1 : 1;
+      }
+    }
     if (b.companyRank !== a.companyRank) {
       return b.companyRank - a.companyRank;
     }
@@ -506,7 +553,25 @@ export function rankTickerSearchItems<T extends Pick<TickerSearchRankableItem, "
   if (boardFuture && futureIndex >= 0) {
     deduped.splice(boardFuture.bareCode ? 0 : Math.min(1, futureIndex), 0, ...deduped.splice(futureIndex, 1));
   }
-  return deduped;
+  return withHeadlineIndexFirst(deduped, rawQuery);
+}
+
+/**
+ * An index named as typed leads the indices whose names only add to it:
+ * "BIST 100" is the BIST 100 (XU100.IS) before the BIST 100-30 and BIST 100
+ * (EURO), whatever order search sent them in. Any other list keeps its order.
+ */
+function withHeadlineIndexFirst<T extends Pick<TickerSearchRankableItem, "detail"> & Partial<TickerSearchRankableItem>>(items: T[], query: string): T[] {
+  const name = normalizeSearchText(query);
+  const isIndex = (item: T) => /^\s*index\s*$/i.test(item.instrumentType ?? "");
+  const indexName = (item: T) => normalizeSearchText(item.detail.split("|")[0] ?? "");
+  const headline = items.findIndex((item) => isIndex(item) && indexName(item) === name);
+  if (!name || headline < 0) return items;
+  const first = items.findIndex((item, index) => index < headline && isIndex(item) && indexName(item).startsWith(`${name} `));
+  if (first < 0) return items;
+  const ordered = [...items];
+  ordered.splice(first, 0, ...ordered.splice(headline, 1));
+  return ordered;
 }
 
 // Folding accents keeps "Nestlé" matchable as "nestle" instead of "NESTL".
@@ -636,13 +701,31 @@ export function answersOnlyByKeyword(
  * wants (an exchange or "ETF" beside the word).
  */
 export function themeQueryWord(
-  items: ReadonlyArray<Pick<TickerSearchRankableItem, "searchKeywords">>,
+  items: ReadonlyArray<ThemeAnswerRow>,
   query: string,
 ): string | null {
   const intent = analyzeSearchQuery(query);
   const word = intent.normalizedQuery;
   if (!word || word.includes(" ") || intent.exchangeHints.length > 0 || intent.assetPreference != null) return null;
-  return items.some((item) => item.searchKeywords?.some((keyword) => normalizeSearchText(keyword) === word)) ? word : null;
+  const tagged = (item: ThemeAnswerRow) => item.searchKeywords?.some((keyword) => normalizeSearchText(keyword) === word) ?? false;
+  if (!items.some(tagged)) return null;
+  return namesOneCompany(items.filter((item) => !tagged(item))) ? null : word;
+}
+
+/** A row of an answer as `themeQueryWord` reads it: a search row (`name`) or a ranked row (`detail`, its name first). */
+type ThemeAnswerRow = Pick<TickerSearchRankableItem, "searchKeywords" | "homeListing"> & { name?: string; detail?: string };
+
+/**
+ * Whether most of the rows the service sent for a word by name are one
+ * company's lines, its home line among them: the word is that company's
+ * name, whatever rows it also tags ("Hermes" is Hermès International,
+ * though the service sends Federated Hermes's funds and holdings with the
+ * word). A sector word's rows are many companies' ("steel", "gaming").
+ */
+function namesOneCompany(rows: readonly ThemeAnswerRow[]): boolean {
+  const name = (row: ThemeAnswerRow) => row.name ?? row.detail?.split(" | ")[0] ?? "";
+  return rows.some((home) => home.homeListing === true
+    && rows.filter((row) => sameCompany(name(row), name(home))).length * 2 > rows.length);
 }
 
 /** How many sector funds lead a sector word's list: the rest of the list is the companies named for it. */
@@ -868,6 +951,31 @@ function namesUsCompany(
   return entries.some(({ item, symbolMatchRank }) => symbolMatchRank === 2 && item.kind === "search"
     && item.instrumentClass === "equity" && isUsListingExchange(listingVenue(item))
     && !!item.searchAliases?.some((alias) => compactSearchText(alias) === typed));
+}
+
+/**
+ * A search line that names no company or venue of its own: its name is its
+ * symbol or empty (an old line search keeps for a ticker, a Toronto `HD`
+ * named HD), or it lists on no exchange.
+ */
+export function isPlaceholderLine(item: Pick<TickerSearchRankableItem, "label" | "detail" | "kind"> & Partial<TickerSearchRankableItem>): boolean {
+  if (item.kind !== "search") return false;
+  const name = compactSearchText(item.detail.split("|")[0] || "");
+  return !name || name === compactSearchText(item.symbol || item.label) || !(item.exchangeLabel || item.primaryExchangeLabel);
+}
+
+/**
+ * A lettered symbol typed as a ticker (`AAL`, `aal`), which is its US listing when it has one, rather than a word
+ * written as a company's name (`Aeon`) or a code of digits.
+ */
+export function readsAsUsTicker(query: string): boolean {
+  const typed = query.trim();
+  return /\p{L}/u.test(typed) && !/^\p{Lu}\p{Ll}/u.test(typed);
+}
+
+/** A search line of a company's own on a US exchange that still trades: not a placeholder, OTC or Toronto line. */
+function isUsLine(item: Pick<TickerSearchRankableItem, "label" | "detail" | "kind"> & Partial<TickerSearchRankableItem>): boolean {
+  return item.kind === "search" && !item.delisted && isUsListingExchange(listingVenue(item)) && !isPlaceholderLine(item);
 }
 
 function isDepositaryReceiptType(type?: string): boolean {

@@ -21,12 +21,16 @@ export type MarketContext = ConfigContext & {
   seriesCapabilities?: CapabilityInvoker;
   /** The catalog series charted as an expression (`FRED:DFII10`), in a report run without the plugin runtime. */
   findCatalogSeries?: (expression: string) => import("../series/types").SeriesDefinition | undefined;
+  /** The catalog series a bare word is an alias of (`hashrate`), in a report run without the plugin runtime. */
+  findCatalogSeriesNamed?: (word: string) => import("../series/types").SeriesDefinition | undefined;
   /** `--refresh`: prefetched data bypasses the local cache. */
   refresh?: boolean;
   /** Filings behind the statements and a bank's figures, read from Gloom Cloud; absent where the data service is a stand-in. */
   statementSources?: StatementReportSources;
   /** Daily FX closes (`fx --date`, converted INS values); Gloom Cloud unless a test stands in for it. */
   fxHistory?: FxHistoryClient;
+  /** Japan's intervention record for a yen pair's notes; Gloom Cloud unless a test stands in for it. */
+  fxInterventions?: () => Promise<import("../api-client/fx-interventions").FxInterventionsPayload | null>;
 };
 
 export type CliServicesContext = {

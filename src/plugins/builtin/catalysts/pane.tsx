@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { usePaneInstance } from "../../../state/app/context";
 import { useCatalystEvidence } from "./evidence";
 import { useCallback, useMemo, useRef, useState } from "react";
@@ -18,10 +19,11 @@ import { CLOUD_PLAN_KEY, useCloudUpgradeAction } from "../shared/cloud-upgrade";
 import { useOpenDescription } from "../shared/open-description";
 import { Blurred, LockedOverlay, UpgradeLabel } from "../shared/locked-rows";
 import { listingCell, toneColor } from "../shared/research-cells";
+import { logFailure } from "../../../utils/log-failure";
 import { isCloudSessionRequired, useResearchCloudSession } from "../shared/research-cloud-session";
 import { loadCatalystDetail, loadCatalysts, validateCatalysts } from "./client";
 import { CatalystEventDetail } from "./detail";
-import { catalystAgency, catalystBasisWidth, catalystCell, catalystColumns, catalystEmptyTitle, catalystLabel, catalystQuery, catalystSections, catalystStatusTone, catalystSymbol, catalystTab, catalystTypeTone, CATALYST_TABS } from "./model";
+import { catalystAgency, catalystBasisWidth, catalystCell, catalystColumns, catalystEmptyTitle, catalystLabel, catalystLockedText, catalystQuery, catalystSections, catalystShownStatus, catalystStatusTone, catalystSymbol, catalystTab, catalystTypeTone, CATALYST_TABS } from "./model";
 
 type Row = SectionedRow<CatalystEvent> | { kind: "locked"; key: string };
 const rowKey = (row: Row) => row.key;
@@ -65,7 +67,7 @@ export function CatalystView({ width, height, focused, symbol, litigation = fals
   const [selectedId, setSelectedId] = usePluginPaneState<string | null>("catalyst:selected", null);
   const [searchActive, setSearchActive] = useState(false);
   const [dateFieldActive, setDateFieldActive] = useState<string | null>(null);
-  const snapshot = useMemo(() => { try { return snapshotSetting ? validateCatalysts(snapshotSetting) : null; } catch { return null; } }, [snapshotSetting]);
+  const snapshot = useMemo(() => { try { return snapshotSetting ? validateCatalysts(snapshotSetting) : null; } catch (error) { return logFailure("catalysts.pane", "Validate catalysts snapshot failed", null)(error); } }, [snapshotSetting]);
   const query = useMemo(() => catalystQuery({ ...filters, tab }, symbol ?? undefined, litigation), [filters, tab, symbol, litigation]);
   const loader = useCallback(async ({ offset, signal, force }: PageRequest) => {
     const result = snapshot ? { payload: snapshot, stale: false, refreshError: null } : await loadCatalysts({ ...query, limit: 100, offset }, accessKey, force, signal);
@@ -82,9 +84,12 @@ export function CatalystView({ width, height, focused, symbol, litigation = fals
   const lockedRows = Math.min(3, data?.access?.lockedRows ?? 0);
   // Grouped by month on the calendar and by day in the change feed, in the order the server sends them.
   const items = useMemo<Row[]>(() => {
-    return [...buildSectionedRows(catalystSections(rows, query.dateField, tab === "changes"), (event) => event.id),
+    return [...buildSectionedRows(catalystSections(rows, query, tab === "changes"), (event) => event.id),
       ...Array.from({ length: lockedRows }, (_, index): Row => ({ kind: "locked", key: `locked:${index}` }))];
-  }, [rows, query.dateField, tab, lockedRows]);
+  }, [rows, query, tab, lockedRows]);
+  // "Upgrade for 16 more events (2 upcoming)": what the preview holds back, and how much of it is still ahead.
+  const locked = catalystLockedText(data?.access, litigation ? "case" : "event");
+  const upgradeText = locked ? `Upgrade for ${locked}` : "Upgrade for every catalyst and its history";
   const listedOpen = rows.find((event) => event.id === openId) ?? null;
   const openLoader = useCallback((force: boolean) => loadCatalystDetail(openId!, accessKey, force), [openId, accessKey]);
   const externalOpen = useAsyncResource(openId && !listedOpen && !detailSnapshots[openId] ? openLoader : null, { clearOnError: isAccessDenied });
@@ -120,26 +125,26 @@ export function CatalystView({ width, height, focused, symbol, litigation = fals
     ...(tab === "calendar" ? [{ id: "upcoming", kind: "toggle" as const, label: "Upcoming", value: filters.upcoming === true, onChange: (value: boolean) => changeFilter("upcoming", value) },
       { id: "date", label: "Date", value: String(filters.dateField ?? "any"), options: [{ value: "any", label: "Any date" }, { value: "announced", label: "Announced" }, { value: "effective", label: "Effective" }, { value: "deadline", label: "Deadlines" }], onChange: (value: string) => changeFilter("dateField", value) }] : []),
   ]} />;
-  const columns = catalystColumns(width, tab === "changes", litigation, catalystBasisWidth(rows, query.dateField));
+  const columns = catalystColumns(width, tab === "changes", litigation, catalystBasisWidth(rows, query));
   const renderCell = (row: Row, column: (typeof columns)[number], _index: number, state: { selected: boolean }): DataTableCell => {
     if (row.kind === "locked") {
-      if (!desktop && column.id === "title" && row.key === "locked:0") return { text: "Upgrade for every catalyst and its history", content: <UpgradeLabel text="Upgrade for every catalyst and its history" onPress={openUpgrade} role="catalysts-upgrade" />, onMouseDown: openUpgrade };
+      if (!desktop && column.id === "title" && row.key === "locked:0") return { text: upgradeText, content: <UpgradeLabel text={upgradeText} onPress={openUpgrade} role="catalysts-upgrade" />, onMouseDown: openUpgrade };
       return desktop ? { text: "", content: <Blurred><Text fg={colors.textDim}>{column.id === "title" ? "Additional catalyst" : "Hidden"}</Text></Blurred> } : { text: "░░░░", color: colors.textDim };
     }
     if (!isEventRow(row)) return EMPTY_TABLE_CELL;
     const event = row.item;
-    const text = catalystCell(event, column.id, query.dateField, tab === "changes");
+    const text = catalystCell(event, column.id, query, tab === "changes");
     if (column.id === "ticker") {
       const symbol = catalystSymbol(event);
       if (!symbol) return { text, color: colors.textMuted };
       const more = event.parties.filter((party) => party.ticker).length - 1;
       return more > 0 ? { text, color: colors.textBright } : listingCell(symbol, colors, state.selected);
     }
-    if (column.id === "parties") return { text, color: text === "--" ? colors.textMuted : colors.textBright };
+    if (column.id === "parties") return { text, color: text === MISSING_VALUE ? colors.textMuted : colors.textBright };
     if (column.id === "type") return { text, color: toneColor(catalystTypeTone(event.type), colors) };
     // The column has room for the flag beside a code.
     if (column.id === "country") return withCountryFlag({ text, color: colors.textDim }, text, desktop);
-    if (column.id === "status") return { text, color: tab === "changes" ? colors.text : toneColor(catalystStatusTone(event.status), colors) };
+    if (column.id === "status") return { text, color: tab === "changes" ? colors.text : toneColor(catalystStatusTone(catalystShownStatus(event)), colors) };
     return { text, color: column.id === "title" || column.id === "date" ? colors.text : colors.textDim };
   };
   if (isCloudSessionRequired(error?.message)) return <SignInWall placement="catalysts-signin" action="view catalysts" needsVerification={session.needsVerification} />;
@@ -157,7 +162,7 @@ export function CatalystView({ width, height, focused, symbol, litigation = fals
           renderCell={renderCell}
           scrollRef={scrollRef} onBodyScrollActivity={loadMore} resetScrollKey={JSON.stringify(query)} showHorizontalScrollbar selectedTextOverridesCellColor
           emptyStateTitle={catalystEmptyTitle(data, query, tab === "changes")}
-          bodyAfter={lockedRows && desktop ? <LockedOverlay rows={lockedRows} text="Upgrade for every catalyst and its history" onPress={openUpgrade} role="catalysts-upgrade" /> : undefined} />}
+          bodyAfter={lockedRows && desktop ? <LockedOverlay rows={lockedRows} text={upgradeText} onPress={openUpgrade} role="catalysts-upgrade" /> : undefined} />}
       />
   </Box>;
 }

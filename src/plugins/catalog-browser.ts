@@ -43,8 +43,10 @@ import { ipoCalendarPlugin } from "./builtin/ipo-calendar";
 import { clinicalTrialsPlugin } from "./builtin/clinical-trials";
 import { commentLettersPlugin } from "./builtin/comment-letters";
 import { openFdaPlugin } from "./builtin/openfda";
-import { browserGloomberbCloudPlugin } from "./builtin/cloud/browser";
+import { gloomberbCloudPlugin } from "./builtin/cloud";
+import { browserChatSettings } from "../renderers/browser/notifications";
 import { changelogModule } from "./builtin/changelog";
+import { roadmapModule } from "./builtin/roadmap";
 import { chartComposerModule } from "./builtin/chart-composer";
 import { connectionsModule } from "./builtin/connections";
 import { relativeRotationModule } from "./builtin/relative-rotation";
@@ -126,7 +128,7 @@ import { FIXED_INCOME_HOSTS } from "./builtin/fixed-income/model";
 
 const browserApplicationPlugin = composeBuiltinPlugin({
   ...applicationPluginMeta,
-  modules: [layoutManagerModule, helpModule, changelogModule, connectionsModule, docsModule],
+  modules: [layoutManagerModule, helpModule, changelogModule, connectionsModule, docsModule, roadmapModule],
 });
 
 const runtimeOnly = (module: PluginModule): PluginModule => {
@@ -297,7 +299,15 @@ const browserEarningsPlugin = composeBuiltinPlugin({
  * browser-safe public API are absent rather than registered behind stubs.
  */
 export const browserBuiltinPlugins: readonly GloomPlugin[] = [
-  browserGloomberbCloudPlugin,
+  {
+    ...gloomberbCloudPlugin,
+    panes: gloomberbCloudPlugin.panes?.map((pane) => pane.id === "chat"
+      ? Object.create(Object.getPrototypeOf(pane), {
+        ...Object.getOwnPropertyDescriptors(pane),
+        settings: { value: browserChatSettings, enumerable: true },
+      })
+      : pane),
+  },
   browserPortfolioPlugin,
   browserTickerCorePlugin,
   browserOptionsVolatilityPlugin,

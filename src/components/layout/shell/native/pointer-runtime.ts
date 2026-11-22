@@ -100,7 +100,12 @@ export function useShellNativePointerRuntime({
     event.preventDefault();
   }, [commandBarOpen, focusNativePane, getShellPointer, nativePaneChrome, startDrag, transientFocusActive, updateDragFloatingRect, windowMode]);
 
-  const startNativeDockedDrag = useCallback((paneId: string, rect: LayoutBounds, event: ShellMouseEvent) => {
+  /**
+   * A press that may become a move of a docked pane. A press on a stack's
+   * hidden tab (`focus` false) leaves the shown pane as it is: the release
+   * shows the tab if the pointer did not move, or the move takes it out.
+   */
+  const startNativeDockedDrag = useCallback((paneId: string, rect: LayoutBounds, event: ShellMouseEvent, options?: { focus?: boolean }) => {
     if (!nativePaneChrome) return;
     if (commandBarOpen) return;
     if (windowMode) return;
@@ -108,7 +113,7 @@ export function useShellNativePointerRuntime({
     if (event.button === 2) return;
 
     const pointer = getShellPointer(event);
-    focusNativePane(paneId);
+    if (options?.focus !== false) focusNativePane(paneId);
     startDrag({
       type: "pane-drag",
       paneId,
@@ -119,6 +124,30 @@ export function useShellNativePointerRuntime({
     });
     event.preventDefault();
   }, [commandBarOpen, focusNativePane, getShellPointer, nativePaneChrome, startDrag, transientFocusActive, windowMode]);
+
+  /**
+   * A press on a tab of a floating stack: a move pulls that tab out as an
+   * outline, the stack staying where it is; a release where it was pressed
+   * shows the tab.
+   */
+  const startNativeTabDrag = useCallback((paneId: string, rect: FloatingRect, event: ShellMouseEvent) => {
+    if (!nativePaneChrome) return;
+    if (commandBarOpen) return;
+    if (windowMode) return;
+    if (transientFocusActive) return;
+    if (event.button === 2) return;
+
+    const pointer = getShellPointer(event);
+    startDrag({
+      type: "pane-drag",
+      paneId,
+      mode: "tab",
+      startX: pointer.x,
+      startY: pointer.y,
+      origRect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+    });
+    event.preventDefault();
+  }, [commandBarOpen, getShellPointer, nativePaneChrome, startDrag, transientFocusActive, windowMode]);
 
   const startNativeFloatResize = useCallback((paneId: string, rect: FloatingRect, event: ShellMouseEvent, edges?: ResizeEdges) => {
     if (!nativePaneChrome) return;
@@ -205,5 +234,6 @@ export function useShellNativePointerRuntime({
     startNativeDockedDrag,
     startNativeFloatingDrag,
     startNativeFloatResize,
+    startNativeTabDrag,
   };
 }

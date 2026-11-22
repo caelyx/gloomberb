@@ -6,18 +6,24 @@ import type { Quote } from "../../../types/financials";
 import { deriveHeadlessFreshness } from "../../../cli/pane-functions/freshness";
 import { headlessReportTables, renderHeadlessPaneText } from "../../../cli/pane-functions/headless";
 import { renderReportCsv } from "../../../cli/report-tables";
+import { portableCsv } from "../../../cli/csv-export";
 import { companyHeadless } from "./headless";
-import { guidancePayload, kpisPayload, observation } from "./test-fixture";
+import { guide, guidancePayload, kpisPayload, observation } from "./test-fixture";
 
 test("headless request preserves publication cutoff and every evidence field while reporting preview limits", async () => {
   const requests: unknown[] = [];
-  const payload = kpisPayload({ access: "preview", truncated: true, lockedRows: 5, totalRows: 6, previewRows: 3 });
+  const payload = kpisPayload({ access: "preview", truncated: true, lockedRows: 61, totalRows: 64, previewRows: 3 });
   const client = { getCloudCompanyKpis: async (symbol: string, options: unknown) => { requests.push({ symbol, options }); return payload; },
     getCloudCompanyGuidance: async () => guidancePayload() } as unknown as typeof apiClient;
   const result = await companyHeadless("kpis").load(createTestHeadlessArgs({ symbols: [payload.symbol], options: { metric: "arr", asOf: "2026-09-30", from: "2026-01-01", basis: "reported", tab: "chart" } }), createTestHeadlessContext({ apiClient: client }));
   expect(requests).toEqual([{ symbol: payload.symbol, options: { metric: "arr", basis: "reported", from: "2026-01-01", asOf: "2026-09-30" } }]);
   expect(result.complete).toBe(false);
-  expect(result.metadata).toMatchObject({ access: "preview", lockedRows: 5 });
+  expect(result.metadata).toMatchObject({ access: "preview", lockedRows: 61 });
+  const definition = companyHeadless("kpis");
+  const args = createTestHeadlessArgs({ symbols: [payload.symbol] });
+  const exported = portableCsv(renderReportCsv(headlessReportTables(definition, result, args, "KPIS", deriveHeadlessFreshness(definition, result), { complete: false, unavailableSymbols: [] })));
+  expect(exported.split("\n")[0]).toEndWith("export_notes");
+  expect(exported).toContain("3 of 64");
   expect(result.sections[0]?.rows?.[0]).toMatchObject({ currency: "GBP", evidence: [{ quote: payload.series[0]!.latest.evidence[0]!.quote, quoteOffset: 0, quoteMatchMode: "exact" }] });
 });
 
@@ -70,4 +76,30 @@ test("the text report prints the pane's fiscal labels and compact values and say
   const csv = renderReportCsv(headlessReportTables(definition, result, args, "KPIS", freshness, { complete: false, unavailableSymbols: [] }));
   expect(csv).toContain("125000000");
   expect(result.sections[0]?.rows?.[0]).toEqual({ ...latest });
+});
+
+test("a company with no guidance says so and names one that has some, instead of calling itself not covered", async () => {
+  const empty = guidancePayload({ guidance: [], history: [], totalRows: 0, coverage: { ...guidancePayload().coverage, guidance: 0 } });
+  const definition = companyHeadless("guidance");
+  const args = createTestHeadlessArgs({ symbols: [empty.symbol], options: {} });
+  const result = await definition.load(args, createTestHeadlessContext({ apiClient: { getCloudCompanyGuidance: async () => empty } as unknown as typeof apiClient }));
+  expect(result).toMatchObject({ empty: `Guidance for ${empty.symbol} is not yet available. Try \`fn GUIDE WMT\`.` });
+  const text = renderHeadlessPaneText(definition, result, args, "GUIDE", deriveHeadlessFreshness(definition, result));
+  expect(text).toContain("is not yet available");
+  expect(text).not.toContain("not covered");
+  // Guidance on file is a table, not that sentence, and a metric that is not among it keeps its own reason.
+  const full = await definition.load(args, createTestHeadlessContext({ apiClient: { getCloudCompanyGuidance: async () => guidancePayload() } as unknown as typeof apiClient }));
+  expect(full.empty).toBeUndefined();
+  expect(full.sections[0]?.rows?.length).toBe(1);
+});
+
+// Preserve the disclosed tolerance through text projection and machine export.
+test("a point with a disclosed tolerance prints the full management range", async () => {
+  const row = guide({ point: 17e9, low: null, high: null, hedge: "approximately", currency: "USD",
+    rangeText: "approximately $17 billion plus or minus 3%" });
+  const definition = companyHeadless("guidance");
+  const args = createTestHeadlessArgs({ symbols: [row.symbol], options: {} });
+  const result = await definition.load(args, createTestHeadlessContext({ apiClient: { getCloudCompanyGuidance: async () => guidancePayload({ guidance: [row] }) } as unknown as typeof apiClient }));
+  expect(renderHeadlessPaneText(definition, result, args, "GUIDE", deriveHeadlessFreshness(definition, result))).toContain("$17 billion plus or minus 3%");
+  expect(result.sections[0]?.rows?.[0]).toMatchObject({ point: 17e9, rangeText: row.rangeText });
 });

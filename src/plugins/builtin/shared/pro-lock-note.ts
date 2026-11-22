@@ -1,3 +1,4 @@
+import { createTtlCache, type TtlCache } from "../../../data/ttl-cache";
 import type { HeadlessPaneContext } from "../../../types/headless";
 import type { PaneLock } from "../../../types/plugin";
 import { settleWithin, signalWithTimeout } from "../../../utils/async-deadline";
@@ -35,8 +36,7 @@ const ANSWER_TTL_MS = 5 * 60_000;
  */
 const ROUTE_CHECK_WAIT_MS = 3_000;
 
-interface KeptAnswer { at: number; answer: Promise<boolean> }
-const answers = new WeakMap<FreeRoute, Map<string, KeptAnswer>>();
+const answers = new WeakMap<FreeRoute, TtlCache<boolean>>();
 
 /**
  * Whether the route has data for the symbol, null when its check failed or was
@@ -45,20 +45,20 @@ const answers = new WeakMap<FreeRoute, Map<string, KeptAnswer>>();
  * rather than hiding the route for minutes over one slow read.
  */
 async function routeAnswers(route: FreeRoute, check: NonNullable<FreeRoute["answers"]>, symbol: string, context: HeadlessPaneContext, deadline: number): Promise<boolean | null> {
-  const bySymbol = answers.get(route) ?? new Map<string, KeptAnswer>();
+  const bySymbol = answers.get(route) ?? createTtlCache<boolean>({ ttlMs: ANSWER_TTL_MS });
   answers.set(route, bySymbol);
   const key = symbol.trim().toUpperCase();
-  let kept = bySymbol.get(key);
-  if (!kept || Date.now() - kept.at >= ANSWER_TTL_MS) {
+  const kept = bySymbol.load(key, () => {
     // The check's own reads stop at the deadline where they take a signal.
     const signal = signalWithTimeout(context.signal, Math.max(0, deadline - Date.now()));
-    const entry: KeptAnswer = { at: Date.now(), answer: check(symbol, { ...context, signal }) };
-    entry.answer.catch(logFailure("plugins.pro-lock-note", "Check a free route's data failed"));
-    bySymbol.set(key, entry);
-    kept = entry;
-  }
-  const answer = await settleWithin(kept.answer, Math.max(0, deadline - Date.now()));
-  if (answer === null && bySymbol.get(key) === kept) bySymbol.delete(key);
+    return check(symbol, { ...context, signal }).catch((error: unknown) => {
+      logFailure("plugins.pro-lock-note", "Check a free route's data failed")(error);
+      throw error;
+    });
+  });
+  const answer = await settleWithin(kept, Math.max(0, deadline - Date.now()));
+  // Only this check is dropped: a newer one for the symbol stays.
+  if (answer === null) bySymbol.delete(key, kept);
   return answer;
 }
 
@@ -70,19 +70,23 @@ async function routeAnswers(route: FreeRoute, check: NonNullable<FreeRoute["answ
  * symbol the routes read `<ticker>` and the first is named; without a way to
  * read data, only a route that answers for every symbol is.
  */
-async function answeringFreeRoute(lock: PaneLock, routes: readonly FreeRoute[]): Promise<FreeRoute | null> {
+async function answeringFreeRoute(lock: PaneLock, routes: readonly FreeRoute[]): Promise<{ route: FreeRoute | null; noneHasData: boolean }> {
   const { symbol, context } = lock;
-  if (!symbol) return routes[0] ?? null;
+  if (!symbol) return { route: routes[0] ?? null, noneHasData: false };
   // Routes past the first that needs no check are never named, so they are not checked.
   const unchecked = routes.findIndex((route) => !route.answers);
   const candidates = unchecked < 0 ? routes : routes.slice(0, unchecked + 1);
   const deadline = Date.now() + ROUTE_CHECK_WAIT_MS;
   const checks = candidates.map((route) => !route.answers ? Promise.resolve(true)
-    : context ? routeAnswers(route, route.answers, symbol, context, deadline) : Promise.resolve(false));
+    : context ? routeAnswers(route, route.answers, symbol, context, deadline) : Promise.resolve(null));
+  const answered: Array<boolean | null> = [];
   for (const [index, check] of checks.entries()) {
-    if (await check) return candidates[index]!;
+    const answer = await check;
+    if (answer) return { route: candidates[index]!, noneHasData: false };
+    answered.push(answer);
   }
-  return null;
+  // Every check answered no: a failed or stalled one is not known to.
+  return { route: null, noneHasData: candidates.length > 0 && answered.every((answer) => answer === false) };
 }
 
 /**
@@ -114,6 +118,17 @@ export async function proLockNote(
      * command repeats the ticker only when the reader gave one. Default `ticker`.
      */
     argument?: "ticker" | "optional" | "none";
+    /**
+     * For a function that reads what its free routes read (RISK the SEC's
+     * 10-Ks and 20-Fs, FLOW the listing's options): the sentence the note
+     * says when every route answered that the symbol has none. The note then
+     * names no command for the symbol, which would read nothing once unlocked
+     * either: IAG:LSE files neither form, and LHA:XETRA has no options served.
+     * A function that reads only the one ticker has nothing to unlock for it,
+     * so the note does not ask for an upgrade; a board (FLOW) still has the
+     * rest of the market.
+     */
+    noneFor?: (ticker: string) => string;
   },
 ): Promise<string> {
   const { gate, symbol, token: typed, verifyEmail } = lock;
@@ -129,12 +144,16 @@ export async function proLockNote(
   const unlock = gate === "pro"
     ? `To read ${pane.shows} in ${token}, upgrade in the app (gloom, then Ctrl+P, UPGRADE)`
     : `To read ${pane.shows} in ${token}, open the app (gloom), ${account}${pro ? ", then upgrade (Ctrl+P, UPGRADE)" : ""}`;
-  const bare = pane.argument === "none" || (pane.argument === "optional" && !symbol);
-  const command = bare ? `gloom fn ${token}` : `gloom fn ${token} ${ticker}`;
-  const free = pane.free ? await answeringFreeRoute(lock, pane.free) : null;
+  const { route: free, noneHasData } = pane.free ? await answeringFreeRoute(lock, pane.free) : { route: null, noneHasData: false };
+  // Unlocking reads nothing for a symbol none of the function's own data covers: it is named only where it has some.
+  const uncovered = noneHasData && !!pane.noneFor;
+  const bare = pane.argument === "none" || (pane.argument === "optional" && (!symbol || uncovered));
+  const command = bare ? `gloom fn ${token}` : `gloom fn ${token} ${uncovered ? "<ticker>" : ticker}`;
+  const nothingToUnlock = uncovered && (pane.argument ?? "ticker") === "ticker";
   return [
     `${token} ${what}: ${pane.does}. ${without} it shows none of ${pane.shows}.`,
     ...free ? [`Free, with no sign-in: ${free.text(ticker, symbol ?? "the company")}`] : [],
-    `${unlock}; ${command} then reads with that session.`,
+    ...uncovered ? [pane.noneFor!(ticker)] : [],
+    ...nothingToUnlock ? [] : [`${unlock}; ${command} then reads with that session.`],
   ].join("\n");
 }

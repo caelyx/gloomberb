@@ -1,4 +1,5 @@
 import { logFailure } from "../utils/log-failure";
+import { debugLog } from "../utils/debug-log";
 import { httpFetch, isHttpFetchStreaming } from "../utils/http-transport";
 import { OperationTimeoutError } from "../utils/async-deadline";
 import {
@@ -16,7 +17,10 @@ import {
   type ConnectionHealthRegistry,
 } from "../core/connection-health";
 import { SESSION_COOKIE_NAMES } from "./session-cookie";
-import { asDataServiceFailure, DataServiceUnreachableError } from "../utils/network-failure";
+import { asDataServiceFailure, DataServiceUnreachableError, isDroppedConnection } from "../utils/network-failure";
+
+/** Request failures with the endpoint they were for, which their messages leave out. */
+const requestLog = debugLog.createLogger("cloud-api");
 
 /** The public Gloom Cloud API, which the web app's same-origin `/api` path forwards to. */
 export const DEFAULT_API_URL = "https://api.gloom.sh";
@@ -25,11 +29,12 @@ export const DEFAULT_API_URL = "https://api.gloom.sh";
  * then, and nothing else answered meanwhile, is a hung connection: the request
  * fails as the data service being unreachable, as a refused one does.
  */
-const DEFAULT_MARKET_REQUEST_TIMEOUT_MS = 10_000;
+export const MARKET_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_MARKET_READ_LIMIT_MS = 25_000;
 /**
  * A search, which a command and a keystroke wait on, gives up on a connection
  * that sends nothing back sooner. A slow search on a service that answers
- * (some take five seconds) still gets the full market deadline.
+ * (some take five seconds) still gets the full market read limit.
  */
 const SEARCH_ANSWER_TIMEOUT_MS = 4_000;
 /**
@@ -37,7 +42,7 @@ const SEARCH_ANSWER_TIMEOUT_MS = 4_000;
  * until any answer comes back: a hung connection is not waited out in full by
  * every request a command or a pane makes after it.
  */
-const UNREACHABLE_REQUEST_TIMEOUT_MS = 3_000;
+export const UNREACHABLE_REQUEST_TIMEOUT_MS = 3_000;
 /**
  * Right after a request hung with nothing back, the requests that follow it
  * (a fallback, the next step of a command) fail at once rather than each
@@ -49,25 +54,177 @@ const DEFAULT_RESEARCH_REQUEST_TIMEOUT_MS = 45_000;
 const DEFAULT_SERVICE_REQUEST_LIMIT_MS = 120_000;
 const UPLOAD_REQUEST_LIMIT_MS = 300_000;
 /**
- * How long the check that the service answers at all waits. It runs this long
- * before a request's answer deadline, unless something answered meanwhile, so
- * one slow request on a service that answers is waited for and a dead
- * connection is not.
+ * How long each check that the service answers at all waits. When the answer
+ * deadline has room for two checks, one stuck connection isn't enough to
+ * declare an outage.
  */
 const SERVICE_PROBE_TIMEOUT_MS = 3_000;
 const SERVICE_PROBE_PATH = "/health";
+/**
+ * While the service is unreachable it is asked whether it answers again, this
+ * soon after the outage began and then twice as long after each check up to
+ * the cap, so the app hears it is back without waiting for a pane to ask.
+ */
+const RECOVERY_PROBE_FIRST_MS = 2_000;
+const RECOVERY_PROBE_MAX_MS = 15_000;
 // Research may fill missing sections after a primary read; quote/history reads remain latency bounded.
+// A batched search runs a hundred searches, a few at a time, and takes longer than one.
 const RESEARCH_MARKET_PATHS = new Set([
   "/market/dividends", "/market/short-interest", "/market/movers", "/market/trending",
-  "/market/heatmap", "/market/earnings-calendar",
+  "/market/heatmap", "/market/earnings-calendar", "/market/search/batch",
 ]);
+
+export function marketReadLimitMs(pathname: string): number {
+  return RESEARCH_MARKET_PATHS.has(pathname) ? DEFAULT_RESEARCH_REQUEST_TIMEOUT_MS : DEFAULT_MARKET_READ_LIMIT_MS;
+}
+
+/**
+ * A read cut off by a server restart is sent once more after a pause in this
+ * range (`sendAgainIfCutOff`): the next connection reaches a server that
+ * answers. Spread so the requests a restart dropped together are not all sent
+ * again in the same instant.
+ */
+const DROPPED_RETRY_MIN_MS = 100;
+const DROPPED_RETRY_SPREAD_MS = 400;
+
+/**
+ * Whether asking twice is harmless: a GET or HEAD, or a POST under the market
+ * paths, which are batch reads. Writes are never sent twice: the first may
+ * have reached the server before its connection dropped.
+ */
+function isRepeatableRead(method: string, path: string): boolean {
+  return method === "GET" || method === "HEAD" || (method === "POST" && path.startsWith("/market/"));
+}
+
+/**
+ * Set by the local relay a CLI capture's page reads the data service through
+ * (`gloom fn`, `gloom shot`) on its answer for a read it could not get to the
+ * service at all: the page reads it as the service being unreachable.
+ */
+export const SHOT_SERVICE_UNREACHABLE_HEADER = "X-Gloom-Service-Unreachable";
+
+/** What the last request to the data service in this process came to: answered, or not reached at all. */
+let lastServiceReach: "answered" | "unreachable" | null = null;
+/** Counts the commands that forgot the state: a request sent before one began says nothing of it. */
+let reachEpoch = 0;
+
+/** The current command's count (forgetDataServiceReach), which a request takes when it is sent. */
+export function dataServiceReachEpoch(): number {
+  return reachEpoch;
+}
+
+/**
+ * Whether the data service was unreachable when this process last asked it:
+ * a request went unanswered (no connection, a refused proxy, a hung one) and
+ * nothing has answered since. A command whose output came out empty then says
+ * so, rather than that there is no data (`gloom fn`).
+ */
+export function dataServiceUnreachable(): boolean {
+  return lastServiceReach === "unreachable";
+}
+
+/**
+ * Records what a request came to: answered, or not reached. `epoch` is the
+ * count it was sent under (dataServiceReachEpoch): one sent before the
+ * current command began, still out when it did, records nothing.
+ */
+export function noteDataServiceReach(answered: boolean, epoch = reachEpoch): void {
+  if (answered) serviceAnswers += 1;
+  if (epoch !== reachEpoch) return;
+  lastServiceReach = answered ? "answered" : "unreachable";
+}
+
+/** How many answers the data service gave this process, whichever command asked. */
+let serviceAnswers = 0;
+
+/**
+ * The count of the data service's answers (`noteDataServiceReach`): a read
+ * with nothing back while the count moved is slow, not cut off, as the
+ * client's own deadlines read it.
+ */
+export function dataServiceAnswerCount(): number {
+  return serviceAnswers;
+}
+
+/** Forgets what the last request came to, so a command reads only its own (`gloom fn` and `shot` start with it). */
+export function forgetDataServiceReach(): void {
+  lastServiceReach = null;
+  reachEpoch += 1;
+}
+
+/** The statuses a proxy answers with when it will not, or cannot, reach the server for a request. */
+const PROXY_REFUSAL_STATUSES = new Set([407, 502, 503, 504]);
+
+/** The variables a proxy is read from: the process's, or a test's own. */
+type ProxyEnvironment = Readonly<Record<string, string | undefined>>;
+
+function processEnvironment(): ProxyEnvironment | null {
+  return typeof process === "undefined" ? null : process.env;
+}
+
+/** The proxy the runtime sends a request for `url` through, from the environment as Bun reads it; null for none. */
+function environmentProxy(url: string, env: ProxyEnvironment | null): string | null {
+  if (!env) return null;
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    // Intentional ignore: a URL that does not parse is sent through no proxy the environment names.
+    return null;
+  }
+  const names = target.protocol === "https:" ? ["HTTPS_PROXY", "https_proxy"] : ["HTTP_PROXY", "http_proxy"];
+  const proxy = [...names, "ALL_PROXY", "all_proxy"].map((name) => env[name]?.trim()).find(Boolean);
+  if (!proxy) return null;
+  const bypass = (env.NO_PROXY ?? env.no_proxy ?? "").split(",").map((entry) => entry.trim().toLowerCase()).filter(Boolean);
+  const host = target.hostname.toLowerCase();
+  return bypass.some((entry) => entry === "*" || host === entry.replace(/^\./, "") || host.endsWith(entry.startsWith(".") ? entry : `.${entry}`))
+    ? null : proxy;
+}
+
+/**
+ * Whether an answer is a proxy's own, not the service's: what Bun 1.3 hands
+ * back when the proxy in HTTPS_PROXY refuses to open a tunnel (a 502 with
+ * "Bad Gateway" from the proxy; later Bun throws ERR_PROXY_TUNNEL instead).
+ * The data service was never reached, so it reads as unreachable, never as
+ * the service being busy ("Search is busy"). Told by a proxy being set for the
+ * URL, a status a proxy refuses with, and a body that is not the JSON every
+ * answer of the service carries.
+ */
+export function isProxyRefusal(
+  url: string,
+  response: Pick<Response, "status" | "headers">,
+  env: ProxyEnvironment | null = processEnvironment(),
+): boolean {
+  if (!PROXY_REFUSAL_STATUSES.has(response.status)) return false;
+  // A capture's relay that could not reach the service either.
+  if (response.headers.get(SHOT_SERVICE_UNREACHABLE_HEADER) === "1") return true;
+  if (!environmentProxy(url, env)) return false;
+  return !/\bjson\b/i.test(response.headers.get("Content-Type") ?? "");
+}
+
+/** Waits `ms`, or rejects with the signal's reason once it aborts. */
+function pause(ms: number, signal: AbortSignal | null | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 /** When a request gives up: without any answer from the service, and in all. */
 interface RequestDeadline {
   answerMs: number;
   limitMs: number;
-  /** When to check that the service answers at all, if nothing has by then; null when the deadline is too short for it. */
-  probeAtMs: number | null;
 }
 /** Local status for "this runtime cannot stream", never returned by the server. */
 export const STREAMING_UNSUPPORTED_STATUS = 0;
@@ -82,6 +239,49 @@ type CloudApiStreamFetch = (
   init?: RequestInit,
 ) => Promise<Response>;
 type SessionCookieName = (typeof SESSION_COOKIE_NAMES)[number];
+/**
+ * Whether a GET may join an identical one still out (`readShared`): market
+ * data reads, which panes opening together ask for at once, and only when the
+ * caller did not ask the HTTP cache for a fresh copy. Elsewhere a read asked
+ * after another is often asked because the first may be stale (a forced
+ * refresh), and joining it would hand back the older answer.
+ */
+function isSharedRead(path: string, options: RequestInit | undefined): boolean {
+  return path.startsWith("/market/") && options?.cache === undefined;
+}
+
+/**
+ * Whether a request can change what a later read answers. POSTs under the
+ * market and cloud data paths are batch reads (quotes, histories, perps,
+ * exposure), and telemetry and research activity reports change nothing a
+ * read returns; everything else that is not a GET is taken as a write.
+ */
+function changesReads(method: string, path: string): boolean {
+  if (method === "GET" || method === "HEAD") return false;
+  if (path.startsWith("/cloud/auth/")) return true;
+  return !/^\/(?:market|cloud|telemetry|activity)\//.test(path);
+}
+
+/** A request's headers in a fixed order, so two identical requests compare equal. */
+function headerLines(headers: Headers): string {
+  const lines: string[] = [];
+  headers.forEach((value, name) => { lines.push(`${name}:${value}`); });
+  return lines.sort().join("\n");
+}
+/**
+ * A response and the read of its body, which several callers can each parse.
+ * The body is read apart from the headers: a caller takes the session cookie
+ * from the headers even when the body never arrives.
+ */
+interface CloudApiAnswer {
+  response: CloudApiResponse;
+  text: Promise<string>;
+}
+interface SharedRead {
+  answer: Promise<CloudApiAnswer>;
+  controller: AbortController;
+  waiters: number;
+}
 
 export interface CloudApiFetchTransportOptions {
   /**
@@ -200,6 +400,36 @@ export async function putWithRevision<T, Current extends { revision: number }>(
   }
 }
 
+/**
+ * Background traffic. Crash reports, usage counts and command-search reports:
+ * a rate-limited, timed-out or missing one must not show up as a Cloud outage
+ * in the connections pane, and one that never got out (an ad blocker refuses
+ * `/telemetry/` in a browser that reaches everything else) says nothing of
+ * whether the data service answers. Nor must the map's probe for geo layers,
+ * which a server without them answers with 404, or a ticker change lookup: a
+ * note beside a quote, never one of the refused market requests a lookup of
+ * many symbols waits out and retries. Nor the tickers beside a list of
+ * organization names, which say so in place, or a 13F filer's EDGAR filing
+ * list, whose report says it went unchecked, or a company's other listings,
+ * beside a list check that still answers for the listing itself. Nor the
+ * batched searches and ticker changes a list of symbols starts with: a service
+ * without them answers 404, and whatever they leave unanswered is looked up
+ * one symbol at a time, which is tracked. Nor the Pro tab's yearly billing
+ * status: a server without it answers 404 and the tab shows no yearly row.
+ */
+function isBackgroundRequest(path: string): boolean {
+  return path.startsWith("/telemetry/")
+    || path === "/assist/searches"
+    || path === "/cloud/geo/layers"
+    || path.startsWith("/cloud/sec/13f/filer?")
+    || path.startsWith("/market/ticker-changes?")
+    || path.startsWith("/market/issuer-listings?")
+    || path === "/market/ticker-changes/batch"
+    || path === "/market/search/batch"
+    || path === "/market/organization-tickers"
+    || path === "/stripe/subscription/yearly";
+}
+
 function throwIfRequestAborted(signal: AbortSignal | null | undefined): void {
   if (!signal?.aborted) return;
   throw (
@@ -208,14 +438,54 @@ function throwIfRequestAborted(signal: AbortSignal | null | undefined): void {
   );
 }
 
+/**
+ * Whether an answer says the server that took the request is going away: the
+ * proxy in front could not get an answer from it (a 502 that is not the
+ * API's own JSON), or the server refused new work while it stops (503 with a
+ * Retry-After of at most a second). The API's other 502s and 503s say what an
+ * upstream or the service does not have, and stand.
+ */
+function isRestartAnswer(response: CloudApiResponse): boolean {
+  if (response.status === 502) return !(response.headers.get("Content-Type") ?? "").includes("json");
+  if (response.status !== 503) return false;
+  const retryAfter = response.headers.get("Retry-After");
+  return retryAfter != null && retryAfter.trim() !== "" && Number(retryAfter) <= 1;
+}
+
+/**
+ * Sends a read, and once more after a short pause when its connection
+ * dropped before the answer began (`isDroppedConnection`), or the answer
+ * says its server is going away (`isRestartAnswer`). Only once: a second
+ * failure is the service's state, and is reported as before.
+ */
+async function sendAgainIfCutOff(
+  sendOnce: () => Promise<CloudApiResponse>,
+  signal: AbortSignal | null | undefined,
+): Promise<CloudApiResponse> {
+  let first: CloudApiResponse;
+  try {
+    first = await sendOnce();
+  } catch (error) {
+    if (signal?.aborted || !isDroppedConnection(error)) throw error;
+    await pause(DROPPED_RETRY_MIN_MS + Math.random() * DROPPED_RETRY_SPREAD_MS, signal);
+    return sendOnce();
+  }
+  if (!isRestartAnswer(first)) return first;
+  // Read and drop the replaced answer's body, so its connection is released.
+  first.text().catch(() => { /* Intentional ignore: this answer is replaced by the next. */ });
+  await pause(DROPPED_RETRY_MIN_MS + Math.random() * DROPPED_RETRY_SPREAD_MS, signal);
+  return sendOnce();
+}
+
 export class CloudApiRequestTransport {
   private sessionToken: string | null = null;
   private sessionCookieName: SessionCookieName | null = null;
   private websocketToken: string | null = null;
   private cookieSessionMode = false;
   private readonly fetchTransport: CloudApiFetchTransport | null;
+  private readonly proxyEnvironment: ProxyEnvironment | undefined;
   private readonly marketRequestTimeoutMs: number;
-  private readonly researchRequestTimeoutMs: number;
+  private readonly marketReadLimitOverride?: number;
   private readonly connectionHealth: ConnectionHealthRegistry;
   /** Answers received from the service, by any request: a request that sees this grow knows the connection works. */
   private answers = 0;
@@ -227,7 +497,17 @@ export class CloudApiRequestTransport {
   private connectionGeneration = cloudApiTransportGeneration;
   /** Requests waiting under a deadline: the check that the service answers runs only while one is. */
   private pending = 0;
-  private probe: AbortController | null = null;
+  private probe: { controller: AbortController; expiresAt: number } | null = null;
+  /** The next check whether an unreachable service answers again, and how long after it the one after waits. */
+  private recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  private recoveryDelayMs = RECOVERY_PROBE_FIRST_MS;
+  /** Bumped by `dispose`, so a check still out does not schedule the next one. */
+  private recoveryGeneration = 0;
+  /** The check whether an unreachable service answers again, while it is out, and when the last one went out. */
+  private recoveryProbe: AbortController | null = null;
+  private lastRecoveryProbeAt = Number.NEGATIVE_INFINITY;
+  /** GETs still out, by URL and headers, that an identical GET joins instead of sending its own (`readShared`). */
+  private readonly sharedReads = new Map<string, SharedRead>();
 
   readonly baseUrl = getCloudApiBaseUrl();
 
@@ -236,12 +516,14 @@ export class CloudApiRequestTransport {
       fetchTransport?: CloudApiFetchTransport;
       marketRequestTimeoutMs?: number;
       connectionHealth?: ConnectionHealthRegistry;
+      /** The variables the proxy is read from (isProxyRefusal); the process's by default. */
+      proxyEnvironment?: ProxyEnvironment;
     } = {},
   ) {
     this.fetchTransport = options.fetchTransport ?? null;
-    this.marketRequestTimeoutMs =
-      options.marketRequestTimeoutMs ?? DEFAULT_MARKET_REQUEST_TIMEOUT_MS;
-    this.researchRequestTimeoutMs = options.marketRequestTimeoutMs ?? DEFAULT_RESEARCH_REQUEST_TIMEOUT_MS;
+    this.proxyEnvironment = options.proxyEnvironment;
+    this.marketRequestTimeoutMs = options.marketRequestTimeoutMs ?? MARKET_REQUEST_TIMEOUT_MS;
+    this.marketReadLimitOverride = options.marketRequestTimeoutMs;
     this.connectionHealth = options.connectionHealth ?? connectionHealth;
   }
 
@@ -258,12 +540,14 @@ export class CloudApiRequestTransport {
   }
 
   setCookieSessionMode(enabled: boolean): void {
+    if (this.cookieSessionMode !== enabled) this.forgetSharedReads();
     this.cookieSessionMode = enabled;
   }
 
   setSessionToken(token: string | null): void {
     if (this.sessionToken !== token) {
       this.sessionCookieName = null;
+      this.forgetSharedReads();
     }
     this.sessionToken = token;
     if (!token) {
@@ -273,6 +557,16 @@ export class CloudApiRequestTransport {
 
   setWebSocketToken(token: string | null): void {
     this.websocketToken = token;
+  }
+
+  /**
+   * Stops later GETs from joining the ones still out (`readShared`); callers
+   * already waiting keep their answer. A write, or another account signing
+   * in, can change what a read answers, and in cookie mode a request's
+   * headers do not say whose session it carries.
+   */
+  forgetSharedReads(): void {
+    this.sharedReads.clear();
   }
 
   getSocketAuthToken(): string | null {
@@ -320,7 +614,7 @@ export class CloudApiRequestTransport {
       GLOOM_CLOUD_HTTP_CONNECTION_ID,
       operation,
       async () => {
-        const response = await this.reachService(() => streamFetch(`${this.baseUrl}${path}`, {
+        const response = await this.reachService(`${this.baseUrl}${path}`, () => streamFetch(`${this.baseUrl}${path}`, {
           ...options,
           headers,
           credentials: "include",
@@ -333,6 +627,7 @@ export class CloudApiRequestTransport {
             response.status,
             parseRetryAfterMs(response.headers.get("Retry-After")),
             parseApiErrorCode(text),
+            parseApiErrorDetails(text),
           );
         }
         return response;
@@ -340,28 +635,26 @@ export class CloudApiRequestTransport {
     );
   }
 
-  async request<T>(path: string, options?: RequestInit, canApplySession: () => boolean = () => true): Promise<T> {
+  async request<T>(path: string, options?: RequestInit, canApplySession?: () => boolean): Promise<T> {
     return this.withDeadline(path, this.deadlineFor(path), options?.signal, (signal) => this.performRequest<T>(path, {
       ...options,
       signal,
-    }, canApplySession));
+    }, canApplySession ?? (() => true), undefined, !canApplySession && isSharedRead(path, options)));
   }
 
   /**
-   * Every request's deadline. A market read or a search waits about ten
-   * seconds, research and requests outside market data longer. With nothing
-   * back from the service, a request gives up at ten seconds, a search at
-   * four, and any request at three after one went unanswered, until something
-   * answers again. Three seconds before that, a request still unanswered
-   * checks that the service answers at all, so one slow request on a working
-   * connection is waited for and a dead connection is not.
+   * With nothing back from the service, a request gives up at ten seconds, a
+   * search at four, and any request at three once the service is unreachable.
+   * An unanswered request checks the service, twice if there's time. With an
+   * answer, a market read may take up to 25 seconds in all; research and
+   * requests outside market data get longer.
    */
   private deadlineFor(path: string, limitMs?: number): RequestDeadline {
     this.forgetOtherTransport();
     const pathname = path.split("?")[0]!;
     const market = pathname.startsWith("/market/");
     const limit = limitMs ?? (!market ? DEFAULT_SERVICE_REQUEST_LIMIT_MS
-      : RESEARCH_MARKET_PATHS.has(pathname) ? this.researchRequestTimeoutMs : this.marketRequestTimeoutMs);
+      : this.marketReadLimitOverride ?? marketReadLimitMs(pathname));
     let answerMs = pathname === "/market/search"
       ? Math.min(this.marketRequestTimeoutMs, SEARCH_ANSWER_TIMEOUT_MS)
       : this.marketRequestTimeoutMs;
@@ -369,7 +662,6 @@ export class CloudApiRequestTransport {
     return {
       answerMs,
       limitMs: Math.max(limit, answerMs),
-      probeAtMs: answerMs >= SERVICE_PROBE_TIMEOUT_MS ? answerMs - SERVICE_PROBE_TIMEOUT_MS : null,
     };
   }
 
@@ -397,12 +689,19 @@ export class CloudApiRequestTransport {
     const answersAtStart = this.answers;
     const answered = () => this.answers > answersAtStart;
     const generation = cloudApiTransportGeneration;
+    const epoch = reachEpoch;
     const what = path.startsWith("/market/") ? "Cloud market request" : "Cloud request";
-    const timedOut = (ms: number) => new OperationTimeoutError(`${what} timed out after ${ms}ms: ${path.split("?")[0]}`);
+    // The endpoint stays out of the message, which reports and panes print; the debug log's line names it.
+    const endpoint = path.split("?")[0]!;
+    const failed = (message: string) => {
+      requestLog.warn(message, { endpoint });
+      return new OperationTimeoutError(message);
+    };
+    const timedOut = (ms: number) => failed(`${what} timed out after ${ms}ms`);
     const timers: Array<ReturnType<typeof setTimeout>> = [];
     if (this.hungAt != null && Date.now() - this.hungAt < HUNG_FAIL_FAST_MS && !controller.signal.aborted) {
       callerSignal?.removeEventListener("abort", abortFromCaller);
-      throw new DataServiceUnreachableError(new OperationTimeoutError(`${what} not sent: the last one got no answer: ${path.split("?")[0]}`));
+      throw new DataServiceUnreachableError(failed(`${what} not sent: the last one got no answer`));
     }
     this.pending += 1;
     try {
@@ -413,16 +712,17 @@ export class CloudApiRequestTransport {
           controller.abort(error);
         };
         work.then(resolve, reject);
-        if (deadline.probeAtMs != null) {
+        for (const lead of [2 * SERVICE_PROBE_TIMEOUT_MS, SERVICE_PROBE_TIMEOUT_MS]) {
+          if (deadline.answerMs < lead) continue;
           timers.push(setTimeout(() => {
             if (!answered()) this.checkServiceAnswers();
-          }, deadline.probeAtMs));
+          }, deadline.answerMs - lead));
         }
         timers.push(setTimeout(() => {
           // The caller gave up first: its abort settles the request, and says nothing of the connection.
           if (callerSignal?.aborted) return;
           if (!answered()) {
-            this.recordNoAnswer(generation, true);
+            if (!isBackgroundRequest(path)) this.recordNoAnswer(generation, true, epoch);
             fail(new DataServiceUnreachableError(timedOut(deadline.answerMs)));
           } else if (deadline.limitMs > deadline.answerMs) {
             timers.push(setTimeout(() => fail(timedOut(deadline.limitMs)), deadline.limitMs - deadline.answerMs));
@@ -436,7 +736,7 @@ export class CloudApiRequestTransport {
       callerSignal?.removeEventListener("abort", abortFromCaller);
       this.pending -= 1;
       // Nothing waits on the check any more: it must not hold a command's process open.
-      if (this.pending === 0) this.probe?.abort();
+      if (this.pending === 0) this.probe?.controller.abort();
     }
   }
 
@@ -448,18 +748,29 @@ export class CloudApiRequestTransport {
    * A caller's abort stays an abort. An answer of any status says the
    * connection works, for the deadlines of the requests beside it.
    */
-  private async reachService<R>(fetch: () => Promise<R>, signal: AbortSignal | null | undefined): Promise<R> {
+  private async reachService<R extends Pick<Response, "status" | "headers">>(
+    url: string,
+    fetch: () => Promise<R>,
+    signal: AbortSignal | null | undefined,
+    background = false,
+  ): Promise<R> {
     const generation = cloudApiTransportGeneration;
+    const epoch = reachEpoch;
     let response: R;
     try {
       response = await fetch();
+      // The proxy's refusal to reach the service, which Bun 1.3 gives back as an answer, is none of the service's.
+      if (isProxyRefusal(url, response, this.proxyEnvironment ?? processEnvironment())) {
+        throw new DataServiceUnreachableError(new Error(`Proxy refused to open a tunnel: ${response.status}`));
+      }
     } catch (error) {
       if (signal?.aborted) throw error;
       const failure = asDataServiceFailure(error);
-      if (failure instanceof DataServiceUnreachableError) this.recordNoAnswer(generation, false);
+      // Background traffic that never got out says nothing of the service (`isBackgroundRequest`).
+      if (failure instanceof DataServiceUnreachableError && !background) this.recordNoAnswer(generation, false, epoch);
       throw failure;
     }
-    this.recordAnswer();
+    this.recordAnswer(epoch);
     return response;
   }
 
@@ -467,15 +778,43 @@ export class CloudApiRequestTransport {
   private forgetOtherTransport(): void {
     if (this.fetchTransport || this.connectionGeneration === cloudApiTransportGeneration) return;
     this.connectionGeneration = cloudApiTransportGeneration;
-    this.unreachable = false;
-    this.hungAt = null;
+    this.markReachable();
   }
 
   /** Something came back from the service: the connection works. */
-  private recordAnswer(): void {
+  private recordAnswer(epoch?: number): void {
+    noteDataServiceReach(true, epoch);
     this.answers += 1;
-    this.unreachable = false;
+    this.markReachable();
+  }
+
+  /**
+   * The service answered on another channel (the quote stream opened, or sent
+   * a frame). That alone does not end an outage: a stream can run while
+   * requests still fail (a proxy that lets one through and not the other),
+   * and ending the outage on each frame would start it again at the stream's
+   * tick rate. While the service is unreachable this checks over HTTP at once
+   * instead (`runRecoveryCheck`), one check at a time and at most one per
+   * RECOVERY_PROBE_FIRST_MS. It does not count toward the deadlines of
+   * requests in flight, which wait for an answer over this transport.
+   */
+  noteServiceAnswered(): void {
+    if (!this.unreachable || this.recoveryProbe) return;
+    if (Date.now() - this.lastRecoveryProbeAt < RECOVERY_PROBE_FIRST_MS) return;
+    this.stopRecoveryChecks();
+    this.runRecoveryCheck();
+  }
+
+  /**
+   * Ends an outage: requests stop failing fast, and the connections registry
+   * hears the service answers again, which asks again for what failed meanwhile.
+   */
+  private markReachable(): void {
     this.hungAt = null;
+    if (!this.unreachable) return;
+    this.unreachable = false;
+    this.stopRecoveryChecks();
+    this.connectionHealth.reportReachability(GLOOM_CLOUD_HTTP_CONNECTION_ID, true);
   }
 
   /**
@@ -483,10 +822,71 @@ export class CloudApiRequestTransport {
    * refused, or `hung` with nothing back by its deadline. Once another
    * transport is installed, what one sent on the last says nothing of it.
    */
-  private recordNoAnswer(generation: number, hung: boolean): void {
+  private recordNoAnswer(generation: number, hung: boolean, epoch?: number): void {
     if (!this.fetchTransport && generation !== cloudApiTransportGeneration) return;
-    this.unreachable = true;
+    noteDataServiceReach(false, epoch);
     if (hung) this.hungAt = Date.now();
+    if (this.unreachable) {
+      // A chain of checks stopped by `dispose` starts again.
+      this.scheduleRecoveryCheck();
+      return;
+    }
+    this.unreachable = true;
+    this.connectionHealth.reportReachability(GLOOM_CLOUD_HTTP_CONNECTION_ID, false);
+    this.recoveryDelayMs = RECOVERY_PROBE_FIRST_MS;
+    this.scheduleRecoveryCheck();
+  }
+
+  /**
+   * Checks again later whether the unreachable service answers: nothing else
+   * may be asking (no stream, no pane refreshing), and what failed in the
+   * outage is asked again only once something answers. The timer never holds
+   * a command's process open.
+   */
+  private scheduleRecoveryCheck(): void {
+    if (this.recoveryTimer || this.recoveryProbe || !this.unreachable) return;
+    const timer = setTimeout(() => {
+      this.recoveryTimer = null;
+      this.runRecoveryCheck();
+    }, this.recoveryDelayMs);
+    (timer as { unref?: () => void }).unref?.();
+    this.recoveryTimer = timer;
+  }
+
+  /** Asks `/health` now whether the unreachable service answers; the next check is scheduled once this one is done. */
+  private runRecoveryCheck(): void {
+    if (!this.unreachable || this.recoveryProbe) return;
+    const generation = this.recoveryGeneration;
+    this.lastRecoveryProbeAt = Date.now();
+    this.recoveryDelayMs = Math.min(this.recoveryDelayMs * 2, RECOVERY_PROBE_MAX_MS);
+    const controller = new AbortController();
+    this.recoveryProbe = controller;
+    const giveUp = setTimeout(() => controller.abort(), SERVICE_PROBE_TIMEOUT_MS);
+    (giveUp as { unref?: () => void }).unref?.();
+    const url = `${this.baseUrl}${SERVICE_PROBE_PATH}`;
+    (this.fetchTransport ?? cloudApiFetchTransport)(url, { signal: controller.signal })
+      // A proxy that refuses to reach the service answers for it: still unreachable.
+      .then((response) => { if (!isProxyRefusal(url, response, this.proxyEnvironment ?? processEnvironment())) this.recordAnswer(); }, () => {
+        // Intentional ignore: still unreachable; the next check is scheduled below.
+      })
+      .finally(() => {
+        clearTimeout(giveUp);
+        if (this.recoveryProbe === controller) this.recoveryProbe = null;
+        if (generation === this.recoveryGeneration) this.scheduleRecoveryCheck();
+      });
+  }
+
+  private stopRecoveryChecks(): void {
+    if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
+    this.recoveryTimer = null;
+  }
+
+  /** Stops checking whether an unreachable service answers again; a request that goes unanswered after starts the checks again. */
+  dispose(): void {
+    this.recoveryGeneration += 1;
+    this.stopRecoveryChecks();
+    this.recoveryProbe?.abort();
+    this.recoveryProbe = null;
   }
 
   /**
@@ -496,18 +896,20 @@ export class CloudApiRequestTransport {
    * when nothing waits on it any more.
    */
   private checkServiceAnswers(): void {
-    if (this.probe) return;
+    if (this.probe && this.probe.expiresAt > Date.now()) return;
+    this.probe?.controller.abort();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), SERVICE_PROBE_TIMEOUT_MS);
     const done = () => {
       clearTimeout(timer);
-      if (this.probe === controller) this.probe = null;
+      if (this.probe?.controller === controller) this.probe = null;
     };
     // Done once given up on, even through a transport that ignores the abort.
     controller.signal.addEventListener("abort", done, { once: true });
-    this.probe = controller;
-    (this.fetchTransport ?? cloudApiFetchTransport)(`${this.baseUrl}${SERVICE_PROBE_PATH}`, { signal: controller.signal })
-      .then(() => this.recordAnswer(), () => {
+    this.probe = { controller, expiresAt: Date.now() + SERVICE_PROBE_TIMEOUT_MS };
+    const url = `${this.baseUrl}${SERVICE_PROBE_PATH}`;
+    (this.fetchTransport ?? cloudApiFetchTransport)(url, { signal: controller.signal })
+      .then((response) => { if (!isProxyRefusal(url, response, this.proxyEnvironment ?? processEnvironment())) this.recordAnswer(); }, () => {
         // Intentional ignore: an unanswered check only leaves the request it guards to its own deadline.
       })
       .finally(done);
@@ -554,8 +956,19 @@ export class CloudApiRequestTransport {
     options: RequestInit | undefined,
     canApplySession: () => boolean,
     send?: CloudApiFetchTransport,
+    /**
+     * Whether an identical GET already out can answer this one (`readShared`,
+     * `isSharedRead`). Never for a request tied to a session check: a newer
+     * check must reach the server rather than take an answer about an older
+     * credential.
+     */
+    shareable = false,
   ): Promise<T> {
     throwIfRequestAborted(options?.signal);
+    const method = (options?.method ?? "GET").toUpperCase();
+    // A read asked during or after a write must not take an answer sent before it.
+    const writes = changesReads(method, path);
+    if (writes) this.forgetSharedReads();
     const headers = new Headers(options?.headers);
     if (
       !headers.has("Content-Type") &&
@@ -569,20 +982,37 @@ export class CloudApiRequestTransport {
     headers.set("Origin", this.baseUrl);
 
     const operation = `${options?.method ?? "GET"} ${path.split("?")[0]}`;
-    const request = async () => {
-      const res = await this.reachService(() => (send ?? this.fetchTransport ?? cloudApiFetchTransport)(
-        `${this.baseUrl}${path}`,
-        {
-          ...options,
-          headers,
-          credentials: "include",
-        },
-      ), options?.signal);
+    const url = `${this.baseUrl}${path}`;
+    const repeatable = !send && isRepeatableRead(method, path);
+    const read = async (signal: AbortSignal | null | undefined): Promise<CloudApiAnswer> => {
+      const sendOnce = () => (send ?? this.fetchTransport ?? cloudApiFetchTransport)(url, {
+        ...options,
+        headers,
+        credentials: "include",
+        signal,
+      });
+      // Inside the reach check: a read that gets through on its second try was answered, not an outage.
+      const response = await this.reachService(
+        url,
+        () => (repeatable ? sendAgainIfCutOff(sendOnce, signal) : sendOnce()),
+        signal,
+        isBackgroundRequest(path),
+      );
+      throwIfRequestAborted(signal);
+      const text = response.text();
+      text.catch(() => { /* Intentional ignore: every caller awaits this body after reading the headers. */ });
+      return { response, text };
+    };
+    const answer = async () => {
+      const shared = shareable && !send && method === "GET" && options?.body == null;
+      const { response: res, text: body } = shared
+        ? await this.readShared(`${url}\n${headerLines(headers)}`, options?.signal, read)
+        : await read(options?.signal);
       throwIfRequestAborted(options?.signal);
       const ownsCredential = canApplySession() && this.sessionToken === sessionTokenAtRequestStart;
       if (ownsCredential) this.extractSessionCookie(res);
       const sessionTokenAfterHeaders = this.sessionToken;
-      const text = await res.text();
+      const text = await body;
       throwIfRequestAborted(options?.signal);
 
       if (!res.ok) {
@@ -604,29 +1034,14 @@ export class CloudApiRequestTransport {
       }
       return parsed as T;
     };
-    // Crash reports, usage counts and command-search reports are background
-    // traffic: a rate-limited, timed-out or missing one must not show up as a
-    // Cloud outage in the connections pane. Nor must the map's probe for geo
-    // layers, which a server without them answers with 404, or a ticker
-    // change lookup: a note beside a quote, never one of the refused market
-    // requests a lookup of many symbols waits out and retries. Nor the
-    // tickers beside a list of organization names, which say so in place,
-    // or a 13F filer's EDGAR filing list, whose report says it went unchecked,
-    // or a company's other listings, beside a list check that still answers
-    // for the listing itself. Nor the batched searches and ticker changes a
-    // list of symbols starts with: a service without them answers 404, and whatever they leave
-    // unanswered is looked up one symbol at a time, which is tracked.
-    if (
-      path.startsWith("/telemetry/")
-      || path === "/assist/searches"
-      || path === "/cloud/geo/layers"
-      || path.startsWith("/cloud/sec/13f/filer?")
-      || path.startsWith("/market/ticker-changes?")
-      || path.startsWith("/market/issuer-listings?")
-      || path === "/market/ticker-changes/batch"
-      || path === "/market/search/batch"
-      || path === "/market/organization-tickers"
-    ) return request();
+    const request = async () => {
+      try {
+        return await answer();
+      } finally {
+        if (writes) this.forgetSharedReads();
+      }
+    };
+    if (isBackgroundRequest(path)) return request();
     return this.connectionHealth.track(
       GLOOM_CLOUD_HTTP_CONNECTION_ID,
       operation,
@@ -639,6 +1054,64 @@ export class CloudApiRequestTransport {
             )
           : request(),
     );
+  }
+
+  /**
+   * Identical GETs (same URL and headers, so the same credential) asked while
+   * one is still out share it: each caller gets the same answer and parses its
+   * own copy. Panes that open together ask for the same quote or history from
+   * several places at once, and the browser would otherwise send each one and
+   * queue them behind each other. A caller that gives up leaves the request
+   * running for the others; the last one to give up cancels it.
+   */
+  private readShared(
+    key: string,
+    signal: AbortSignal | null | undefined,
+    read: (signal: AbortSignal) => Promise<CloudApiAnswer>,
+  ): Promise<CloudApiAnswer> {
+    throwIfRequestAborted(signal);
+    let flight = this.sharedReads.get(key);
+    if (!flight) {
+      const controller = new AbortController();
+      // Joinable until its body is in, not only its headers, and not a moment
+      // longer: a caller that has the body can ask again and must go out.
+      const done = () => { if (this.sharedReads.get(key) === created) this.sharedReads.delete(key); };
+      const answer = read(controller.signal).then((first) => {
+        const text = first.text.finally(done);
+        text.catch(() => { /* Intentional ignore: each waiter awaits this body and sees its failure. */ });
+        return { response: first.response, text };
+      }, (error: unknown) => {
+        done();
+        throw error;
+      });
+      const created: SharedRead = { answer, controller, waiters: 0 };
+      this.sharedReads.set(key, created);
+      flight = created;
+    }
+    const current = flight;
+    current.waiters += 1;
+    if (!signal) return current.answer;
+    // A caller stays on the request until its body is in: giving up while the
+    // body is still arriving counts as leaving, as it does before the headers.
+    let leave = () => {};
+    const left = new Promise<never>((_, reject) => {
+      leave = () => {
+        current.waiters -= 1;
+        reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+        if (current.waiters > 0) return;
+        if (this.sharedReads.get(key) === current) this.sharedReads.delete(key);
+        current.controller.abort(signal.reason);
+      };
+    });
+    left.catch(() => { /* Intentional ignore: the race below hands this abort to the caller. */ });
+    signal.addEventListener("abort", leave, { once: true });
+    const stop = () => signal.removeEventListener("abort", leave);
+    void current.answer.then((answer) => answer.text).then(stop, stop);
+    return Promise.race([current.answer, left]).then((answer) => {
+      const text = Promise.race([answer.text, left]);
+      text.catch(() => { /* Intentional ignore: the caller awaits this body and sees its failure. */ });
+      return { response: answer.response, text };
+    });
   }
 
   private extractSessionCookie(res: CloudApiResponse): void {

@@ -191,7 +191,7 @@ describe("Ticker detail chart tab switching", () => {
 
     await flushFrames();
     const chartTabFrame = tui.frame();
-    expect(chartTabFrame).toContain("AAPL:XNAS Price");
+    expect(chartTabFrame).toContain("AAPL:NASDAQ Price");
     expect(chartTabFrame).toContain("5Y");
     expect(chartTabFrame.toUpperCase()).toContain("AUTO");
     expect(chartTabFrame).not.toContain("AAPL -");
@@ -306,12 +306,12 @@ describe("Ticker detail chart tab keys", () => {
     await tui.waitForFrameToContain("Apple Inc.");
   });
 
-  test("the Esc that leaves the chart never counts toward a close, an idle Esc Esc still closes", async () => {
+  test("Esc Esc closes the pane from inside the chart, though the first Esc leaves the chart", async () => {
     const closes = await renderChartTab();
     await key("down");
     await tui.waitForFrameToContain("[Esc]tabs");
-    await press(ESC);
-    await press(ESC);
+    const leave = await press(ESC);
+    expect(leave.propagationStopped).toBe(true);
     expect(closes.count).toBe(0);
     await press(ESC);
     expect(closes.count).toBe(1);

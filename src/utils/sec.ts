@@ -1,32 +1,13 @@
 import type { TickerRecord } from "../types/ticker";
 import { tickerHasListingSuffix } from "../sources/listing-symbols";
-import { canonicalExchange, exchangeLabel, isKnownExchangeCode, parsePublicTickerKey, resolveExchangeTimeZone, US_LISTING_EXCHANGES } from "./exchanges";
+import { canonicalExchange, exchangeLabel, isKnownExchangeCode, isUsEquityExchange, parsePublicTickerKey, publicTickerKey, resolveExchangeTimeZone } from "./exchanges";
 import { shortListingTitle } from "../tickers/company-name";
-
-/** Canonical US equity venues: the listing exchanges plus other lit and OTC venues. */
-const US_EQUITY_EXCHANGES = new Set([
-  ...US_LISTING_EXCHANGES,
-  "BYX",
-  "IEX",
-  "OTC",
-  "PINK",
-  // Listing codes for the OTC Markets tiers.
-  "PNK",
-  "OQB",
-  "OQX",
-  "OEM",
-  "OBB",
-]);
 
 /** Order-routing destinations, not listings. */
 const ROUTING_EXCHANGES = new Set(["SMART"]);
 
 function normalize(value?: string): string {
   return (value ?? "").trim().toUpperCase();
-}
-
-function isUsExchange(value?: string): boolean {
-  return US_EQUITY_EXCHANGES.has(canonicalExchange(value));
 }
 
 function isEquityType(value?: string): boolean {
@@ -69,6 +50,17 @@ export function mayBeUsEquityOrFundTicker(ticker: TickerRecord | null | undefine
   return mayBeUsListingOfType(ticker, (type) => isEquityType(type) || isFundType(type));
 }
 
+/**
+ * Whether the fund view (ETF) can open on the ticker: `mayBeUsEquityOrFundTicker`,
+ * or an equity or fund known to be listed abroad (3046.HK), which the view
+ * gives its issuer's figures where Gloom reads them, and its issuer's page
+ * otherwise. Before this `ETF 3046.HK` opened nothing.
+ */
+export function mayBeFundViewTicker(ticker: TickerRecord | null | undefined): boolean {
+  if (mayBeUsEquityOrFundTicker(ticker)) return true;
+  return isTickerOfType(ticker, (type) => isEquityType(type) || isFundType(type)) && isKnownNonUsListing(ticker);
+}
+
 function isTickerOfType(ticker: TickerRecord | null | undefined, acceptsType: (type?: string) => boolean): boolean {
   if (!ticker) return false;
   const primaryContract = ticker.metadata.broker_contracts?.[0];
@@ -97,7 +89,7 @@ export function isKnownNonUsListing(ticker: TickerRecord | null | undefined): bo
   const venues = [primaryContract?.primaryExchange, primaryContract?.exchange, ticker.metadata.exchange]
     .map(normalize)
     .filter((exchange) => exchange.length > 0 && !ROUTING_EXCHANGES.has(exchange));
-  if (venues.length > 0) return !venues.some((exchange) => isUsExchange(exchange));
+  if (venues.length > 0) return !venues.some((exchange) => isUsEquityExchange(exchange));
   return isKnownNonUsListingSymbol(ticker.metadata.ticker ?? "");
 }
 
@@ -110,7 +102,7 @@ export function isKnownNonUsListing(ticker: TickerRecord | null | undefined): bo
 export function isKnownNonUsListingSymbol(symbol: string): boolean {
   const parsed = parsePublicTickerKey(symbol);
   if (parsed.exchange) {
-    return isKnownExchangeCode(parsed.exchange) && !ROUTING_EXCHANGES.has(parsed.exchange) && !isUsExchange(parsed.exchange);
+    return isKnownExchangeCode(parsed.exchange) && !ROUTING_EXCHANGES.has(parsed.exchange) && !isUsEquityExchange(parsed.exchange);
   }
   return tickerHasListingSuffix(parsed.symbol);
 }
@@ -133,7 +125,7 @@ export function isKnownNonUsEquityTicker(ticker: TickerRecord | null | undefined
  */
 export function nonUsSecListingVenue(ticker: string, exchange?: string): string | null {
   const venue = parsePublicTickerKey(ticker).exchange ?? canonicalExchange(exchange);
-  if (!venue || ROUTING_EXCHANGES.has(venue) || isUsExchange(venue)) return null;
+  if (!venue || ROUTING_EXCHANGES.has(venue) || isUsEquityExchange(venue)) return null;
   return venue;
 }
 
@@ -153,8 +145,28 @@ export function listingAbroadVenue(key: string): string | null {
   return venue && zone && zone !== "UTC" && !US_TIME_ZONES.has(zone) ? venue : null;
 }
 
-/** What `ticker` and ETF say of a fund listed abroad: the facts Gloom collects are the US-listed funds'. */
-export const US_FUND_FACTS_ONLY = "Fund facts (fee, NAV, premium) cover US-listed funds only.";
+/** What `ticker` and ETF say of a fund listed abroad: the facts Gloom collects are the US-listed funds' and Hong Kong's spot coin funds'. */
+export const US_FUND_FACTS_ONLY = "Fund facts (fee, NAV, premium) cover US-listed funds and Hong Kong's spot bitcoin and ether ETFs only.";
+
+/**
+ * Whether a fund on this venue abroad can have facts: Hong Kong, whose spot
+ * bitcoin and ether ETFs Gloom reads from their issuers. The server says which
+ * of its funds are covered.
+ */
+export function hasFundFactsAbroad(exchange?: string | null): boolean {
+  return canonicalExchange(exchange ?? undefined) === "HKEX";
+}
+
+/**
+ * What fund facts are asked for by, for a fund on a venue abroad: a bare
+ * code with its venue's key (3046 on HKEX as 3046:XHKG), so the server reads
+ * it as that listing and not as a US ticker; a key or suffix that already
+ * names its venue (3046:HKEX, 3046.HK) as it is.
+ */
+export function fundFactsAbroadKey(symbol: string, exchange?: string | null): string {
+  if (parsePublicTickerKey(symbol).exchange || tickerHasListingSuffix(symbol)) return symbol;
+  return publicTickerKey(symbol, exchange ?? undefined);
+}
 
 /**
  * The symbol data that covers US listings only reads a listing by: AAPL for

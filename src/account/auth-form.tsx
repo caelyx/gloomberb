@@ -4,19 +4,21 @@
  * own panel. The sign-in attempt it shares with onboarding lives in
  * `email-auth-attempt`, the non-React logic in `auth-model`.
  */
-import { useCallback, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { apiClient, type AuthUser } from "../api-client";
 import { matchesKeyChord, parseKeyChord } from "../app/keybindings";
 import { Button, Spinner, TextField } from "../components";
+import { fitDialogWidth } from "../components/ui/frame";
 import { t, tf } from "../i18n";
 import { useAppLanguage } from "../i18n/react";
 import { colors } from "../theme/colors";
-import { Box, Text, TextAttributes, type InputRenderable } from "../ui";
+import { Box, Text, TextAttributes, useUiCapabilities, type InputRenderable } from "../ui";
 import { useDialogKeyboard } from "../ui/dialog";
 import { isPlainKey } from "../utils/keyboard";
 import { validateAccountEmail, type AccountMode } from "./auth-model";
 import { useEmailAuthAttempt, type EmailAuthField } from "./email-auth-attempt";
 
+/** The form's width in cells; the desktop and the web narrow it to fit a phone. */
 const AUTH_FIELD_WIDTH = 42;
 
 type ResetState = "idle" | "sending" | "sent";
@@ -48,6 +50,8 @@ export interface AuthFormProps {
   onModeChange?: (mode: AccountMode) => void;
   /** Extra actions below the buttons, e.g. the gate's QR alternative. */
   footer?: ReactNode;
+  /** Whether anything is typed in it, so a dialog holding it closes on a stray click only while nothing would be lost. */
+  onTypedChange?: (typed: boolean) => void;
 }
 
 export function AuthForm({
@@ -57,14 +61,20 @@ export function AuthForm({
   shortcutScope,
   onModeChange,
   footer,
+  onTypedChange,
 }: AuthFormProps) {
   useAppLanguage();
+  // The desktop and the web size the column and let its rows fill it, as the kit's dialogs do.
+  const { nativePaneChrome } = useUiCapabilities();
+  const rowWidth = nativePaneChrome ? undefined : AUTH_FIELD_WIDTH;
   const [mode, setMode] = useState<AccountMode>(initialMode);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [activeField, setActiveField] = useState<EmailAuthField>("email");
   const [showPassword, setShowPassword] = useState(false);
   const [resetState, setResetState] = useState<ResetState>("idle");
+  const typed = email !== "" || password !== "";
+  useEffect(() => onTypedChange?.(typed), [onTypedChange, typed]);
   const emailInputRef = useRef<InputRenderable>(null);
   const passwordInputRef = useRef<InputRenderable>(null);
   const {
@@ -167,14 +177,14 @@ export function AuthForm({
   const error = validationError ?? submitError?.message ?? null;
 
   return (
-    <Box flexDirection="column" gap={1}>
+    <Box flexDirection="column" gap={1} {...(nativePaneChrome ? { style: { width: fitDialogWidth(AUTH_FIELD_WIDTH) } } : {})}>
       <TextField
         label={t("Email")}
         value={email}
         placeholder="email@example.com"
         inputRef={emailInputRef}
         focused={activeField === "email" && !submitting}
-        width={AUTH_FIELD_WIDTH}
+        width={rowWidth}
         type="email"
         autoComplete="email"
         onMouseDown={() => setActiveField("email")}
@@ -186,7 +196,7 @@ export function AuthForm({
         onSubmit={() => submitField(activeField)}
       />
       <Box flexDirection="column">
-        <Box height={1} width={AUTH_FIELD_WIDTH} flexDirection="row" justifyContent="space-between">
+        <Box height={1} width={rowWidth} flexDirection="row" justifyContent="space-between">
           <Text
             fg={activeField === "password" ? colors.textBright : colors.textDim}
             attributes={activeField === "password" ? TextAttributes.BOLD : 0}
@@ -208,7 +218,7 @@ export function AuthForm({
           value={password}
           placeholder={mode === "signup" ? t("At least 8 characters") : t("Your password")}
           focused={activeField === "password" && !submitting}
-          width={AUTH_FIELD_WIDTH}
+          width={rowWidth}
           type={showPassword ? "text" : "password"}
           autoComplete={mode === "signup" ? "new-password" : "current-password"}
           onMouseDown={() => setActiveField("password")}
@@ -219,7 +229,7 @@ export function AuthForm({
           onSubmit={() => submitField(activeField)}
         />
       </Box>
-      <Box flexDirection="column" minHeight={2} width={AUTH_FIELD_WIDTH}>
+      <Box flexDirection="column" minHeight={2} width={rowWidth}>
         {submitting ? (
           <Spinner label={mode === "signup" ? t("Creating your account...") : t("Signing you in...")} />
         ) : resetState === "sending" ? (
@@ -237,7 +247,7 @@ export function AuthForm({
           <Text fg={colors.textMuted} wrapText>{t("We'll email you a verification link.")}</Text>
         ) : null}
       </Box>
-      <Box flexDirection="row" justifyContent="space-between" width={AUTH_FIELD_WIDTH}>
+      <Box flexDirection="row" justifyContent="space-between" width={rowWidth}>
         <Button stopPropagation
           label={switchToLogin || mode === "signup" ? t("Log in instead") : t("Sign up instead")}
           variant="ghost"
@@ -253,7 +263,7 @@ export function AuthForm({
         />
       </Box>
       {mode === "login" && (
-        <Box flexDirection="row" width={AUTH_FIELD_WIDTH}>
+        <Box flexDirection="row" width={rowWidth}>
           <Button stopPropagation
             label={t("Forgot password?")}
             variant="plain"

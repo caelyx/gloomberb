@@ -1,6 +1,6 @@
 import type { SocialMentionPost, SocialMentionsPayload } from "../../../api-client/social-mentions";
 import type { DataTableColumn } from "../../../components";
-import { formatCompact } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact } from "../../../utils/format";
 
 export interface SocialDayRow {
   day: string;
@@ -17,9 +17,9 @@ export interface SocialDayRow {
 }
 
 export const socialCount = (value: number | null | undefined) =>
-  value == null ? "--" : Math.abs(value) >= 10_000 ? formatCompact(value) : Math.round(value).toLocaleString("en-US");
-export const socialRatio = (value: number | null) => value == null ? "--" : `${value >= 10 ? value.toFixed(0) : value.toFixed(1)}x`;
-export const socialStance = (value: number | null) => value == null ? "--" : `${value > 0 ? "+" : ""}${value.toFixed(2)}`;
+  value == null ? MISSING_VALUE : Math.abs(value) >= 10_000 ? formatCompact(value) : Math.round(value).toLocaleString("en-US");
+export const socialRatio = (value: number | null) => value == null ? MISSING_VALUE : `${value >= 10 ? value.toFixed(0) : value.toFixed(1)}x`;
+export const socialStance = (value: number | null) => value == null ? MISSING_VALUE : `${value > 0 ? "+" : ""}${value.toFixed(2)}`;
 export const stanceWord = (value: number | null) => value == null ? undefined : value >= .15 ? "bullish" : value <= -.15 ? "bearish" : "mixed";
 
 export function socialDayRows(data: SocialMentionsPayload): SocialDayRow[] {
@@ -47,8 +47,8 @@ export type SocialColumn = Omit<DataTableColumn, "id"> & { id: SocialColumnId };
 export const SOCIAL_COLUMNS: SocialColumn[] = [
   { id: "day", label: "DATE", width: 12, align: "left" },
   { id: "mentions", label: "POSTS", width: 9, align: "right" },
-  { id: "ratio", label: "VS MEDIAN", width: 10, align: "right" },
-  { id: "wikiViews", label: "WIKI", width: 8, align: "right" },
+  { id: "ratio", label: "VS MEDIAN", width: 10, align: "right", omitWhenEmpty: true },
+  { id: "wikiViews", label: "WIKI", width: 8, align: "right", omitWhenEmpty: true },
   { id: "redditMentions", label: "REDDIT", width: 8, align: "right" },
   { id: "stance", label: "STANCE", width: 8, align: "right" },
   { id: "topPost", label: "TOP POST", width: 24, flexGrow: 1, align: "left" },

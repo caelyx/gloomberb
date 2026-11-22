@@ -1,12 +1,14 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createInitialState } from "../core/state/app/state";
 import { MarketDataCoordinator, setSharedMarketDataCoordinator } from "../market-data/coordinator";
 import { createTestDataProvider } from "../test-support/data-provider";
-import { createDefaultConfig, createPaneInstance } from "../types/config";
+import { createDefaultConfig, createPaneInstance, type TelemetryConfig } from "../types/config";
 import { removePane, removeUnavailablePaneTypes, restoreHiddenPanes } from "../layout/pane-manager";
 import type { PricePoint } from "../types/financials";
 import type { TickerPosition, TickerRecord } from "../types/ticker";
 import { mergeSuffixedListings } from "../portfolio/suffixed-listings";
+import { clearPortfolioCash, setPortfolioCash } from "../portfolio/mutations";
+import { portfolioCashBalances } from "../portfolio/cash-balances";
 import {
   __syncContributorInternalsForTests,
   coreCollectionsSyncContributor,
@@ -16,6 +18,9 @@ import { setSyncedProfileAnalytics } from "./profile-analytics";
 import { captureConfigSaves } from "../test-support/config-store";
 import { createTestTicker } from "../test-support/ticker";
 import { createTestFinancials } from "../test-support/data-provider";
+import { runTickerWrite } from "../data/ticker-writes";
+import { flushPendingPersistence } from "../state/persist-scheduler";
+import * as configStore from "../data/config/store";
 
 describe("core sync contributors", () => {
   const configSaves = captureConfigSaves();
@@ -117,6 +122,46 @@ describe("core sync contributors", () => {
       portfolio: { metric: "beta", shared: "canonical" },
       application: { section: "shortcuts" },
     });
+  });
+
+  // Attention Counts off is the account's: one device turning it off has to
+  // stop the others counting, and a device's own stale on must not undo it.
+  test("an Attention Counts off reaches the account's other devices; only a later explicit on clears it", async () => {
+    const merge = __syncContributorInternalsForTests.mergeConfigPayload;
+    const device = (telemetry?: TelemetryConfig) => ({
+      ...createDefaultConfig("/tmp/gloomberb-sync-attention-test"),
+      ...(telemetry ? { telemetry } : {}),
+    });
+    const payloadOf = async (config: ReturnType<typeof device>) => (
+      await coreConfigSyncContributor.collect({ state: createInitialState(config) })
+    ) as Record<string, unknown>;
+    const off = await payloadOf(device({ attention: false }));
+    const on = await payloadOf(device({ attention: true }));
+    // What a build from before the field pushed.
+    const { attentionOff: _, ...older } = on;
+
+    expect(off.attentionOff).toBe(true);
+    // First sync after updating, whether on by default or from an earlier opt-in: the off wins.
+    for (const telemetry of [undefined, { attention: true }, { attentionNoticeShownTo: ["me"] }]) {
+      const local = device(telemetry);
+      expect(merge(local, off, local, older)?.telemetry?.attention).toBe(false);
+    }
+    // An off made here since the last sync, or before this device ever synced (signed out), is pushed, not overwritten.
+    const turnedOff = device({ attention: false });
+    expect(merge(turnedOff, on, turnedOff, on)?.telemetry?.attention).toBe(false);
+    expect(merge(turnedOff, on, turnedOff)?.telemetry?.attention).toBe(false);
+    const neverSynced = device();
+    expect(merge(neverSynced, off, neverSynced)?.telemetry?.attention).toBe(false);
+    // Turned back on here after the off arrived: this device's newer choice stands.
+    const turnedOn = device({ attention: true });
+    expect(merge(turnedOn, off, turnedOn, off)?.telemetry?.attention).toBe(true);
+    // Turned back on elsewhere: a device whose off came from the account follows.
+    const synced = device({ attention: false });
+    expect(merge(synced, on, synced, off)?.telemetry?.attention).toBe(true);
+    // A copy from an older build says nothing either way.
+    expect(merge(synced, older, synced, off)?.telemetry?.attention).toBe(false);
+    const fresh = device();
+    expect(merge(fresh, older, fresh, older)?.telemetry).toBeUndefined();
   });
 
   // Two signed-in clients used to hand each other their view on every poll:
@@ -315,6 +360,20 @@ describe("core sync contributors", () => {
     expect(on.layout.floating).toEqual(local.layout.floating);
   });
 
+  test("the tab a stack shows is this device's, as stacking order is: switching tabs is no workspace edit", () => {
+    const pane = (instanceId: string) => ({ kind: "pane" as const, instanceId });
+    const stack = (active: string) => ({ kind: "split" as const, axis: "horizontal" as const, ratio: 0.5, first: pane("a"), second: pane("b"), tabs: { active } });
+    const payload = (dockRoot: unknown) => {
+      const layout = { dockRoot, instances: [], floating: [], detached: [] };
+      return { layout, layouts: [{ name: "Main", layout }], activeLayoutIndex: 0 };
+    };
+    const { layoutIntent } = __syncContributorInternalsForTests;
+    expect(layoutIntent(payload(stack("b")))).toBe(layoutIntent(payload(stack("a"))));
+    // Unstacking the two is an edit.
+    const { tabs: _tabs, ...split } = stack("a");
+    expect(layoutIntent(payload(split))).not.toBe(layoutIntent(payload(stack("a"))));
+  });
+
   test("preserves local broker identity when applying sanitized portfolios", () => {
     const config = createDefaultConfig("/tmp/gloomberb-sync-broker-identity-test");
     config.portfolios = [{
@@ -366,6 +425,113 @@ describe("core sync contributors", () => {
     const merged = __syncContributorInternalsForTests.mergeConfigPayload(config, pushed);
 
     expect(merged?.portfolios).toEqual(elsewhere.portfolios);
+  });
+
+  test("a watchlist's groups reach the account's other devices whatever they are named, and a list without them pushes as before", async () => {
+    const elsewhere = createDefaultConfig("/tmp/gloomberb-sync-groups-elsewhere");
+    // Names and symbols that read like secrets: keyed by them, the push would drop them.
+    elsewhere.watchlists = [
+      { id: "growth", name: "Growth", groups: [{ name: "Private equity", symbols: ["PATH", "KKR"] }, { name: "Session", symbols: ["SPY"] }] },
+      { id: "plain", name: "Plain" },
+    ];
+    const pushed = await coreConfigSyncContributor.collect({ state: createInitialState(elsewhere) }) as { watchlists: Array<Record<string, unknown>> };
+    expect(Object.keys(pushed.watchlists[1]!)).toEqual(["id", "name"]);
+
+    const config = createDefaultConfig("/tmp/gloomberb-sync-groups-here");
+    config.watchlists = [{ id: "growth", name: "Growth" }, { id: "plain", name: "Plain" }];
+    const merged = __syncContributorInternalsForTests.mergeConfigPayload(config, pushed);
+
+    expect(merged?.watchlists).toEqual(elsewhere.watchlists);
+  });
+
+  test("a pull from a build that sends no groups keeps the groups here, which go back out marked; one that sends them can remove them", async () => {
+    const { collectCoreConfigPayload, collectCoreCollectionsPayload, mergeConfigPayload } = __syncContributorInternalsForTests;
+    const groups = [{ name: "Energy", symbols: ["XOM", "CVX"] }];
+    const config = createDefaultConfig("/tmp/gloomberb-sync-groups-older");
+    config.watchlists = [{ id: "growth", name: "Growth", groups }, { id: "plain", name: "Plain" }];
+    const lastSynced = collectCoreConfigPayload(config);
+
+    // An older build's push: its lists carry no groups and the payload no marker. It renamed one.
+    const older = { ...lastSynced as Record<string, unknown>, watchlists: [{ id: "growth", name: "Growth stocks" }, { id: "plain", name: "Plain" }] };
+    delete older.watchlistsCarryGroups;
+    const kept = mergeConfigPayload(config, older, config, lastSynced);
+    expect(kept?.watchlists).toEqual([{ id: "growth", name: "Growth stocks", groups }, { id: "plain", name: "Plain" }]);
+    const pushedBack = collectCoreConfigPayload(kept!) as Record<string, unknown>;
+    expect(pushedBack).toMatchObject({ watchlistsCarryGroups: true, watchlists: [{ id: "growth", name: "Growth stocks", groups }, { id: "plain", name: "Plain" }] });
+    expect(collectCoreCollectionsPayload(kept!, new Map(), new Map(), new Map(), {})).toMatchObject({ watchlistsCarryGroups: true, watchlists: pushedBack.watchlists });
+
+    // A build that sends groups and sends none: the list's last group was removed there.
+    const removed = mergeConfigPayload(config, { ...older, watchlistsCarryGroups: true }, config, lastSynced);
+    expect(removed?.watchlists).toEqual([{ id: "growth", name: "Growth stocks" }, { id: "plain", name: "Plain" }]);
+  });
+
+  test("cash in several currencies reaches the account's other devices, and a balance cleared on one is cleared on the others", async () => {
+    const { collectCoreConfigPayload, collectCoreCollectionsPayload, mergeConfigPayload } = __syncContributorInternalsForTests;
+    let elsewhere = createDefaultConfig("/tmp/gloomberb-sync-other-cash-elsewhere");
+    elsewhere.portfolios = [{ id: "hk", name: "HK Book", currency: "USD" }];
+    elsewhere = setPortfolioCash(elsewhere, "hk", { amount: 390_000, currency: "HKD" }).config;
+    elsewhere = setPortfolioCash(elsewhere, "hk", { amount: 1_200, currency: "USD" }).config;
+    const pushed = collectCoreConfigPayload(elsewhere) as Record<string, unknown>;
+    // The first balance stays where a build before several currencies reads it, and only there.
+    expect(pushed).toMatchObject({
+      portfoliosCarryOtherCash: true,
+      portfolios: [{ id: "hk", cash: { amount: 390_000, currency: "HKD" }, otherCash: [{ amount: 1_200, currency: "USD" }] }],
+    });
+    expect(collectCoreCollectionsPayload(elsewhere, new Map(), new Map(), new Map(), {}))
+      .toMatchObject({ portfoliosCarryOtherCash: true, portfolios: pushed.portfolios });
+
+    // A device holding the book from before, in one currency, takes both.
+    const config = createDefaultConfig("/tmp/gloomberb-sync-other-cash-here");
+    config.portfolios = [{ id: "hk", name: "HK Book", currency: "USD", cash: { amount: 390_000, currency: "HKD" } }];
+    const merged = mergeConfigPayload(config, pushed, config, collectCoreConfigPayload(config))!;
+    expect(merged.portfolios).toEqual(elsewhere.portfolios);
+    expect(portfolioCashBalances(merged.portfolios[0])).toEqual([{ amount: 390_000, currency: "HKD" }, { amount: 1_200, currency: "USD" }]);
+
+    // Cleared there, one currency and then the rest: the pull clears them here, and nothing brings them back.
+    const lastSynced = collectCoreConfigPayload(merged);
+    const oneCleared = clearPortfolioCash(elsewhere, "hk", "USD").config;
+    const afterOne = mergeConfigPayload(merged, collectCoreConfigPayload(oneCleared), merged, lastSynced)!;
+    expect(afterOne.portfolios[0]).toEqual({ id: "hk", name: "HK Book", currency: "USD", cash: { amount: 390_000, currency: "HKD" } });
+    const allCleared = clearPortfolioCash(elsewhere, "hk").config;
+    const afterAll = mergeConfigPayload(merged, collectCoreConfigPayload(allCleared), merged, lastSynced)!;
+    expect(afterAll.portfolios[0]).toEqual({ id: "hk", name: "HK Book", currency: "USD" });
+  });
+
+  test("a pull from a build that sends no other currencies keeps them here, and a balance it set in one of them counts once", async () => {
+    const { collectCoreConfigPayload, mergeConfigPayload } = __syncContributorInternalsForTests;
+    const config = createDefaultConfig("/tmp/gloomberb-sync-other-cash-older");
+    config.portfolios = [{
+      id: "hk", name: "HK Book", currency: "USD",
+      cash: { amount: 390_000, currency: "HKD" },
+      otherCash: [{ amount: 1_200, currency: "USD" }, { amount: 250_000, currency: "TRY" }],
+    }];
+    const lastSynced = collectCoreConfigPayload(config) as Record<string, unknown>;
+    // What an older build pushes: its portfolios carry `cash` alone, and the payload no marker.
+    const olderPush = (portfolio: Record<string, unknown>) => {
+      const payload: Record<string, unknown> = { ...lastSynced, portfolios: [portfolio] };
+      delete payload.portfoliosCarryOtherCash;
+      return payload;
+    };
+    const base = { id: "hk", name: "HK Book", currency: "USD" };
+
+    // It renamed the book: the HKD it saw and the two balances it never did all stay, and go back out marked.
+    const renamed = mergeConfigPayload(config, olderPush({ ...base, name: "Hong Kong", cash: { amount: 390_000, currency: "HKD" } }), config, lastSynced)!;
+    expect(portfolioCashBalances(renamed.portfolios[0]).map((balance) => balance.currency)).toEqual(["HKD", "USD", "TRY"]);
+    expect(collectCoreConfigPayload(renamed)).toMatchObject({ portfoliosCarryOtherCash: true, portfolios: [{ name: "Hong Kong", otherCash: config.portfolios[0]!.otherCash }] });
+
+    // It set its one balance to $5,000, replacing the HKD as that build does: USD is $5,000 once, not $5,000 and $1,200.
+    const replaced = mergeConfigPayload(config, olderPush({ ...base, cash: { amount: 5_000, currency: "USD" } }), config, lastSynced)!;
+    expect(portfolioCashBalances(replaced.portfolios[0])).toEqual([{ amount: 5_000, currency: "USD" }, { amount: 250_000, currency: "TRY" }]);
+    expect(replaced.portfolios[0]).toMatchObject({ cash: { amount: 5_000, currency: "USD" }, otherCash: [{ amount: 250_000, currency: "TRY" }] });
+
+    // It cleared the cash it saw: the HKD goes, and the first balance left takes its place.
+    const cleared = mergeConfigPayload(config, olderPush(base), config, lastSynced)!;
+    expect(cleared.portfolios[0]).toEqual({ ...base, cash: { amount: 1_200, currency: "USD" }, otherCash: [{ amount: 250_000, currency: "TRY" }] });
+
+    // A portfolio saved before several currencies needs no migration: it reads its one balance as before.
+    const fresh = createDefaultConfig("/tmp/gloomberb-sync-other-cash-fresh");
+    const legacy = olderPush({ ...base, cash: { amount: 390_000, currency: "HKD" } });
+    expect(mergeConfigPayload(fresh, legacy)!.portfolios).toEqual([{ ...base, cash: { amount: 390_000, currency: "HKD" } }]);
   });
 
   test("does not reintroduce older unlinked broker portfolios from cloud", () => {
@@ -420,6 +586,56 @@ describe("core sync contributors", () => {
         lastSyncedAt: 300,
       },
     ]);
+  });
+
+  describe("two devices linking different accounts at one broker", () => {
+    const here = { id: "ibkr-here", brokerType: "ibkr", label: "IBKR here", config: {} };
+    const elsewhere = { id: "ibkr-elsewhere", brokerType: "ibkr", label: "IBKR elsewhere", config: {} };
+    const ownAccount = { id: "broker:ibkr-here:U1", name: "U1", currency: "USD", brokerId: "ibkr", brokerInstanceId: "ibkr-here", brokerAccountId: "U1" };
+    const otherAccount = { id: "broker:ibkr-elsewhere:U2", name: "U2", currency: "USD", brokerId: "ibkr", lastSyncedAt: 100 };
+    const ids = (portfolios: Array<{ id: string }> | undefined) => portfolios?.map((portfolio) => portfolio.id);
+
+    test("an account linked only on the other device stays through a newer sync here, and goes out again with the next push", async () => {
+      const config = createDefaultConfig("/tmp/gloomberb-sync-same-broker-test");
+      config.brokerInstances = [{ ...here, config: { token: "secret" } }, elsewhere];
+      config.portfolios = [...config.portfolios, { ...ownAccount, lastSyncedAt: 200 }];
+      const pulled = {
+        portfolios: [
+          { id: "main", name: "Main Portfolio", currency: "USD" },
+          otherAccount,
+          // What a sync here outdates: an account its own connection stopped
+          // reporting, and one of a profile no longer here (removed or relinked).
+          { id: "broker:ibkr-here:U9", name: "U9", currency: "USD", brokerId: "ibkr", lastSyncedAt: 100 },
+          { id: "broker:ibkr-old:U7", name: "U7", currency: "USD", brokerId: "ibkr", lastSyncedAt: 100 },
+        ],
+      };
+
+      const merged = __syncContributorInternalsForTests.mergeConfigPayload(config, pulled);
+      expect(ids(merged?.portfolios)).toEqual(["main", otherAccount.id, ownAccount.id]);
+
+      // This device syncs its own account again and pushes: the other account goes with it.
+      const synced = { ...merged!, portfolios: merged!.portfolios.map((portfolio) => portfolio.id === ownAccount.id ? { ...portfolio, lastSyncedAt: 300 } : portfolio) };
+      const pushed = await coreConfigSyncContributor.collect({ state: createInitialState(synced) }) as { portfolios: Array<{ id: string }> };
+      expect(ids(pushed.portfolios)).toEqual(["main", otherAccount.id, ownAccount.id]);
+      expect(ids(__syncContributorInternalsForTests.mergeConfigPayload(synced, pushed)?.portfolios)).toEqual(["main", otherAccount.id, ownAccount.id]);
+    });
+
+    test("a device keeps its own account when a pull without it carries a newer sync of another account at that broker", () => {
+      const config = createDefaultConfig("/tmp/gloomberb-sync-same-broker-test");
+      config.brokerInstances = [here, { ...elsewhere, config: { token: "secret" } }];
+      const linked = { ...otherAccount, brokerInstanceId: "ibkr-elsewhere", brokerAccountId: "U2" };
+      config.portfolios = [...config.portfolios, linked];
+      // As a build that dropped the other device's account pushes it.
+      const pulled = {
+        portfolios: [
+          { id: "main", name: "Main Portfolio", currency: "USD" },
+          { id: ownAccount.id, name: "U1", currency: "USD", brokerId: "ibkr", lastSyncedAt: 200 },
+        ],
+      };
+
+      const merged = __syncContributorInternalsForTests.mergeConfigPayload(config, pulled);
+      expect(merged?.portfolios).toEqual([...pulled.portfolios, linked]);
+    });
   });
 
   test("merges broker profiles one by one once this device changed its own, so a removal on either side wins", () => {
@@ -549,10 +765,30 @@ describe("core sync contributors", () => {
     function deviceStore(state: AppState) {
       const store = {
         current: state,
-        disk: new Map<string, TickerRecord>(),
+        disk: new Map(state.tickers),
         saved: [] as string[],
-        /** Runs while the pull writes its first row, as an edit landing then would. */
-        duringFirstSave: undefined as (() => void) | undefined,
+        deleted: [] as string[],
+        beforeWrite: undefined as ((kind: "save" | "delete", symbol: string, record?: TickerRecord) => void | Promise<void>) | undefined,
+        /** Runs while the pull persists its first row, as an edit landing then would. */
+        duringFirstWrite: undefined as (() => void) | undefined,
+        repository: {
+          saveTicker: (record: TickerRecord): Promise<void> => runTickerWrite(store.repository, record.metadata.ticker, async () => {
+            if (store.beforeWrite) await store.beforeWrite("save", record.metadata.ticker, record);
+            store.saved.push(record.metadata.ticker);
+            store.disk.set(record.metadata.ticker, record);
+            const edit = store.duringFirstWrite;
+            store.duringFirstWrite = undefined;
+            edit?.();
+          }),
+          deleteTicker: (symbol: string): Promise<void> => runTickerWrite(store.repository, symbol, async () => {
+            if (store.beforeWrite) await store.beforeWrite("delete", symbol);
+            store.deleted.push(symbol);
+            store.disk.delete(symbol);
+            const edit = store.duringFirstWrite;
+            store.duringFirstWrite = undefined;
+            edit?.();
+          }),
+        },
         context: (baselinePayload: unknown, snapshot?: unknown) => ({
           snapshot,
           baselinePayload,
@@ -564,15 +800,7 @@ describe("core sync contributors", () => {
             if (action.type === "SET_CONFIG") store.current = { ...store.current, config: action.config! };
             if (action.type === "SET_TICKERS") store.current = { ...store.current, tickers: action.tickers! };
           },
-          tickerRepository: {
-            saveTicker: async (record: TickerRecord) => {
-              store.saved.push(record.metadata.ticker);
-              store.disk.set(record.metadata.ticker, record);
-              const edit = store.duringFirstSave;
-              store.duringFirstSave = undefined;
-              edit?.();
-            },
-          },
+          tickerRepository: store.repository,
         }) as unknown as ApplyContext,
       };
       return store;
@@ -583,6 +811,261 @@ describe("core sync contributors", () => {
       await coreCollectionsSyncContributor.apply?.(pulled, store.context(baselinePayload));
       return { state: store.current, saved: store.saved };
     }
+
+    test.each(["save", "delete"])("profile cleanup keeps edits made during its first %s", async (firstWrite) => {
+      const config = deviceConfig(200);
+      const state = createInitialState(config);
+      state.tickers = new Map(["AAA", "BBB", "CCC", "DDD"].map((symbol) => [symbol, createTestTicker(symbol, symbol, {
+        portfolios: [signedInId],
+        positions: [signedInPosition(3)],
+        watchlists: symbol === "BBB" || (symbol === "AAA" && firstWrite === "save") ? ["watchlist"] : [],
+      })]));
+      const baseline = await coreConfigSyncContributor.collect({ state });
+      const pulled = await coreConfigSyncContributor.collect({ state: createInitialState({
+        ...config,
+        brokerInstances: [demo],
+        portfolios: config.portfolios.filter((portfolio) => portfolio.id !== signedInId),
+      }) });
+      const store = deviceStore(state);
+      const edited = createTestTicker("BBB", "Edited", { portfolios: ["main"], positions: [mainPosition] });
+      const recreated = createTestTicker("CCC", "Recreated", { watchlists: ["watchlist"] });
+      const added = createTestTicker("NEW", "Added", { watchlists: ["watchlist"] });
+      store.duringFirstWrite = () => {
+        const tickers = new Map(store.current.tickers);
+        for (const ticker of [edited, recreated, added]) {
+          tickers.set(ticker.metadata.ticker, ticker);
+          store.disk.set(ticker.metadata.ticker, ticker);
+        }
+        store.current = { ...store.current, tickers };
+      };
+
+      await coreConfigSyncContributor.apply?.(pulled, store.context(baseline));
+
+      for (const ticker of [edited, recreated, added]) {
+        expect(store.current.tickers.get(ticker.metadata.ticker)).toBe(ticker);
+        expect(store.disk.get(ticker.metadata.ticker)).toBe(ticker);
+      }
+      expect(store.current.tickers.has("DDD")).toBe(false);
+      expect(store.disk.has("DDD")).toBe(false);
+      expect(store.current.config.brokerInstances).toEqual([demo]);
+    });
+
+    test("profile cleanup waits for a manual position save before reading its row", async () => {
+      const config = deviceConfig(200);
+      const state = createInitialState(config);
+      const original = createTestTicker("AAA", "AAA", {
+        portfolios: [signedInId], positions: [signedInPosition(3)],
+      });
+      state.tickers = new Map([["AAA", original]]);
+      const baseline = await coreConfigSyncContributor.collect({ state });
+      const pulled = await coreConfigSyncContributor.collect({ state: createInitialState({
+        ...config, brokerInstances: [demo], portfolios: config.portfolios.filter((portfolio) => portfolio.id !== signedInId),
+      }) });
+      const store = deviceStore(state);
+      const edited = { ...original, metadata: { ...original.metadata,
+        portfolios: [signedInId, "main"], positions: [signedInPosition(3), mainPosition],
+      } };
+      const started = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      store.beforeWrite = async (_kind, _symbol, record) => {
+        if (record !== edited) return;
+        started.resolve();
+        await release.promise;
+      };
+      // Position entry persists first and publishes the edited row only after acknowledgement.
+      const editing = (async () => {
+        await store.repository.saveTicker(edited);
+        store.current = { ...store.current, tickers: new Map(store.current.tickers).set("AAA", edited) };
+      })();
+      await started.promise;
+      const cleanup = coreConfigSyncContributor.apply!(pulled, store.context(baseline));
+      const profilesBeforeAcknowledgement = store.current.config.brokerInstances;
+      release.resolve();
+      await Promise.all([editing, cleanup]);
+
+      expect(profilesBeforeAcknowledgement).toEqual([signedIn, demo]);
+      expect(store.current.config.brokerInstances).toEqual([demo]);
+      expect(store.current.tickers.get("AAA")?.metadata).toMatchObject({ portfolios: ["main"], positions: [mainPosition] });
+      expect(store.disk.get("AAA")?.metadata).toEqual(store.current.tickers.get("AAA")!.metadata);
+    });
+
+    test.each(["AAA", "NEW"])("profile cleanup rescans a saved %s row that arrives during its acknowledgement", async (symbol) => {
+      const config = deviceConfig(200);
+      const state = createInitialState(config);
+      state.tickers = new Map([["AAA", createTestTicker("AAA", "AAA", {
+        portfolios: [signedInId], positions: [signedInPosition(3)], watchlists: ["watchlist"],
+      })]]);
+      const baseline = await coreConfigSyncContributor.collect({ state });
+      const pulled = await coreConfigSyncContributor.collect({ state: createInitialState({
+        ...config, brokerInstances: [demo], portfolios: config.portfolios.filter((portfolio) => portfolio.id !== signedInId),
+      }) });
+      const store = deviceStore(state);
+      const started = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let paused = false;
+      store.beforeWrite = async () => {
+        if (paused) return;
+        paused = true;
+        started.resolve();
+        await release.promise;
+      };
+      const cleanup = coreConfigSyncContributor.apply!(pulled, store.context(baseline));
+      await started.promise;
+      const edited = createTestTicker(symbol, symbol, {
+        portfolios: [signedInId, "main"], positions: [signedInPosition(3), mainPosition], watchlists: ["watchlist"],
+      });
+      const editing = (async () => {
+        await store.repository.saveTicker(edited);
+        store.current = { ...store.current, tickers: new Map(store.current.tickers).set(symbol, edited) };
+      })();
+      release.resolve();
+      await Promise.all([editing, cleanup]);
+
+      expect(store.current.config.brokerInstances).toEqual([demo]);
+      expect(store.current.tickers.get(symbol)?.metadata).toMatchObject({ portfolios: ["main"], positions: [mainPosition] });
+      for (const [tickerSymbol, ticker] of store.current.tickers) {
+        expect(ticker.metadata.positions.some((position) => position.brokerInstanceId === signedIn.id)).toBe(false);
+        expect(store.disk.get(tickerSymbol)?.metadata).toEqual(ticker.metadata);
+      }
+    });
+
+    test.each(["save", "delete"])("profile cleanup retries a failed %s before committing the profile removal", async (failedWrite) => {
+      const config = deviceConfig(200);
+      const state = createInitialState(config);
+      state.tickers = new Map(["AAA", "BBB"].map((symbol) => [symbol, createTestTicker(symbol, symbol, {
+        portfolios: [signedInId], positions: [signedInPosition(3)],
+        watchlists: symbol === "AAA" || failedWrite === "save" ? ["watchlist"] : [],
+      })]));
+      const originalB = state.tickers.get("BBB")!;
+      const baseline = await coreConfigSyncContributor.collect({ state });
+      const pulled = await coreConfigSyncContributor.collect({ state: createInitialState({
+        ...config, brokerInstances: [demo], portfolios: config.portfolios.filter((portfolio) => portfolio.id !== signedInId),
+      }) });
+      const store = deviceStore(state);
+      let failed = false;
+      store.beforeWrite = (kind, symbol) => {
+        if (failed || kind !== failedWrite || symbol !== "BBB") return;
+        failed = true;
+        throw new Error("Ticker write unavailable");
+      };
+
+      await expect(coreConfigSyncContributor.apply!(pulled, store.context(baseline))).rejects.toThrow("Ticker write unavailable");
+      await flushPendingPersistence();
+      expect(store.current.config.brokerInstances).toEqual([signedIn, demo]);
+      expect(store.current.config.portfolios).toContainEqual(config.portfolios.find((portfolio) => portfolio.id === signedInId)!);
+      expect(store.current.tickers.get("BBB")).toBe(originalB);
+      expect(store.disk.get("BBB")).toBe(originalB);
+      expect(configSaves.every((saved) => saved.brokerInstances.some((instance) => instance.id === signedIn.id))).toBe(true);
+
+      // A failed pull has not advanced the baseline; retry the same removal against its live state.
+      await coreConfigSyncContributor.apply!(pulled, store.context(baseline));
+      await flushPendingPersistence();
+      const reloaded = createInitialState(JSON.parse(JSON.stringify(configSaves.at(-1)!)));
+      reloaded.tickers = new Map([...store.disk].map(([symbol, ticker]) => [symbol, JSON.parse(JSON.stringify(ticker)) as TickerRecord]));
+      expect(reloaded.config.brokerInstances).toEqual([demo]);
+      expect(reloaded.config.portfolios.some((portfolio) => portfolio.id === signedInId)).toBe(false);
+      expect(reloaded.tickers.get("AAA")?.metadata).toMatchObject({ portfolios: [], positions: [], watchlists: ["watchlist"] });
+      if (failedWrite === "save") expect(reloaded.tickers.get("BBB")?.metadata).toMatchObject({ portfolios: [], positions: [], watchlists: ["watchlist"] });
+      else expect(reloaded.tickers.has("BBB")).toBe(false);
+      expect([...reloaded.tickers]).toEqual(JSON.parse(JSON.stringify([...store.current.tickers])));
+    });
+
+    test.each(["AAA", "NEW"])("profile cleanup retries a late %s row after its config acknowledgement", async (symbol) => {
+      const config = deviceConfig(200);
+      const state = createInitialState(config);
+      state.tickers = new Map([["AAA", createTestTicker("AAA", "AAA", {
+        portfolios: [signedInId], positions: [signedInPosition(3)], watchlists: ["watchlist"],
+      })]]);
+      const baseline = await coreConfigSyncContributor.collect({ state });
+      const pulled = await coreConfigSyncContributor.collect({ state: createInitialState({
+        ...config, brokerInstances: [demo], portfolios: config.portfolios.filter((portfolio) => portfolio.id !== signedInId),
+      }) });
+      const store = deviceStore(state);
+      const configStarted = Promise.withResolvers<void>();
+      const releaseConfig = Promise.withResolvers<void>();
+      spyOn(configStore, "saveConfig").mockImplementationOnce(async (saved) => {
+        configSaves.push(saved);
+        configStarted.resolve();
+        await releaseConfig.promise;
+      });
+      const cleanup = coreConfigSyncContributor.apply!(pulled, store.context(baseline));
+      await configStarted.promise;
+      const edited = createTestTicker(symbol, symbol, {
+        portfolios: [signedInId, "main"], positions: [signedInPosition(3), mainPosition], watchlists: ["watchlist"],
+      });
+      await store.repository.saveTicker(edited);
+      store.current = { ...store.current, tickers: new Map(store.current.tickers).set(symbol, edited) };
+      let failed = false;
+      store.beforeWrite = (kind, writtenSymbol) => {
+        if (failed || kind !== "save" || writtenSymbol !== symbol) return;
+        failed = true;
+        throw new Error("Late cleanup write unavailable");
+      };
+      releaseConfig.resolve();
+
+      const error = await cleanup.then(() => null, (error: unknown) => error);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe("Late cleanup write unavailable");
+      expect(store.current.config.brokerInstances).toEqual([signedIn, demo]);
+      expect(store.current.tickers.get(symbol)).toBe(edited);
+      expect(store.disk.get(symbol)).toBe(edited);
+
+      await flushPendingPersistence();
+      expect(configSaves.at(-1)?.brokerInstances).toEqual([signedIn, demo]);
+      store.current = createInitialState(JSON.parse(JSON.stringify(configSaves.at(-1)!)));
+      store.current.tickers = new Map([...store.disk].map(([tickerSymbol, ticker]) => [tickerSymbol, JSON.parse(JSON.stringify(ticker)) as TickerRecord]));
+
+      await coreConfigSyncContributor.apply!(pulled, store.context(baseline));
+      await flushPendingPersistence();
+      const reloaded = createInitialState(JSON.parse(JSON.stringify(configSaves.at(-1)!)));
+      reloaded.tickers = new Map([...store.disk].map(([tickerSymbol, ticker]) => [tickerSymbol, JSON.parse(JSON.stringify(ticker)) as TickerRecord]));
+      expect(reloaded.config.brokerInstances).toEqual([demo]);
+      expect(reloaded.config.portfolios.some((portfolio) => portfolio.id === signedInId)).toBe(false);
+      expect(reloaded.tickers.get(symbol)?.metadata).toMatchObject({ portfolios: ["main"], positions: [mainPosition] });
+      expect([...reloaded.tickers]).toEqual(JSON.parse(JSON.stringify([...store.current.tickers])));
+    });
+
+    test.each([true, false])("profile cleanup keeps config additions made during its write (profile merge marker %s)", async (mergedById) => {
+      const config = deviceConfig(200);
+      const state = createInitialState(config);
+      state.tickers = new Map([["AAA", createTestTicker("AAA", "AAA", {
+        portfolios: [signedInId], positions: [signedInPosition(3)], watchlists: ["watchlist"],
+      })]]);
+      const baseline = await coreConfigSyncContributor.collect({ state });
+      const payload = await coreConfigSyncContributor.collect({ state: createInitialState({
+        ...config, brokerInstances: [demo], portfolios: config.portfolios.filter((portfolio) => portfolio.id !== signedInId),
+      }) }) as Record<string, unknown>;
+      const { brokerInstancesMergedById: _mergeMarker, ...legacyPayload } = payload;
+      const store = deviceStore(state);
+      const started = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let paused = false;
+      store.beforeWrite = async () => {
+        if (paused) return;
+        paused = true;
+        started.resolve();
+        await release.promise;
+      };
+      const cleanup = coreConfigSyncContributor.apply!(mergedById ? payload : legacyPayload, store.context(baseline));
+      await started.promise;
+      const addedProfile = { id: "new-demo", brokerType: "demo", label: "New account", config: {} };
+      const addedWatchlist = { id: "new-list", name: "New list" };
+      store.current = { ...store.current, config: { ...store.current.config,
+        brokerInstances: [...store.current.config.brokerInstances, addedProfile],
+        watchlists: [...store.current.config.watchlists, addedWatchlist],
+        pluginConfig: { ...store.current.config.pluginConfig, example: { display: "compact" } },
+      } };
+      release.resolve();
+      await cleanup;
+      await flushPendingPersistence();
+
+      expect(store.current.config.brokerInstances).toEqual([demo, addedProfile]);
+      expect(store.current.config.portfolios.some((portfolio) => portfolio.id === signedInId)).toBe(false);
+      expect(store.current.config.watchlists).toContainEqual(addedWatchlist);
+      expect(store.current.config.pluginConfig.example).toEqual({ display: "compact" });
+      expect(configSaves.at(-1)).toEqual(store.current.config);
+      expect(store.disk.get("AAA")?.metadata).toEqual(store.current.tickers.get("AAA")!.metadata);
+    });
 
     // The device that holds the signed-in account pulls what a device that was
     // away pushed: its own old copies of these rows, before sign-in, with the
@@ -654,6 +1137,75 @@ describe("core sync contributors", () => {
       expect(after.tickers.get("CCC")?.metadata).toMatchObject({ portfolios: [], positions: [], watchlists: ["watchlist"] });
     });
 
+    test("a newer broker sync preserves hand-entered lots in pulled and omitted rows", async () => {
+      const state = createInitialState(deviceConfig(200));
+      const manual = { ...mainPosition, portfolio: signedInId };
+      state.tickers = new Map(["AAA", "BBB"].map((symbol) => [symbol, createTestTicker(symbol, symbol, {
+        portfolios: [signedInId], positions: symbol === "BBB" ? [signedInPosition(3), manual] : [signedInPosition(3)],
+      })]));
+      const pushed = await coreCollectionsSyncContributor.collect({ state });
+      const aaa = state.tickers.get("AAA")!;
+      state.tickers.set("AAA", { ...aaa, metadata: { ...aaa.metadata, positions: [...aaa.metadata.positions, manual] } });
+      const elsewhere = createInitialState(deviceConfig(300));
+      elsewhere.tickers = new Map([["AAA", createTestTicker("AAA", "AAA", {
+        portfolios: [signedInId], positions: [signedInPosition(8)],
+      })]]);
+      const pulled = await coreCollectionsSyncContributor.collect({ state: elsewhere });
+
+      const { state: after } = await pull(state, pulled, pushed);
+
+      expect(after.tickers.get("AAA")?.metadata).toMatchObject({ portfolios: [signedInId], positions: [signedInPosition(8), manual] });
+      expect(after.tickers.get("BBB")?.metadata).toMatchObject({ portfolios: [signedInId], positions: [manual] });
+    });
+
+    test("a first pull keeps manual lots from both devices without counting a shared lot twice", async () => {
+      const manual = { ...mainPosition, portfolio: signedInId };
+      const state = createInitialState(deviceConfig(200));
+      state.tickers = new Map([["AAA", createTestTicker("AAA", "AAA", {
+        portfolios: [signedInId], positions: [signedInPosition(3), manual, manual],
+      })]]);
+      const elsewhere = createInitialState(deviceConfig(300));
+      elsewhere.tickers = new Map([["AAA", createTestTicker("AAA", "AAA", {
+        portfolios: [signedInId], positions: [signedInPosition(8), manual, { ...manual, shares: 6 }],
+      })]]);
+      const pulled = await coreCollectionsSyncContributor.collect({ state: elsewhere });
+
+      const { state: after } = await pull(state, pulled, null);
+
+      expect(after.tickers.get("AAA")?.metadata.positions).toMatchObject([
+        signedInPosition(8), manual, manual, { ...manual, shares: 6 },
+      ]);
+    });
+
+    test.each([100, 300])("hand-entered lots merge independently of a broker sync at %d", async (remoteSyncedAt) => {
+      const manual = { ...mainPosition, portfolio: signedInId };
+      const state = createInitialState(deviceConfig(200));
+      const symbols = ["UNCHANGED", "EDITED", "DELETED"];
+      state.tickers = new Map(symbols.map((symbol) => [symbol, createTestTicker(symbol, symbol, {
+        portfolios: [signedInId], positions: [signedInPosition(3), manual],
+      })]));
+      const pushed = await coreCollectionsSyncContributor.collect({ state });
+      state.tickers = new Map([...state.tickers].map(([symbol, ticker]) => [symbol, {
+        ...ticker, metadata: { ...ticker.metadata, positions: [signedInPosition(3),
+          ...(symbol === "DELETED" ? [] : [{ ...manual, shares: symbol === "EDITED" ? 9 : manual.shares }]),
+        ] },
+      }]));
+      const elsewhere = createInitialState(deviceConfig(remoteSyncedAt));
+      elsewhere.tickers = new Map(symbols.map((symbol) => [symbol, createTestTicker(symbol, symbol, {
+        portfolios: [signedInId], positions: [signedInPosition(8), { ...manual, shares: 6 }],
+      })]));
+      const pulled = await coreCollectionsSyncContributor.collect({ state: elsewhere });
+
+      const { state: after } = await pull(state, pulled, pushed);
+
+      for (const symbol of symbols) {
+        expect(after.tickers.get(symbol)?.metadata.positions).toMatchObject([
+          signedInPosition(remoteSyncedAt > 200 ? 8 : 3),
+          ...(symbol === "DELETED" ? [] : [{ ...manual, shares: symbol === "EDITED" ? 9 : 6 }]),
+        ]);
+      }
+    });
+
     test("a row edited while the pull writes its rows keeps the edit on disk", async () => {
       const config = deviceConfig(200);
       const state = createInitialState(config);
@@ -671,7 +1223,7 @@ describe("core sync contributors", () => {
 
       const store = deviceStore(state);
       const edited = createTestTicker("BBB", "BBB", { portfolios: ["main"], positions: [{ ...mainPosition, shares: 9 }] });
-      store.duringFirstSave = () => {
+      store.duringFirstWrite = () => {
         store.current = { ...store.current, tickers: new Map(store.current.tickers).set("BBB", edited) };
         store.disk.set("BBB", edited);
       };

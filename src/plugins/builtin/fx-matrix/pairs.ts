@@ -1,3 +1,7 @@
+import { MISSING_VALUE } from "../../../utils/format";
+import { fxRateDigits } from "../../../utils/currency-pair";
+import { WORD_CURRENCY_CODES } from "../../../utils/currency-names";
+
 /** The default board, in its default order. */
 export const MAJOR_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"] as const;
 
@@ -14,6 +18,19 @@ export const FX_CURRENCIES = [
   "MXN", "BRL", "CLP", "COP", "PEN", "ARS",
 ] as const;
 export type FxCurrency = typeof FX_CURRENCIES[number];
+
+/**
+ * The words a reader looks for the board by: the codes it carries (but those
+ * that are English words) and the names of its currencies, so `catalog yen`,
+ * `catalog chf` and `catalog "swiss franc"` find it. "cad" is a word too, yet
+ * in a market catalog it is the loonie far more often than not, so it still
+ * finds the board; only the fx line waits for CAD in capitals.
+ */
+export const FX_CURRENCY_KEYWORDS: readonly string[] = [
+  ...FX_CURRENCIES.filter((code) => code === "CAD" || !WORD_CURRENCY_CODES.has(code)).map((code) => code.toLowerCase()),
+  "dollar", "euro", "yen", "pound", "sterling", "franc", "swiss franc", "loonie", "aussie", "kiwi", "yuan", "renminbi",
+  "krona", "krone", "won", "rupee", "rupiah", "ringgit", "baht", "peso", "rand", "lira", "zloty", "forint", "koruna", "shekel",
+];
 
 /** The flag each currency wears on the desktop and web; the euro is the EU's, not one member's. */
 export const CURRENCY_FLAG_REGIONS: Record<FxCurrency, string> = {
@@ -47,17 +64,18 @@ export const CURRENCY_SETS: readonly { id: string; label: string; currencies: re
 ];
 
 /**
- * Decimals follow the rate's size, counted at `referenceRate` (the cross at a
- * rate that holds still) when there is one, so a live rate ticking across a
- * power of ten, such as JPY/AUD near 0.0100, keeps its decimals. From 50 up a
- * rate reads two decimals (149.25, 1340.50, 33000.12); below 0.1 it keeps five
- * significant digits, to eight decimals; everything between reads four.
+ * A cross at its pair's precision (`fxRateDigits`), as `fx` and `quote` print
+ * it: a rate in yen from 1 up to three decimals, from 1000 up to two, from 50
+ * up to three, from 1 up to five, and below 1 five significant digits (KRW/JPY
+ * 0.10712, VND/GBP 0.000030400). `currency` is the one the rate is in, the
+ * cross's quote currency. Decimals are counted at `referenceRate` (the cross at
+ * a rate that holds still) when there is one, so a live rate ticking across a
+ * power of ten, such as JPY/AUD near 0.0100, keeps its decimals.
  */
-export function formatRate(rate: number, referenceRate = rate): string {
-  if (!Number.isFinite(rate) || rate <= 0) return "—";
+export function formatRate(rate: number, currency: string, referenceRate = rate): string {
+  if (!Number.isFinite(rate) || rate <= 0) return MISSING_VALUE;
   const basis = Number.isFinite(referenceRate) && referenceRate > 0 ? referenceRate : rate;
-  const decimals = basis < 0.1 ? Math.min(8, 4 - Math.floor(Math.log10(basis))) : basis >= 50 ? 2 : 4;
-  return rate.toFixed(decimals);
+  return rate.toFixed(fxRateDigits(currency, basis));
 }
 
 export function isFxCurrency(code: unknown): code is FxCurrency {

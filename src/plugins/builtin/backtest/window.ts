@@ -1,9 +1,12 @@
 import { parsePublicTickerKey } from "../../../utils/exchanges";
+import { currencyPairInstrument } from "../../../market-data/bars-per-year";
 import { futuresGenericCaption, futuresGenericListing } from "../../../utils/futures-generic";
 import type { BacktestHistory } from "./client";
 import { runBacktest, type BacktestOptions, type BacktestResult } from "./engine";
 import { delistingLabel } from "../../../market-data/quotes/delisting";
 import type { BacktestBar, Rule } from "./rules";
+import { formingBarsState, isFormingBar } from "../shared/forming-bars";
+import { ROLLS_BACK_ADJUSTED } from "../../../market-data/futures-roll-returns";
 
 /** Which served sessions a run tests. */
 export interface BacktestWindowOptions {
@@ -32,6 +35,8 @@ export interface HistoryBacktestResult extends BacktestResult {
    * later sessions change it.
    */
   repeatable: boolean;
+  /** A continuous future's bars were back-adjusted at its rolls (BacktestHistory.rollNote). */
+  rollNote?: string;
 }
 
 /**
@@ -45,7 +50,7 @@ export interface HistoryBacktestResult extends BacktestResult {
  * says so, and is repeatable.
  */
 export function backtestWindow(
-  history: Pick<BacktestHistory, "bars" | "skippedDates" | "undatedSkipped" | "delisting"> & { symbol?: string },
+  history: Pick<BacktestHistory, "bars" | "skippedDates" | "undatedSkipped" | "delisting" | "rollNote"> & { symbol?: string },
   options: BacktestWindowOptions = {},
 ): { bars: BacktestBar[]; warnings: string[]; repeatable: boolean } {
   const end = options.end?.trim() || null;
@@ -62,17 +67,17 @@ export function backtestWindow(
   if (history.undatedSkipped > 0) {
     warnings.push(`${history.undatedSkipped} price ${history.undatedSkipped === 1 ? "point" : "points"} without a date ${history.undatedSkipped === 1 ? "was" : "were"} left out.`);
   }
-  const forming = inWindow.filter((bar) => bar.partial);
-  const bars = forming.length === 0 || options.includePartial ? inWindow : inWindow.filter((bar) => !bar.partial);
+  // A future's session that has not settled moves too: its close becomes the settlement.
+  const forming = inWindow.filter(isFormingBar);
+  const bars = forming.length === 0 || options.includePartial ? inWindow : inWindow.filter((bar) => !isFormingBar(bar));
   const through = bars.at(-1)?.date;
   if (forming.length > 0) {
-    const dates = listDates(forming.map((bar) => bar.date));
+    const dates = `${listDates(forming.map((bar) => bar.date))} ${formingBarsState(forming)}`;
     warnings.push(options.includePartial
-      ? `${dates} ${forming.length === 1 ? "is" : "are"} still forming (partial) and kept: the last close is the latest price, so the results move until the session ends.`
-      : `${dates} ${forming.length === 1 ? "is" : "are"} still forming (partial) and left out`
-        + `${through ? `: the test runs through ${through}, the last complete session` : ""}.`);
+      ? `${dates} and kept: the last close is ${forming.every((bar) => bar.partial) ? "the latest price" : "not final"}, so the results move until the session ends.`
+      : `${dates} and left out${through ? `: the test runs through ${through}, the last complete session` : ""}.`);
   }
-  const newestComplete = history.bars.findLast((bar) => !bar.partial)?.date;
+  const newestComplete = history.bars.findLast((bar) => !isFormingBar(bar))?.date;
   const delisting = history.delisting;
   if (delisting) {
     const listing = `${history.symbol ? `${parsePublicTickerKey(history.symbol).symbol}: ` : ""}${delistingLabel(delisting)}`;
@@ -93,27 +98,33 @@ export function backtestWindow(
 
 /** The run over a loaded history: its window's bars, then the engine, every left-out session warned first. */
 export function runHistoryBacktest(
-  history: Pick<BacktestHistory, "bars" | "skippedDates" | "undatedSkipped" | "delisting"> & { symbol?: string },
+  history: Pick<BacktestHistory, "bars" | "skippedDates" | "undatedSkipped" | "delisting" | "rollNote"> & { symbol?: string },
   entry: Rule,
   exit: Rule,
   options: BacktestOptions & BacktestWindowOptions,
 ): HistoryBacktestResult {
   const window = backtestWindow(history, options);
-  const result = runBacktest(window.bars, entry, exit, options);
-  return { ...result, warnings: [...window.warnings, ...result.warnings], repeatable: window.repeatable };
+  // A currency pair's year is every weekday, however short the run.
+  const result = runBacktest(window.bars, entry, exit, { ...options, instrument: options.instrument ?? currencyPairInstrument(history.symbol) });
+  return { ...result, warnings: [...window.warnings, ...result.warnings], repeatable: window.repeatable,
+    ...(history.rollNote ? { rollNote: history.rollNote } : {}) };
 }
 
 /**
  * What a futures continuation is, said wherever its backtest is read: a
- * continuous symbol (CL=F) rolls front months by volume, a generic (CL2F5R)
- * by its rule, and unless adjusted each roll is a jump between two contracts'
- * prices that the returns include. Null for anything else, a dated contract included.
+ * continuous symbol (CL=F) rolls front months, its bars back-adjusted at
+ * each roll as `rollNote` says (rollAdjustedHistory), a generic (CL2F5R) by
+ * its rule; unless adjusted each roll is a jump between two contracts' prices
+ * that the returns include. Null for anything else, a dated contract included.
  */
-export function continuationNote(symbol: string, exchange?: string | null): string | null {
+export function continuationNote(symbol: string, exchange?: string | null, rollNote?: string | null): string | null {
   const key = parsePublicTickerKey(symbol);
   if (/^[A-Z0-9]{1,6}=F$/.test(key.symbol)) {
-    return `${key.symbol} is a rolled front-month continuation, not one contract: it moves to the next contract as that one`
-      + " becomes the most active, and each roll shows in the returns as a jump between the two contracts' prices.";
+    const jump = "each roll shows in the returns as a jump between the two contracts' prices";
+    const head = `${key.symbol} is a rolled front-month continuation, not one contract`;
+    if (rollNote === ROLLS_BACK_ADJUSTED) return `${head}: ${rollNote}, so prices before each roll are not prices that traded.`;
+    if (rollNote?.startsWith(ROLLS_BACK_ADJUSTED)) return `${head}: ${rollNote}; before then ${jump}.`;
+    return `${head}: it moves to the next contract as that one becomes the most active, and ${jump}.`;
   }
   const generic = futuresGenericListing(symbol, exchange ?? key.exchange);
   if (!generic) return null;

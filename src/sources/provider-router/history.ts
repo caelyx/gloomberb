@@ -87,6 +87,18 @@ interface HistoryAttempts {
   misses: ProviderMissNote;
   coverageError?: HistoryCoverageError;
   retention?: HistoryRetention;
+  /** The furthest-reaching bars a source answered and marked as stopping short of the present (StaleHistoryError). */
+  behind?: PriceHistoryResult;
+}
+
+function noteBehindAnswer(attempts: HistoryAttempts | undefined, value: PriceHistoryResult): void {
+  if (!attempts || !hasUsablePriceHistory(value.points)) return;
+  if (!attempts.behind || lastBarTime(value) > lastBarTime(attempts.behind)) attempts.behind = value;
+}
+
+function lastBarTime(value: PriceHistoryResult): number {
+  const last = value.points.at(-1);
+  return last ? getPricePointTimestamp(last) : Number.NEGATIVE_INFINITY;
 }
 
 function recordHistoryOutcome(attempts: HistoryAttempts | undefined, sourceKey: string, outcome: HistorySourceOutcome["outcome"], status?: number): void {
@@ -128,6 +140,7 @@ function recordHistoryError(attempts: HistoryAttempts | undefined, request: Hist
   if (error instanceof StaleHistoryError) {
     // It has the bars, only not up to the present: behind, as a stale copy it served would be.
     recordHistoryOutcome(attempts, sourceKey, "stale");
+    if (error.behind) noteBehindAnswer(attempts, normalizeRequestResult({ ...error.behind, sourceKey }, request));
   } else if (error instanceof InvalidHistoryResultError) {
     recordHistoryOutcome(attempts, sourceKey, "malformed");
   } else if (isHistoryRetentionError(error)) {
@@ -167,17 +180,19 @@ function makeHistoryRequestIdentity(
     fallbackVariantParts: Array<[string, string | number | undefined | null]>;
   },
 ): Pick<HistoryRequestDescriptor, "identity" | "cacheVariantKeys" | "exactCacheVariantKeys" | "target"> {
-  // Extended-hours bars are another history; they never answer for the regular session.
-  const session: [string, string | undefined] = ["session", input.context?.historySession];
+  // Extended-hours bars are another history; they never answer for the regular session. Nor do
+  // the newest bars of one read (newestBars) answer for every bar kept.
+  const session: Array<[string, string | undefined]> = [["session", input.context?.historySession],
+    ["bars", input.context?.newestBars ? "newest" : undefined]];
   const identity = makeRouterRequestIdentity(deps, {
     kind: input.kind,
     ticker: input.ticker,
     context: input.context,
-    variantParts: priceHistoryVariantParts([...input.variantParts, session], input.exchange),
+    variantParts: priceHistoryVariantParts([...input.variantParts, ...session], input.exchange),
   });
   const cacheVariantKeys = [
     identity.variantKey,
-    buildVariantKey(priceHistoryVariantParts([...input.fallbackVariantParts, session], input.exchange)),
+    buildVariantKey(priceHistoryVariantParts([...input.fallbackVariantParts, ...session], input.exchange)),
   ];
   return {
     target: { symbol: input.ticker, exchange: input.exchange },
@@ -748,11 +763,21 @@ export class ProviderRouterHistoryRoutes {
     // empty chart. Intraday copies expire two days after they are saved. A
     // coin never closes, so its old copy is not shown: the miss says why.
     const coin = isRoundTheClockCoin(target.symbol, target.exchange || request.target.exchange);
-    const fallbackRecords = ranked
-      .map((entry) => entry.record)
-      .filter((record) => !supersededCacheSources.has(record.sourceKey));
+    const fallbackEntries = ranked.filter((entry) => !supersededCacheSources.has(entry.record.sourceKey));
+    const fallbackRecords = fallbackEntries.map((entry) => entry.record);
     const fallbackRecord = fallbackRecords.find((record) => !request.isCachedValueStale(record.value, record.fetchedAt))
       ?? (coin ? undefined : fallbackRecords[0]);
+    // A source's own answer that stops short of the present (the service's
+    // stored series while its source refuses) is shown, said to be behind, as
+    // a saved copy short of the latest session is: unless a copy is current or
+    // reaches further. A coin's is not, in the current window, for the reason
+    // its old copy is not.
+    const behindAnswer = coin && currentWindow ? undefined : attempts.behind;
+    const fallbackCurrent = !!fallbackRecord && !request.isCachedValueStale(fallbackRecord.value, fallbackRecord.fetchedAt)
+      && fallbackEntries.find((entry) => entry.record === fallbackRecord)?.tier === 0;
+    if (behindAnswer && !fallbackCurrent && (!fallbackRecord || lastBarTime(behindAnswer) >= lastBarTime(fallbackRecord.value))) {
+      return withReportedGaps({ ...behindAnswer, savedCopyBehind: true });
+    }
     if (fallbackRecord) {
       // A copy short of the latest session says so, so the chart can tell it
       // from a current one: a thin listing's complete copy is not behind.
@@ -771,15 +796,26 @@ export class ProviderRouterHistoryRoutes {
       const candidates = [...attempts.candidates.values()].sort((a, b) => sourceOrder.indexOf(a.sourceKey) - sourceOrder.indexOf(b.sourceKey));
       throw new HistoryRetentionError(candidates[0]?.retention ?? attempts.retention, { candidates, outcomes: [...attempts.outcomes.values()] });
     }
+    // A source answered but its history stops short of the present, and was not shown (a coin's, one without
+    // bars, or one this router's own check finds behind): say so, not that nothing answered.
+    if (!providerResult && !reportedGaps.some((value) => value.points.length > 0)
+      && [...attempts.outcomes.values()].some((outcome) => outcome.outcome === "stale")) {
+      throw new Error(`Latest history for ${target.symbol} is behind`);
+    }
     if (!providerResult && request.missingProviderError && !reportedGaps.some((value) => value.points.length > 0)) {
-      // A source answered a coin's history but it stops short of the present: say so, not that nothing answered.
-      const behind = coin && [...attempts.outcomes.values()].some((outcome) => outcome.outcome === "stale");
-      if (behind) throw new Error(`Latest history for ${target.symbol} is behind`);
       // A reason the service gave ("ADX listings have daily bars only.") says why; one that has no
       // listing for the symbol says it is not a ticker; otherwise no source answered. A coin trades
-      // around the clock and its sources are there: they could not answer just now.
-      throw noProviderError(coin ? `No source could load history for ${request.target.symbol} just now` : request.missingProviderError,
+      // around the clock and its sources are there: they could not answer just now. So could a
+      // source that failed (a timeout, a 5xx) rather than had nothing: that is no listing without
+      // history, and never reads as one ("No history provider available").
+      const failed = coin || attempts.misses.failure !== undefined;
+      throw noProviderError(failed ? `No source could load history for ${request.target.symbol} just now` : request.missingProviderError,
         attempts.misses, request.target.symbol);
+    }
+    // A window of dates no source could answer, because one failed rather than had nothing, is that failure:
+    // an empty answer would read as no bars in the window (`history --from` printing "0 bars").
+    if (!providerResult && attempts.misses.failure !== undefined && !reportedGaps.some((value) => value.points.length > 0)) {
+      throw noProviderError(`No source could load history for ${request.target.symbol} just now`, attempts.misses, request.target.symbol);
     }
     return withReportedGaps(providerResult?.value ?? { points: [], resolution: historyResolutionForInterval(request.interval) });
   }

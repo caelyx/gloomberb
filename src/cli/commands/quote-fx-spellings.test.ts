@@ -6,7 +6,10 @@ import { createTestCliContext, type PrintedCliResult } from "../../test-support/
 import { createTestDataProvider } from "../../test-support/data-provider";
 import { currencyPairSpelling } from "../../utils/currency-pair";
 import { DEFAULT_CLI_OPTIONS } from "../options";
-import { printCliResult } from "../result";
+import { printCliResult, serializeCliResult } from "../result";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setCliColorEnabledOverride } from "../../utils/cli-output";
 import { marketDataCliCommands } from "./market";
 
@@ -96,7 +99,9 @@ test("every spelling of a pair quotes the same listing, so its rows are the same
     // One request, for the pair's own listing, whatever was typed.
     expect(new Set(asked), pair).toEqual(new Set([pair]));
     expect(rows, pair).toHaveLength(typed.length);
-    for (const [index, row] of rows.entries()) expect(row, `${typed[index]} as ${pair}`).toEqual(rows[0]!);
+    // Each names the entry it was typed as, and the first one it repeats.
+    const quoted = ({ input: _input, duplicateOf: _duplicateOf, ...row }: Record<string, unknown>) => row;
+    for (const [index, row] of rows.entries()) expect(quoted(row), `${typed[index]} as ${pair}`).toEqual(quoted(rows[0]!));
     const first = rows[0]!;
     expect([first.symbol, first.session, first.rawPrice, first.updatedAt], pair)
       .toEqual([pair, "OPEN", listed[pair]!.price, new Date(listed[pair]!.lastUpdated).toISOString()]);
@@ -132,5 +137,87 @@ test("a pair-like miss names the listing search finds nearest, and nothing when 
     spy.mockRestore();
     write.mockRestore();
     setCliColorEnabledOverride(null);
+  }
+});
+
+/**
+ * 13 Nov 2026: eight pasted lines exported five rows. BRK-B had none, BRK.B and BRK/B read two symbols with no
+ * duplicate mark, and N/A and the blank line had none (a warning only), so the export no longer lined up with the sheet.
+ */
+test("a pasted list's export has a row for every line up to the last, a blank or non-symbol line too, and one Symbol per share class", async () => {
+  const stock = (symbol: string, name: string, price: number, exchange = "NYSE"): Quote => ({
+    symbol, name, currency: "USD", price, change: 1, changePercent: 0.2, previousClose: price - 1, marketState: "REGULAR",
+    listingExchangeName: exchange, exchangeName: exchange, instrumentType: "EQUITY", dataSource: "delayed", providerId: "gloomberb-cloud",
+    stale: false, lastUpdated: at("2026-10-12T19:00:00Z"),
+  });
+  const quotes: Record<string, Quote> = {
+    "BRK.B": stock("BRK.B", "Berkshire Hathaway Inc.", 589.83), "BRK-B": stock("BRK-B", "Berkshire Hathaway Inc.", 589.83),
+    MSFT: stock("MSFT", "Microsoft Corporation", 523), AAPL: stock("AAPL", "Apple Inc.", 348), "MC:EPA": stock("MC", "LVMH", 404, "EPA"),
+  };
+  const dataProvider = createTestDataProvider({
+    search: async () => [],
+    getQuotesBatch: async (targets: QuoteSubscriptionTarget[]): Promise<QuoteBatchResult[]> => targets.map((target) => {
+      const quote = quotes[target.symbol];
+      return quote ? { target, quote } : { target, quote: null, error: `Not a ticker: ${target.symbol}.` };
+    }),
+  });
+  const exported = async (text: string) => {
+    const stdin = spyOn(Bun.stdin, "text").mockResolvedValue(text);
+    try {
+      const cli = createTestCliContext({ dataProvider }, { format: "csv" });
+      await quoteCommand.execute(["--file", "-"], cli.context);
+      const [printed] = cli.printed as [PrintedCliResult];
+      const csv = serializeCliResult(printed.result, { ...DEFAULT_CLI_OPTIONS, format: "csv" }, printed.options).split("\n");
+      const head = csv[0]!.split(",");
+      return csv.slice(1).map((line) => line.split(",")).filter((row) => row.length === head.length)
+        .map((row) => ["Symbol", "input", "duplicate_of", "status"].map((column) => row[head.indexOf(column)] ?? ""));
+    } finally {
+      stdin.mockRestore();
+    }
+  };
+  expect(await exported("BRK.B\nBRK-B\nBRK/B\nN/A\n\nMSFT\n\n")).toEqual([
+    ["BRK.B", "BRK.B", "", ""],
+    ["BRK.B", "BRK-B", "BRK.B", ""],
+    ["BRK.B", "BRK/B", "BRK.B", ""],
+    ["N/A", "N/A", "", "not a symbol"],
+    ["", "", "", "blank line"],
+    ["MSFT", "MSFT", "", ""],
+  ]);
+  // A list that reads as one entry still has a row a line, and a code typed with two spaces is one line's.
+  expect(await exported("AAPL\n\nAAPL\n")).toEqual([["AAPL", "AAPL", "", ""], ["", "", "", "blank line"], ["AAPL", "AAPL", "AAPL", ""]]);
+  expect(await exported("MC  FP Equity\nAAPL\n")).toEqual([["MC:EPA", "MC  FP Equity", "", ""], ["AAPL", "AAPL", "", ""]]);
+  // A table with a header keeps a row per symbol: a cell that is no symbol is named on stderr, not given a row.
+  expect(await exported("Symbol,Qty\nAAPL,1\nN/A,2\nMSFT,3\n")).toEqual([["AAPL", "AAPL", "", ""], ["MSFT", "MSFT", "", ""]]);
+});
+
+test("a list's export has a row for every line as typed, in its order, each repeat of a listing marked", async () => {
+  // A sheet's column pasted as a file: four lines that are all USD/JPY, and a code no listing is read from between them.
+  const dir = mkdtempSync(join(tmpdir(), "quote-input-"));
+  const file = join(dir, "symbols.txt");
+  writeFileSync(file, ["USDJPY Curncy", "ＵＳＤＪＰＹ", "GTJPY10Y Govt", "usdjpy", "USD/JPY", "EURUSD=X", "USDJPY Curncy"].join("\n"));
+  try {
+    const source = pairSource();
+    const cli = createTestCliContext({ dataProvider: source.dataProvider }, { format: "csv" });
+    await quoteCommand.execute(["--file", file], cli.context);
+    const [printed] = cli.printed as [PrintedCliResult];
+    const csv = serializeCliResult(printed.result, { ...DEFAULT_CLI_OPTIONS, format: "csv" }, printed.options).split("\n");
+    const head = csv[0]!.split(",");
+    const cells = (line: string) => line.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/);
+    const rows = csv.slice(1, 9).filter((line) => cells(line).length === head.length).map((line) => {
+      const row = cells(line);
+      return [row[head.indexOf("Symbol")], row[head.indexOf("input")], row[head.indexOf("duplicate_of")], row[head.indexOf("status")]!.slice(0, 15)];
+    });
+    expect(rows).toEqual([
+      ["USDJPY=X", "USDJPY Curncy", "", ""],
+      ["USDJPY=X", "ＵＳＤＪＰＹ", "USDJPY Curncy", ""],
+      ["GTJPY10Y Govt", "GTJPY10Y Govt", "", "\"GTJPY10Y Govt "],
+      ["USDJPY=X", "usdjpy", "USDJPY Curncy", ""],
+      ["USDJPY=X", "USD/JPY", "USDJPY Curncy", ""],
+      ["EURUSD=X", "EURUSD=X", "", ""],
+      // The exact repeat keeps its own row, as every line does.
+      ["USDJPY=X", "USDJPY Curncy", "USDJPY Curncy", ""],
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

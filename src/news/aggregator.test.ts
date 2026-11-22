@@ -3,6 +3,8 @@ import { buildNewsQueryKey, NewsService } from "./aggregator";
 import { DEFAULT_GLOBAL_QUERY } from "./news-model";
 import { newsProvider, type NewsCapability } from "../capabilities";
 import type { MarketNewsItem } from "../types/news-source";
+import type { NewsPage } from "./types";
+import { ConnectionHealthRegistry, GLOOM_CLOUD_HTTP_CONNECTION_ID, registerGloomCloudConnectionSources } from "../core/connection-health";
 
 function makeItem(overrides: Partial<MarketNewsItem> & { url: string }): MarketNewsItem {
   return {
@@ -102,6 +104,50 @@ describe("NewsService", () => {
     expect(state.phase).toBe("ready");
     expect(state.articles).toHaveLength(1);
     expect(state.error).toContain("unavailable");
+  });
+
+  // The news reader kept "News sources unavailable." after an outage until
+  // its next poll, two minutes on, while the rest of the app had come back.
+  it("reads a watched list that failed in an outage again once the data service answers", async () => {
+    const health = new ConnectionHealthRegistry();
+    registerGloomCloudConnectionSources(health);
+    const service = new NewsService({ connectionHealth: health });
+    let online = false;
+    let reads = 0;
+    service.register(newsProvider({
+      id: "cloud",
+      name: "cloud",
+      provider: {
+        fetchNews: async () => {
+          reads += 1;
+          if (!online) throw new Error("Gloom couldn't reach its data service");
+          return [makeItem({ url: "https://recovered.example.com/1" })];
+        },
+      },
+    }));
+    service.start();
+    const states: string[] = [];
+    const dispose = service.watchQuery({ feed: "latest" }, (state) => states.push(state.phase));
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(states.at(-1)).toBe("error");
+
+      health.reportReachability(GLOOM_CLOUD_HTTP_CONNECTION_ID, false);
+      online = true;
+      health.reportReachability(GLOOM_CLOUD_HTTP_CONNECTION_ID, true);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(reads).toBe(2);
+      expect(states.at(-1)).toBe("ready");
+
+      // A list that read fine is left to its poll.
+      health.reportReachability(GLOOM_CLOUD_HTTP_CONNECTION_ID, false);
+      health.reportReachability(GLOOM_CLOUD_HTTP_CONNECTION_ID, true);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(reads).toBe(2);
+    } finally {
+      dispose();
+      service.stop();
+    }
   });
 
   it("watchQuery shows loading while the initial fetch is in flight", () => {
@@ -444,7 +490,7 @@ describe("NewsService", () => {
     expect(initial.articles.map((article) => article.url)).toEqual(["https://example.com/a"]);
     expect(initial.nextCursor).toBe("page-2");
 
-    await agg.loadMore({ feed: "latest", limit: 50 });
+    await agg.loadMoreAndWait({ feed: "latest", limit: 50 });
     const state = agg.getQueryState({ feed: "latest", limit: 50 });
     expect(state.articles.map((article) => article.url)).toEqual([
       "https://example.com/a",
@@ -471,7 +517,7 @@ describe("NewsService", () => {
     }));
 
     await agg.load({ feed: "latest", limit: 1 });
-    await agg.loadMore({ feed: "latest", limit: 1 });
+    await agg.loadMoreAndWait({ feed: "latest", limit: 1 });
     const state = agg.getQueryState({ feed: "latest", limit: 1 });
     expect(state.articles.map((article) => article.url)).toEqual([
       "https://example.com/a",
@@ -501,7 +547,7 @@ describe("NewsService", () => {
     }));
 
     await agg.load({ feed: "latest", limit: 1 });
-    await agg.loadMore({ feed: "latest", limit: 1 });
+    await agg.loadMoreAndWait({ feed: "latest", limit: 1 });
     await agg.poll({ feed: "latest", limit: 1 });
     const state = agg.getQueryState({ feed: "latest", limit: 1 });
     expect(state.articles.map((article) => article.url)).toEqual([
@@ -527,4 +573,92 @@ it("retains usable articles and source-owned failure status until a successful r
   failed = false;
   expect((await service.load({ feed: "latest" })).error).toBeNull();
   service.stop();
+});
+
+describe("NewsService across a session change", () => {
+  /** The session the sources read with, switched by hand as a restored token, a sign-in or a sign-out switches it. */
+  function testSession(initial: string) {
+    let key = initial;
+    const listeners = new Set<() => void>();
+    return {
+      signal: {
+        key: () => key,
+        subscribe(listener: () => void) {
+          listeners.add(listener);
+          return () => { listeners.delete(listener); };
+        },
+      },
+      change(next: string) {
+        key = next;
+        for (const listener of listeners) listener();
+      },
+    };
+  }
+
+  const alwaysVisible = { isVisible: () => true, subscribe: () => () => {} };
+  const query = { feed: "top" as const, limit: 20 };
+  const heldBack = makeItem({ id: "held-back", url: "https://example.com/held-back" });
+  const live = makeItem({ id: "live", url: "https://example.com/live" });
+
+  it("reads the feed again once the session arrives, and drops the read that went out without it", async () => {
+    const session = testSession("none");
+    const reads: Array<{ session: string; answer: (page: NewsPage) => void }> = [];
+    const service = new NewsService({ session: session.signal, visibility: alwaysVisible });
+    service.register(newsProvider({ id: "cloud", name: "cloud", provider: {
+      fetchNews: async () => [],
+      fetchNewsPage: () => new Promise<NewsPage>((resolve) => {
+        reads.push({ session: session.signal.key(), answer: resolve });
+      }),
+    } }));
+    service.start();
+    const shown: string[][] = [];
+    const dispose = service.watchQuery(query, (state) => shown.push(state.articles.map((article) => article.id)));
+
+    // A pane restored at launch asks before the saved session is in place.
+    expect(reads.map((read) => read.session)).toEqual(["none"]);
+    session.change("pro");
+    await Bun.sleep(0);
+    expect(reads.map((read) => read.session)).toEqual(["none", "pro"]);
+
+    // The held-back answer comes back after the session did: it never reaches the pane.
+    reads[0]!.answer({ articles: [heldBack], access: "delayed" });
+    await Bun.sleep(0);
+    reads[1]!.answer({ articles: [live], access: "realtime" });
+    await Bun.sleep(0);
+
+    const state = service.getQueryState(query);
+    expect(state.articles.map((article) => article.id)).toEqual(["live"]);
+    expect(state.access).toBe("realtime");
+    expect(shown.flat()).not.toContain("held-back");
+    dispose();
+    service.stop();
+  });
+
+  it("replaces the stories when the session changes instead of merging the two feeds", async () => {
+    const session = testSession("pro");
+    const service = new NewsService({ session: session.signal, visibility: alwaysVisible });
+    service.register(newsProvider({ id: "cloud", name: "cloud", provider: {
+      fetchNews: async () => [],
+      fetchNewsPage: async () => (session.signal.key() === "pro"
+        ? { articles: [live], access: "realtime" as const }
+        : { articles: [heldBack], access: "delayed" as const }),
+    } }));
+    service.start();
+    const dispose = service.watchQuery(query, () => {});
+    await Bun.sleep(0);
+    expect(service.getQueryState(query).articles.map((article) => article.id)).toEqual(["live"]);
+
+    session.change("none");
+    await Bun.sleep(0);
+    const signedOut = service.getQueryState(query);
+    expect(signedOut.articles.map((article) => article.id)).toEqual(["held-back"]);
+    expect(signedOut.access).toBe("delayed");
+
+    // An upgrade brings the live wire back the same way.
+    session.change("pro");
+    await Bun.sleep(0);
+    expect(service.getQueryState(query).articles.map((article) => article.id)).toEqual(["live"]);
+    dispose();
+    service.stop();
+  });
 });

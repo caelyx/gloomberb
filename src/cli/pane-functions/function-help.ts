@@ -19,6 +19,8 @@ const FUNCTION_DOCS_URL = "https://gloom.sh/docs/functions";
 export interface FunctionHelpKey {
   key: string;
   label: string;
+  /** The action's name, as its footer hint gives it, when the label is a whole word after a letter key. */
+  title?: string;
 }
 
 /** A function Free cannot fully open: Pro only, or a limited preview on Free. */
@@ -58,7 +60,7 @@ export function functionDocsUrl(code: string): string {
   return anchor ? `${FUNCTION_DOCS_URL}#${anchor}` : FUNCTION_DOCS_URL;
 }
 
-const key = (hotkey: string, label: string): FunctionHelpKey => ({ key: hotkey, label });
+const key = (hotkey: string, label: string, title?: string): FunctionHelpKey => (title ? { key: hotkey, label, title } : { key: hotkey, label });
 const same = (value: string): FunctionFreshness => ({ free: value, pro: value });
 
 const DELAYED = "15 minutes delayed";
@@ -86,6 +88,8 @@ const IV_DAILY: FunctionFreshness = { free: "Daily, 15 minutes after the pre-clo
 const pro = (value: string): FunctionFreshness => ({ free: "Pro only", pro: value });
 
 const TABS = key("h/l", " tabs");
+/** A wide table's columns past the pane's edge. */
+const COLUMNS = key("Shift+←/→", " columns");
 const OPEN = key("Enter", " open");
 const SEARCH = key("/", "search");
 const OPEN_SOURCE = key("o", "pen source");
@@ -98,8 +102,9 @@ const CHART_KEYS = [key("s", "eries"), key("i", "ndicators"), key("b", "ars"), k
 export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
   // Research companies
   DES: {
-    summary: "The starting point for any ticker: live quote, day and 52-week range, price chart, fundamentals, and tabs into every other research pane.",
-    usage: ["DES NVDA"],
+    summary: "The starting point for any ticker: live quote, day and 52-week range, price chart, fundamentals, and tabs into every other research pane. "
+      + "A bond fund shows its SEC yield, yield to worst and duration beside its distribution yield; --tax-rate 40.8 adds a muni fund's tax-equivalent yield and muni/Treasury ratio.",
+    usage: ["DES NVDA", "DES MUB --tax-rate 40.8"],
     keys: [TABS, key(".", " go to tab")],
     data: QUOTES,
     bloomberg: ["DES"],
@@ -234,10 +239,16 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["RV"],
   },
   EQS: {
-    summary: "Screen covered stocks on valuation, growth, margins, liquidity, volatility, short interest, insider activity and 13F holders, then rank the matches by any metric. "
-      + "ATR% is the 14-session average true range as a percent of the last close. IV rank is a rank, not an IV percentile: 0 is the lowest 30-day implied volatility of the past 52 weeks and 100 the highest.",
-    usage: ["EQS"],
-    keys: [key("a", "dd criterion"), key("m", "etric"), key("t", "check ticker"), key("s", "ave screen"), key("o", "pen research")],
+    summary: "Screen covered stocks on valuation, growth, margins, returns on capital, leverage, liquidity, volatility, technicals, float and ownership, short interest, insider activity and 13F holders, then rank the matches by any metric. "
+      + "ATR% is the 14-session average true range as a percent of the last close. IV rank is a rank, not an IV percentile: 0 is the lowest 30-day implied volatility of the past 52 weeks and 100 the highest. IV percentile, IV30 change in vol points, HV20 and HV rank screen premium to sell. "
+      + "Technical fields read the last completed session: RSI 14, price vs SMA 20, 50 and 200, trading days since a MACD or golden cross and since a new 20-day or 52-week high or low, and Bollinger width percentile (0 is a six-month squeeze). "
+      + "ROIC, FCF yield, net debt / EBITDA, debt / equity and the revenue and EPS CAGRs read FA's bases, and forward growth EE's consensus; N/M where FA prints it. "
+      + "Classic scores: Piotroski F, Altman Z, the Graham number and Lynch fair value with their upside, Greenblatt's Magic Formula rank, the RS rating, years of profit, revenue and dividend growth, and S&P 500 and Dow membership. "
+      + "Grades: Value, Growth, Profitability, Momentum and Revisions, F to A+, each ranked within the sector, and their equal-weighted 1-5 composite labelled Top, Strong, Neutral, Weak or Bottom. "
+      + "Ideas holds ready technical screens, Value, Quality and GARP, screens on the classic scores and Top grades. The pane menu saves the matches to a watchlist.",
+    usage: ["EQS", "gloom fn EQS --preset golden-cross", "gloom fn EQS --preset quality", "gloom fn EQS --preset magic-formula", "gloom fn EQS --preset top-grades"],
+    keys: [TABS, key("a", "dd criterion"), key("m", "etric"), key("t", "check ticker", "Check ticker"), key("s", "ave screen"), key("o", "pen research"),
+      key("Enter", " run idea"), COLUMNS],
     data: same("Daily snapshot, statements as filed"),
     bloomberg: ["EQS"],
   },
@@ -285,8 +296,10 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
   },
   CSP: {
     summary: "Which names pay most to sell a put? For each, the put nearest a delta (0.30) on the expiry nearest a date or a number of days out (30), "
-      + "ranked by annualised yield on cash at the bid, with % out of the money, delta, IV rank, the spread (marked wide, never left out) and an earnings flag.",
-    usage: ["CSP JPM, GS, KO", "gloom fn CSP JPM GS KO AAPL --delta 0.20 --days 45"],
+      + "ranked by annualised yield on cash at the bid, with % out of the money, delta, IV rank, the spread (marked wide, never left out) and an earnings flag. "
+      + "--strategy screens covered calls, verticals, iron condors, straddles, strangles and calendars the same way, with the trade, credit or debit, "
+      + "max gain and loss per contract, break-evens, probability of profit, and an income trade's annualised return or a debit trade's reward to risk.",
+    usage: ["CSP JPM, GS, KO", "gloom fn CSP JPM GS KO AAPL --delta 0.20 --days 45", "gloom fn CSP JPM GS KO --strategy iron-condor"],
     keys: [key("Enter", " open in OSA")],
     data: OPTIONS,
     bloomberg: [],
@@ -349,8 +362,8 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: [],
   },
   MDAY: {
-    summary: "Does this name care about CPI day? Its average move on CPI, jobs report and FOMC days against a normal day, the average signed move and share of up days, and the move on every release day.",
-    usage: ["MDAY SPY"],
+    summary: "Does this name care about CPI day? Its average move on CPI, jobs report and FOMC days against a normal day, the average signed move and share of up days, and the move on every release day. Takes a FRED series too (FRED:T10Y2Y), whose moves in a rate or spread read in basis points.",
+    usage: ["MDAY SPY", "MDAY FRED:T10Y2Y"],
     keys: [],
     data: DAILY_CLOSES,
     bloomberg: [],
@@ -398,7 +411,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["CACS"],
   },
   EVTS: {
-    summary: "The market's report days with implied and past moves, or a past or coming week or day of them; a ticker picks its row.",
+    summary: "The market board: report days with implied and past moves. In the pane, a ticker opens its next report day, or its latest past one, with its row selected. An explicit week or day keeps that range.",
     usage: ["EVTS", "EVTS NVDA", "gloom fn EVTS --week last", "gloom fn EVTS --date 2026-10-15"],
     keys: [key("t", "icker"), key("e", "stimates"), key("c", "alls"), key("a", "nalysts")],
     data: EARNINGS_DAYS,
@@ -406,7 +419,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     docs: "ERN",
   },
   ERN: {
-    summary: "The market's report days with implied and past moves. Alone it is the market board; with tickers, just those names and their report history.",
+    summary: "A company's report history with its surprises and moves, or several tickers' next reports. Alone it is the market board EVTS shows.",
     usage: ["ERN", "ERN NVDA, AAPL, MSFT"],
     keys: [key("t", "icker"), key("e", "stimates"), key("c", "alls"), key("a", "nalysts")],
     data: EARNINGS_DAYS,
@@ -416,8 +429,9 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     summary: "Cash distributions, trailing yield, the forward yield fundamentals show (the latest distribution annualized, or the declared one once announced), and payout growth. Future payments are not forecast. "
       + "For a bond fund these are distribution yields, not its SEC yield, which follows them with its date, yield to worst and duration. "
       + "--tax-rate 40.8 adds a muni fund's tax-equivalent yield, yield / (1 - (federal + state rate)) on the SEC yield (else the distribution yield), "
-      + "and its muni/Treasury ratio against the GC tenor nearest its duration; --state-rate 13.3 --state CA counts only for a CA fund.",
-    usage: ["DVD KO", "DVD MUB --tax-rate 40.8", "DVD CMF --tax-rate 40.8 --state-rate 13.3 --state CA"],
+      + "and its muni/Treasury ratio against the GC tenor nearest its duration; --state-rate 13.3 --state CA counts only for a CA fund. "
+      + "Several tickers rank in one table; with --tax-rate it adds yield to worst, duration, the tax-equivalent yield and the ratio.",
+    usage: ["DVD KO", "DVD MUB --tax-rate 40.8", "DVD CMF --tax-rate 40.8 --state-rate 13.3 --state CA", "DVD MUB VTEB SUB LQD --tax-rate 40.8"],
     keys: [STEP],
     data: same("Daily"),
     bloomberg: ["DVD"],
@@ -506,11 +520,11 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: [],
   },
   SRCH: {
-    summary: "Full-text search across earnings call transcripts, news wires and SEC filings, with the matching passage inline. Save a search to get alerted on new hits.",
+    // Searching and reading hits need only a free account; alerts on a saved search are the part the service keeps for Pro.
+    summary: "Full-text search across earnings call transcripts, news wires and SEC filings, with the matching passage inline. Free with a Gloom account; alerts on a saved search's new hits are Pro.",
     usage: ["SRCH data center capex"],
     keys: [SEARCH, key("Ctrl+S", " save search"), key("a", "lerts")],
-    data: pro("As calls, stories and filings arrive"),
-    access: "pro",
+    data: same("As calls, stories and filings arrive"),
     bloomberg: ["NSE"],
   },
   COVN: {
@@ -530,7 +544,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["CAST", "DDIS"],
   },
   ATTN: {
-    summary: "See which tickers opted-in Gloom users are researching, with delayed privacy-qualified hourly counts, abnormal attention, sectors, countries and market context. Suppressed activity is unavailable, never zero.",
+    summary: "See which tickers Gloom users are researching, with delayed privacy-qualified hourly counts, abnormal attention, sectors, countries and market context. Suppressed activity is unavailable, never zero.",
     usage: ["ATTN", "ATTN 6758:JPX"],
     keys: [OPEN, key("e", "vidence"), key("d", "es"), key("g", "raph"), key("n", "ews")],
     data: { free: "Three published rows per section and the latest history point", pro: "All published rows and hourly history; minimum one-hour publication lag" },
@@ -632,8 +646,8 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["QR"],
   },
   BUZZ: {
-    summary: "Daily posts on X naming the ticker's cashtag, the day's top posts and their stance.",
-    usage: ["BUZZ TSLA"],
+    summary: "Daily posts on X naming the ticker's cashtag, the day's top posts and their stance. Alone it ranks the tickers by how far their posts jump above their own 30-day median, on the latest closed day or today so far, with stance and price move, filtered by posts and market cap.",
+    usage: ["BUZZ TSLA", "BUZZ"],
     keys: [OPEN, OPEN_SOURCE],
     data: same("Through the day"),
     bloomberg: [],
@@ -713,8 +727,8 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
 
   // Watch markets
   MOST: {
-    summary: "Today's top gainers, losers, most active and trending tickers with price, change, volume against average and market cap, and the pre-market and after-hours movers. On Pro, the gaps at the open.",
-    usage: ["MOST"],
+    summary: "Today's top gainers, losers, most active and trending tickers with price, change, volume against average and market cap, and the pre-market and after-hours movers. On Pro, the gaps at the open. Min float keeps the names with at least that many shares in the float.",
+    usage: ["MOST", "gloom fn MOST --list gainers --min-float 10M"],
     keys: [TABS, OPEN],
     data: { free: DELAYED, pro: REAL_TIME },
     bloomberg: ["MOST"],
@@ -791,15 +805,15 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: [],
   },
   FUT: {
-    summary: "Each root's front futures contract (until its stated roll date) and the day's most active month across equity index, equity sectors, rates, energy, metals, agriculture, livestock and FX with last price, unit and session change, grouped by sector.",
-    usage: ["FUT"],
+    summary: "Each root's front futures contract (until its stated roll date) and the day's most active month across equity index, equity sectors, volatility (VIX futures, at Cboe's daily settlement), rates, energy, metals, agriculture, livestock and FX with last price, unit and session change, grouped by sector.",
+    usage: ["FUT", "FUT VX"],
     keys: [SEARCH, OPEN],
     data: same(DELAYED),
     bloomberg: ["GLCO"],
   },
   CTM: {
-    summary: "A futures root's listed contracts as a curve against a week and a month ago, with roll yield, contango or backwardation, and each contract's price, open interest and volume. Takes a FUT root, VX or a CME crypto root (BTC, ETH, SOL, XRP), which also shows each contract's premium to spot and annualised basis against the USD pair in the minute of each contract's last trade: Ann Basis = (Last / spot - 1) × 365 / days to expiry, simple actual/365, with days counted to final settlement.",
-    usage: ["CTM GC", "CTM BTC"],
+    summary: "A futures root's listed contracts as a curve against a week and a month ago, with roll yield, contango or backwardation, and each contract's price, open interest and volume. Takes a FUT root, VX or a CME crypto root (BTC, ETH, SOL, XRP), which also shows each contract's premium to spot and annualised basis against the USD pair in the minute of each contract's last trade: Ann Basis = (Last / spot - 1) × 365 / days to expiry, simple actual/365, with days counted to final settlement. Ann. roll yield is what a long position earns or pays rolling from the front contract into the next, scaled to a year: (front / next - 1) × 365 / days between the two, positive in backwardation and negative in contango. PCTL ranks a figure against its own daily values over the past year, 100 the highest and 0 the lowest: the roll yield and the front spread against theirs, and in the table each contract's price against its own.",
+    usage: ["CTM GC", "CTM BTC", "CTM VX"],
     keys: [key("d", "ate"), key("c", "urrent"), STEP],
     data: same("Delayed, usually 10 minutes; VIX at settlement"),
     bloomberg: ["CTM", "CT"],
@@ -902,9 +916,9 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: [],
   },
   FLOW: {
-    summary: "Sweeps, blocks and large premium prints as they hit the tape, with ticker, strike, expiry and premium.",
-    usage: ["FLOW"],
-    keys: [OPEN],
+    summary: "Sweeps, blocks and large premium prints, and the session's net premium tide.",
+    usage: ["FLOW", "FLOW NVDA"],
+    keys: [TABS, OPEN],
     data: pro(REAL_TIME),
     access: "pro",
     bloomberg: ["FLOW"],
@@ -982,15 +996,15 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["WIRP", "FFIP"],
   },
   CRD: {
-    summary: "ICE BofA option-adjusted spreads: US investment grade and high yield by rating, and euro high yield, with the day's change.",
-    usage: ["CRD", "CRD --region euro"],
+    summary: "ICE BofA option-adjusted spreads: US investment grade and high yield by rating, euro high yield, and emerging markets and Asia corporates, with the day's change.",
+    usage: ["CRD", "CRD --region euro", "CRD --region asia,em"],
     keys: [OPEN],
     data: same("Daily close, published the next day"),
     bloomberg: ["CRD"],
   },
   AUCT: {
-    summary: "Bill, note, bond and TIPS auction results: high rate, stop-out versus average, bid-to-cover, indirect, direct and dealer takedown and size, with the auctions announced next. Searchable by benchmark (10Y) or CUSIP; history reaches back 10 years.",
-    usage: ["AUCT", "AUCT 10Y", "AUCT 91282CRF0"],
+    summary: "Bill, note, bond and TIPS auction results: high rate (a bill's investment rate, with its discount rate), the stop-out's spread against the published average (the median from Nov 1998), bid-to-cover, indirect, direct and dealer takedown and size, with the auctions announced next. The after view ranks each auction's B/C, indirect and dealer share against its tenor's last 24 and gives the Treasury yield's move 1, 5 and 20 sessions later. Searchable by benchmark (10Y) or CUSIP; history reaches back to 1979 (--history-days all). --market hk lists Hong Kong's EF Bills, EF Notes and Government Bond tenders from HKMA's Open API (Source: HKMA; published monthly): issue date, tenor, average accepted yield, B/C and size.",
+    usage: ["AUCT", "AUCT 10Y", "AUCT 91282CRF0", "AUCT 7Y --history-days 3650 --view after --sort btc-pctl", "AUCT --market hk", "AUCT HKGB 10Y"],
     keys: [SEARCH, key("f", "ilter"), OPEN],
     data: same("Daily, after each auction"),
     bloomberg: ["AUCT"],
@@ -1035,7 +1049,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     usage: ["CDS", "CDS F", "gloom fn CDS --sort 1m", "gloom fn CDS F --csv --section daily"],
     keys: [OPEN, STEP],
     data: same("Delayed, as trades are disseminated"),
-    bloomberg: ["CDS"],
+    bloomberg: ["CDS", "CDSW"],
   },
   CDX: {
     summary: "CDX IG, HY and EM with iTraxx Main and Crossover on the run: the 5Y level, 1D, 1W and 1M moves, 1Y percentile and the day's print count. IG and iTraxx in spread, HY and EM in price. Naming an index opens the board on it, and `fn` adds its daily history. Sovereign CDS is the other tab.",
@@ -1075,8 +1089,9 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["CF"],
   },
   ETF: {
-    summary: "A US-listed fund's facts, a leveraged or inverse fund's daily objective among them, then its own SEC filings: registration statements and prospectus updates, shareholder reports, N-CEN and N-PORT reports. Open any of them inline.",
-    usage: ["ETF SPY"],
+    summary: "A US-listed fund's facts, a leveraged or inverse fund's daily objective and a bond fund's SEC yield, yield to worst and duration among them, then its own SEC filings: registration statements and prospectus updates, shareholder reports, N-CEN and N-PORT reports. Open any of them inline. "
+      + "--tax-rate 40.8 adds a muni fund's tax-equivalent yield and muni/Treasury ratio, as DVD does.",
+    usage: ["ETF SPY", "ETF MUB --tax-rate 40.8"],
     keys: [OPEN, OPEN_SOURCE],
     data: AS_FILED,
     bloomberg: [],
@@ -1135,7 +1150,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
   PF: {
     summary: "Your portfolio or watchlist with live quotes, market value, P&L, weights of the total with cash, and sparklines. With target weights set, each holding adds its target, drift and the trade that rebalances it; broker-synced and manual positions sit in the same table.",
     usage: ["PF", "PF Family"],
-    keys: [key("a", "dd"), OPEN, key("s", " grid")],
+    keys: [key("a", "dd"), OPEN, key("s", " grid"), key("t", "arget weight"), key("Shift+T", " clear target"), TABS, COLUMNS],
     data: QUOTES,
     bloomberg: [],
     docs: "https://gloom.sh/docs/portfolio",
@@ -1158,7 +1173,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
   ALRT: {
     summary: "Your price alerts with current price, distance to target and trigger state, plus alerts on earnings, CPI and FOMC dates, filings and 13F, news keywords, analyst changes, 52-week highs and lows, unusual volume, short interest, insider and congress trades, catalysts, IV spikes, options flow and perps.",
     usage: ["ALRT"],
-    keys: [key("a", "dd alert"), key("e", "dit"), key("d", "elete"), key("m", "re-arm")],
+    keys: [key("a", "dd alert"), key("e", "dit"), key("d", "elete"), key("m", "re-arm", "Re-arm")],
     data: QUOTES,
     bloomberg: ["ALRT"],
   },
@@ -1249,10 +1264,17 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: [],
   },
   TBO: {
-    summary: "Data center and semiconductor supply chain intelligence: company lists, sites and intel, with limited free data and full access with a TheBuildout subscription.",
+    summary: "Data center and semiconductor supply chain intelligence: a board of AI buildout themes sized by market cap and coloured by median 1Y return, each theme's companies, sites and intel, with limited free data and full access with Buildout.",
     usage: ["TBO"],
-    keys: [TABS, OPEN, key("s", "tar")],
-    data: same("Intel 72 hours delayed without a TheBuildout plan"),
+    keys: [TABS, key("←/→", " theme"), OPEN, key("s", "tar")],
+    data: same("Intel 72 hours delayed without Buildout"),
+    bloomberg: [],
+  },
+  TBOC: {
+    summary: "One company in TheBuildout: its power and hosting deals, suppliers and customers as a flow, its sites, hiring by site and the signals that name it. Linked to TBO, it follows the company under the cursor.",
+    usage: ["TBOC MSFT", "TBOC MSFT --tab signals"],
+    keys: [TABS, OPEN],
+    data: same("Signals 72 hours delayed and no hiring by site without Buildout"),
     bloomberg: [],
   },
   ACM: {
@@ -1332,7 +1354,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: [],
   },
   LMA: {
-    summary: "Float, dock, swap, remove and save panes and layouts.",
+    summary: "Float panes or return them to the layout, swap, remove and save panes and layouts.",
     usage: ["LMA", "LMA float"],
     keys: [],
     data: null,
@@ -1423,6 +1445,13 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     data: null,
     bloomberg: [],
   },
+  ROADMAP: {
+    summary: "What is being built, what is planned and what shipped, with each item's votes, and the Changelog in a second tab. Pro members vote on what is building or planned, once per item, and can take the vote back.",
+    usage: ["ROADMAP"],
+    keys: [TABS, OPEN, key("v", "ote")],
+    data: null,
+    bloomberg: [],
+  },
   HELP: {
     summary: "Help and the function reference. HELP with a function opens its card, F1 opens the focused pane's, and HELP HELP reaches support.",
     usage: ["HELP", "HELP OMON", "HELP HELP"],
@@ -1440,6 +1469,13 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
   FB: {
     summary: "A message and an optional screenshot, sent with scrubbed logs and app details; works signed out. FEEDBACK and BUG open it too.",
     usage: ["FB"],
+    keys: [],
+    data: null,
+    bloomberg: [],
+  },
+  QUIT: {
+    summary: "Quit Gloom from the command bar. EXIT does too; the browser app, which cannot close its tab, does not list it.",
+    usage: ["QUIT"],
     keys: [],
     data: null,
     bloomberg: [],

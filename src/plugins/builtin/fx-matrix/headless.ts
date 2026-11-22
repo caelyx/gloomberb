@@ -7,7 +7,8 @@ import { servedFromSavedCopy } from "../../../data/saved-copies";
 import { fxPairObservation, fxRateObservations } from "../shared/fx-rate-freshness";
 import { loadFxBoard, type FxLegReading } from "./client";
 import { crossMovePercent } from "./direction";
-import { formatRate, resolveCurrencies, type FxCurrency } from "./pairs";
+import { formatAmountFigure, formatFxBoardAmount, parseFxBoardAmount, parseFxBoardCurrencies, withAmountCurrencies, type FxBoardAmount } from "./amount";
+import { FX_CURRENCY_KEYWORDS, formatRate, resolveCurrencies, type FxCurrency } from "./pairs";
 import { FX_MATRIX_REPORT_OPTIONS, fxMatrixReportNotices } from "./settings";
 
 const iso = (time: number | null | undefined) => time != null && Number.isFinite(time) ? new Date(time).toISOString() : null;
@@ -15,7 +16,7 @@ const iso = (time: number | null | undefined) => time != null && Number.isFinite
 const MOVE_COLUMN: HeadlessPaneColumn = { key: "movePercent", header: "Move", align: "right", format: (value) => typeof value === "number" ? formatPercentRaw(value) : "—" };
 const CROSS_COLUMNS: HeadlessPaneColumn[] = [
   { key: "pair", header: "Pair" },
-  { key: "rate", header: "Rate", align: "right", format: (value) => typeof value === "number" ? formatRate(value) : "—" },
+  { key: "rate", header: "Rate", align: "right", format: (value, row) => typeof value === "number" ? formatRate(value, String(row.quote)) : "—" },
   MOVE_COLUMN,
   { key: "asOf", header: "As of", shrink: false, format: (value) => typeof value === "string" ? formatUtcTime(value) : "—" },
   { key: "stale", header: "Status", format: (value, row) => (
@@ -23,13 +24,42 @@ const CROSS_COLUMNS: HeadlessPaneColumn[] = [
   ) },
 ];
 
+/** The amount a report was asked to convert (`fn FXC 2500000 EUR`), in the quote currency of each of its crosses. */
+const AMOUNT_COLUMN: HeadlessPaneColumn = {
+  key: "converted", header: "Amount", align: "right",
+  format: (value, row) => typeof value === "number" ? `${formatAmountFigure(value, String(row.quote))} ${String(row.quote)}` : "",
+};
+
 /**
  * The columns with the move's header naming its close, as `quote` names a
  * pair's (`Move vs Wed 21 Oct close`), in the text report; exports keep
- * `Move`, so a column read by its name stays where it was.
+ * `Move`, so a column read by its name stays where it was. With an amount,
+ * its column follows the rate.
  */
-function crossColumns(basis: string | null): HeadlessPaneColumn[] {
-  return basis ? CROSS_COLUMNS.map((column) => column === MOVE_COLUMN ? { ...column, textHeader: `Move ${basis}` } : column) : CROSS_COLUMNS;
+function crossColumns(basis: string | null, amount: boolean): HeadlessPaneColumn[] {
+  const columns = amount ? CROSS_COLUMNS.flatMap((column) => column.key === "rate" ? [column, AMOUNT_COLUMN] : [column]) : CROSS_COLUMNS;
+  return basis ? columns.map((column) => column === MOVE_COLUMN ? { ...column, textHeader: `Move ${basis}` } : column) : columns;
+}
+
+/** `fn FXC 2500000 EUR`: the amount typed after the function, as the pane's Amount field reads it; null for none. */
+const typedArgument = (argument: string | string[] | null | undefined) => Array.isArray(argument) ? argument.join(" ") : argument ?? "";
+
+function reportAmount(argument: string | string[] | null | undefined): FxBoardAmount & { to: FxCurrency | null } | null {
+  const typed = typedArgument(argument);
+  // Currencies alone (`fn FXC TRY`) are added to the board, as `FXC TRY` adds them in the app: no amount.
+  if (parseFxBoardCurrencies(typed)) return null;
+  const request = parseFxBoardAmount(typed);
+  if (request && "error" in request) throw new Error(request.error);
+  return request;
+}
+
+/** The board a report reads: its currencies, with the ones its argument names added at the end as the pane adds them. */
+function reportCurrencies(args: { argument?: string | string[] | null; options: Record<string, unknown> }): FxCurrency[] {
+  const currencies = resolveCurrencies(args.options.currencies);
+  const added = parseFxBoardCurrencies(typedArgument(args.argument));
+  if (added) return [...currencies, ...added.filter((code) => !currencies.includes(code))];
+  const amount = reportAmount(args.argument);
+  return amount ? withAmountCurrencies(currencies, amount) : currencies;
 }
 
 /** USD per unit, USD itself as 1; null for a leg with no usable rate. */
@@ -52,7 +82,7 @@ function usdPerUnit(readings: ReadonlyMap<string, FxLegReading>, currency: strin
 export function projectFxCrosses(
   currencies: readonly FxCurrency[],
   readings: ReadonlyMap<string, FxLegReading>,
-  options: { notices?: string[]; now?: number } = {},
+  options: { notices?: string[]; now?: number; amount?: FxBoardAmount | null } = {},
 ): HeadlessRowsResult {
   const now = options.now ?? Date.now();
   const rates = new Map(currencies.flatMap((currency) => {
@@ -66,12 +96,18 @@ export function projectFxCrosses(
   const observed = new Map(observations.map((observation) => [observation.currency, observation]));
   const reference = (currency: string) => currency === "USD" ? 1 : readings.get(currency)?.reference ?? null;
 
-  const rows = currencies.flatMap((base) => currencies.filter((quote) => quote !== base).map((quote) => {
+  // With an amount, its crosses come first, each with the amount in its quote currency at the board's rate.
+  const amount = options.amount ?? null;
+  const bases = amount ? [amount.currency, ...currencies.filter((currency) => currency !== amount.currency)] : currencies;
+  const converted = (base: string, rate: number | null) => (
+    amount ? { converted: base === amount.currency && rate != null ? amount.amount * rate : null } : {}
+  );
+  const rows = bases.flatMap((base) => currencies.filter((quote) => quote !== base).map((quote) => {
     const pair = `${base}/${quote}`;
     const baseRate = rates.get(base);
     const quoteRate = rates.get(quote);
     // A missing leg leaves the cross unavailable, never at parity.
-    if (baseRate == null || quoteRate == null) return { pair, base, quote, rate: null, movePercent: null, asOf: null };
+    if (baseRate == null || quoteRate == null) return { pair, base, quote, rate: null, ...converted(base, null), movePercent: null, asOf: null };
     // A cross drawn from a leg's saved copy, its refresh having failed, is as old as that copy.
     const saved = [base, quote].flatMap((currency) => readings.get(currency)?.savedAt ?? []);
     const legs = [base, quote].flatMap((currency) => observed.get(currency) ?? []);
@@ -83,6 +119,7 @@ export function projectFxCrosses(
       base,
       quote,
       rate: baseRate / quoteRate,
+      ...converted(base, baseRate / quoteRate),
       movePercent: baseReference != null && quoteReference != null
         ? crossMovePercent(baseRate, baseReference, quoteRate, quoteReference)
         : null,
@@ -94,7 +131,7 @@ export function projectFxCrosses(
     }, saved.length > 0 ? Math.min(...saved) : Number.NaN);
   }));
 
-  // The closes the moves are read from: one day for a board read at once, "vs mixed closes" otherwise.
+  // The close the moves are read from: the board's one trading day (fxBoardMoveDay), never mixed closes.
   const moveBasis = combinedChangeBasisLabel(currencies.map((currency) => readings.get(currency)?.changeBasis));
   const unavailable = currencies.filter((currency) => !rates.has(currency));
   const errors = unavailable.flatMap((currency) => {
@@ -102,7 +139,7 @@ export function projectFxCrosses(
     return error ? [`${currency}: ${error}`] : [];
   });
   return {
-    columns: crossColumns(moveBasis),
+    columns: crossColumns(moveBasis, amount != null),
     rows,
     ...(rows.length === 0 ? { empty: "One currency has no crosses. Add another, such as --currencies USD,EUR." } : {}),
     complete: unavailable.length === 0,
@@ -112,6 +149,7 @@ export function projectFxCrosses(
     metadata: {
       ...(options.notices?.length ? { notices: options.notices } : {}),
       currencies,
+      ...(amount ? { amount: { amount: amount.amount, currency: amount.currency } } : {}),
       unit: "quote currency per one unit of the base currency",
       method: "the base currency's USD rate divided by the quote currency's; the two legs' observation times can differ",
       movePercent: "the cross against both legs' previous daily closes, from each pair's quote; empty where a leg has no current pair quote",
@@ -138,12 +176,20 @@ export function projectFxCrosses(
 
 export const fxMatrixHeadless: HeadlessPaneDefinition<"rows"> = {
   shape: "rows",
-  argument: { kind: "none" },
+  argument: {
+    kind: "free-text", optional: true, placeholder: "amount or currencies",
+    description: "An amount to convert into each currency, as the pane's Amount field takes it (2500000 EUR, 2,500,000 EUR/USD), or currencies to add to the board (TRY, USD,TRY).",
+  },
   description: "Cross rates between currencies, one row per ordered pair, each with its move since the previous close, observation time and stale flag.",
   freshness: { source: "Gloom Cloud" },
-  describe: (args) => `FX Cross Rates | ${resolveCurrencies(args.options.currencies).join(" ")}`,
+  describe: (args) => {
+    const amount = reportAmount(args.argument);
+    return `FX Cross Rates | ${reportCurrencies(args).join(" ")}${amount ? ` | ${formatFxBoardAmount(amount)}` : ""}`;
+  },
   discovery: {
-    intents: ["fx", "forex", "currency", "cross rates", "exchange rates"],
+    // A currency's code or name finds the board (`catalog yen`, `catalog chf`), and so do the safe havens it
+    // carries, the yen and the franc. Searched, never listed: the catalog's Keywords line stays short.
+    intents: ["fx", "forex", "currency", "cross rates", "exchange rates", "safe haven", ...FX_CURRENCY_KEYWORDS],
     limitations: ["Indicative crosses through USD legs, whose observation times can differ."],
     screenshotReadiness: "live-dom",
   },
@@ -153,16 +199,18 @@ export const fxMatrixHeadless: HeadlessPaneDefinition<"rows"> = {
   // the pair names both codes, and each leg's feed and delay are in metadata.
   compact: (result) => ({
     ...result,
-    rows: result.rows.map(({ pair, rate, movePercent, asOf, stale }) => ({
+    rows: result.rows.map(({ pair, rate, converted, movePercent, asOf, stale }) => ({
       pair,
       rate: typeof rate === "number" ? Number(rate.toPrecision(6)) : null,
+      ...(converted === undefined ? {} : { converted: typeof converted === "number" ? Number(converted.toFixed(2)) : null }),
       movePercent: typeof movePercent === "number" ? Number(movePercent.toFixed(3)) : null,
       asOf,
       ...(stale === undefined ? {} : { stale }),
     })),
   }),
   async load(args, ctx) {
-    const currencies = resolveCurrencies(args.options.currencies);
+    const amount = reportAmount(args.argument);
+    const currencies = reportCurrencies(args);
     const readings = await loadFxBoard(currencies, ctx.marketData, { forceRefresh: ctx.refresh });
     ctx.signal.throwIfAborted();
     const legs = [...readings.values()];
@@ -170,6 +218,6 @@ export const fxMatrixHeadless: HeadlessPaneDefinition<"rows"> = {
     if (legs.length > 0 && legs.every((reading) => reading.entry == null)) {
       throw new Error(`Exchange rates unavailable for ${legs.map(({ leg }) => leg.currency).join(", ")}: ${legs[0]!.error}`);
     }
-    return projectFxCrosses(currencies, readings, { notices: fxMatrixReportNotices(args.options) });
+    return projectFxCrosses(currencies, readings, { notices: fxMatrixReportNotices(args.options, currencies), amount });
   },
 };

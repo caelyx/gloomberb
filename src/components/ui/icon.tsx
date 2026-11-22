@@ -1,7 +1,7 @@
 import { type ComponentType } from "react";
 import { Box, Text, useUiHost } from "../../ui";
 import { useThemeColors } from "../../theme/theme-context";
-import { useRemoteUiNode } from "../../remote/semantic-tree";
+import { useRemoteUiNode, useRemoteUiScope } from "../../remote/semantic-tree";
 import { t } from "../../i18n";
 
 export type IconName =
@@ -38,7 +38,8 @@ export type IconName =
   | "team"
   | "pro"
   | "clock"
-  | "edit";
+  | "edit"
+  | "mail";
 
 /** Terminal glyph for each icon; the desktop host draws SVG. */
 export const ICON_GLYPHS: Record<IconName, string> = {
@@ -84,6 +85,8 @@ export const ICON_GLYPHS: Record<IconName, string> = {
   // Time, for data that arrives late (a delayed quote).
   clock: "◷",
   edit: "✎",
+  // A message written to you (a DM): text presentation, one cell.
+  mail: "✉",
 };
 
 export interface IconProps {
@@ -91,13 +94,19 @@ export interface IconProps {
   /** Pixel size on the desktop; the terminal draws one glyph. */
   size?: number;
   color?: string;
+  /**
+   * Desktop: takes its row's full height and draws in the middle of it. A
+   * box centred in a row an odd number of pixels taller lands on a whole
+   * pixel, half a pixel off; the drawing inside the box does not.
+   */
+  fullHeight?: boolean;
 }
 
 /** One glyph from the app's icon set. */
-export function Icon({ name, size = 12, color }: IconProps) {
+export function Icon({ name, size = 12, color, fullHeight }: IconProps) {
   const colors = useThemeColors();
   const HostIcon = useUiHost().Icon as ComponentType<IconProps> | undefined;
-  if (HostIcon) return <HostIcon name={name} size={size} color={color} />;
+  if (HostIcon) return <HostIcon name={name} size={size} color={color} fullHeight={fullHeight} />;
   return <Text fg={color ?? colors.textDim} selectable={false}>{ICON_GLYPHS[name]}</Text>;
 }
 
@@ -151,12 +160,14 @@ export function IconButton({
 }: IconButtonProps) {
   const colors = useThemeColors();
   const label = t(rawLabel);
+  // Of the surface it is drawn in, as a kit Button is: a prompt's dialog's close is that prompt's.
+  const remoteScope = useRemoteUiScope();
   useRemoteUiNode({
     role: "button",
     label,
     disabled,
     actions: { press: () => { if (!disabled) onPress?.(); } },
-    metadata: { icon, pressed },
+    metadata: { icon, pressed, ...(remoteScope ? { scope: remoteScope } : {}) },
   });
   const HostIconButton = useUiHost().IconButton as ComponentType<IconButtonProps> | undefined;
   if (HostIconButton) {

@@ -1,8 +1,9 @@
-import type { DepositaryPair, Fundamentals, Quote } from "../types/financials";
+import type { CedearRatio, DepositaryPair, Fundamentals, Quote } from "../types/financials";
 import { canonicalExchange, parsePublicTickerKey } from "../utils/exchanges";
 import { formatNumber } from "../utils/format";
 import { formatUtcDayTime } from "../utils/utc-time";
 import { heldCurrencyUnit } from "../utils/currency-units";
+import { adrRatioText } from "../utils/depositary-receipt";
 import { regularSessionCloseOn } from "./market/freshness";
 import { getRegularSessionDisplay, regularSessionDisplayDate } from "./market/status";
 
@@ -41,19 +42,44 @@ export function ratioCount(ratio: number): string {
   return Number.isInteger(ratio) ? String(ratio) : String(Number(ratio.toPrecision(6)));
 }
 
-/** What a home line says of its receipt: `1 GGAL ADR = 10 of these shares`. */
+type CedearRecords = { quote?: Pick<Quote, "cedearRatio"> | null; fundamentals?: Pick<Fundamentals, "cedearRatio"> | null };
+
+const positiveCount = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value > 0;
+
+/** A served CEDEAR ratio, when it is whole. */
+function readCedearRatio(value: unknown): CedearRatio | null {
+  if (!value || typeof value !== "object") return null;
+  const ratio = value as Partial<CedearRatio>;
+  if (typeof ratio.listing !== "string" || !ratio.listing.trim()) return null;
+  if (typeof ratio.company !== "string" || !ratio.company.trim()) return null;
+  if (!positiveCount(ratio.receipts) || !positiveCount(ratio.shares)) return null;
+  return ratio as CedearRatio;
+}
+
+/** The CEDEAR ratio a listing's records state: the quote's, else the fundamentals'. */
+export function listingCedearRatio(records: CedearRecords | null | undefined): CedearRatio | null {
+  return readCedearRatio(records?.quote?.cedearRatio) ?? readCedearRatio(records?.fundamentals?.cedearRatio);
+}
+
+/** A CEDEAR's ratio in its company's shares: `20 AAPL:BYMA = 1 Apple Inc. share`. */
+export function cedearRatioText(ratio: CedearRatio): string {
+  return `${ratioCount(ratio.receipts)} ${ratio.listing} = ${ratioCount(ratio.shares)} ${ratio.company.trim()} share${ratio.shares === 1 ? "" : "s"}`;
+}
+
+/** What a home line says of its receipt: `1 GGAL ADR = 10 of these shares`, and `1 of these shares` for one. */
 function homeLineRatioText(pair: DepositaryPair): string {
-  return `1 ${pair.receipt} ADR = ${ratioCount(pair.ratio)} of these share${pair.ratio === 1 ? "" : "s"}`;
+  return `1 ${pair.receipt} ADR = ${ratioCount(pair.ratio)} of these shares`;
 }
 
 /**
  * The ratio as a listing's report states it, from its side of the pair:
- * `1 ADR = 10 ordinary shares of GGAL.BA` on the receipt, `1 GGAL ADR = 10
- * of these shares` on a home line.
+ * `1 ADR = 10 ordinary shares of GGAL.BA` on the receipt (`2 preferred
+ * shares of PETR4.SA`, homeShareClass), `1 GGAL ADR = 10 of these shares`
+ * on a home line.
  */
 export function depositaryPairText(pair: DepositaryPair, receiptSide: boolean): string {
   if (!receiptSide) return homeLineRatioText(pair);
-  return `1 ADR = ${ratioCount(pair.ratio)} ordinary share${pair.ratio === 1 ? "" : "s"} of ${pair.ordinary.join(" / ")}`;
+  return `${adrRatioText(pair.ratio, pair.ordinary[0]) ?? `1 ADR = ${ratioCount(pair.ratio)}`} of ${pair.ordinary.join(" / ")}`;
 }
 
 /** A price as the comparison reads it, with when it was observed. */
@@ -130,7 +156,11 @@ export function pairTimeText(time: number, now = Date.now()): string {
   return `${formatUtcDayTime({ time, dateOnly: false }, now)} UTC`;
 }
 
-function timingNote(receipt: PairPriceInput, home: PairPriceInput, now: number): string | null {
+/**
+ * Said when two prices compared were not set together (one market closed, or
+ * both closed half an hour or more apart); null when they were.
+ */
+export function pricesTimingNote(receipt: PairPriceInput, home: PairPriceInput, now: number): string | null {
   if (receipt.open && home.open) return null;
   if (receipt.observedAt == null || home.observedAt == null) return null;
   const gap = Math.abs(receipt.observedAt - home.observedAt);
@@ -155,7 +185,7 @@ export function compareDepositaryPair(
   const impliedFx = (home.price * ratio) / receipt.price;
   if (!Number.isFinite(impliedFx) || impliedFx <= 0) return null;
   const premiumPercent = spot ? (spot.rate / impliedFx - 1) * 100 : null;
-  return { ratio, receipt, home, impliedFx, spot, premiumPercent, timingNote: timingNote(receipt, home, now) };
+  return { ratio, receipt, home, impliedFx, spot, premiumPercent, timingNote: pricesTimingNote(receipt, home, now) };
 }
 
 /** `1,651.28`, `28.4942`, `0.890625`: a dollar rate to its useful digits. */

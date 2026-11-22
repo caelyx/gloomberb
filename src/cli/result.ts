@@ -1,8 +1,11 @@
+import { MISSING_VALUE } from "../utils/format";
 import type { CliGlobalOptions } from "./options";
 import {
   cliPlainEnabled,
   cliStyles,
+  cliText,
   cliTerminalWidth,
+  renderForFile,
   renderStats,
   renderTable,
   statValueWidth,
@@ -13,17 +16,32 @@ import {
   type CliTableColumn,
 } from "../utils/cli-output";
 import { serializeCsv } from "../utils/csv";
+import { portableCsv } from "./csv-export";
+import { logFailure } from "../utils/log-failure";
 import { formatUtcTime, isEpochMilliseconds, isZonedIsoDateTime } from "../utils/utc-time";
 import { formatFreshnessLine, withSavedCopy, type ReportFreshness } from "./pane-functions/freshness";
+import { savedCopyShownAt } from "../data/saved-copies";
+import { dataServiceUnreachable } from "../api-client/request";
+import { savedCopyUnreachableWarning } from "./unreachable";
 import { withSearchHints, type FredSeriesCheck } from "./not-a-ticker";
-import { renderReportCsv, renderReportNdjson, withCsvFooter, type CliReportTables } from "./report-tables";
+import {
+  exportJsonValue,
+  exportNumber,
+  renderReportCsv,
+  renderReportNdjson,
+  splitCsvFooter,
+  withCsvFooter,
+  type CliReportTables,
+} from "./report-tables";
 import {
   EXPORT_DATING_COLUMNS,
   EXPORT_IDENTITY_COLUMNS,
+  EXPORT_RETRIEVAL_COLUMN,
   exportDatingCells,
   exportDatingFields,
   exportIdentityCells,
   exportIdentityFields,
+  exportRetrievalCell,
   exportSource,
   exportSourceLines,
   type ExportIdentity,
@@ -93,6 +111,8 @@ export interface CliResultRenderOptions<T = unknown, Row = Record<string, unknow
   heading?: string;
   /** Text-mode line printed under the rows, such as where a listing stops. Not printed with no rows: say it in `empty`. */
   footnote?: string;
+  /** Text-mode line under each table row, indented and muted, cut to the width: a story's summary under its headline. */
+  rowNote?: (row: Row) => string | null | undefined;
   /** Text-mode block printed under the rows and footnote, for figures about a row that are not columns. */
   details?: (data: T) => string;
   /**
@@ -126,7 +146,7 @@ export interface CliResultRenderOptions<T = unknown, Row = Record<string, unknow
   /**
    * The rows are statistics dated by a period and a release (`econ`, `fred`):
    * CSV and NDJSON rows also end with `period`, `released` and `retrieved`
-   * (`EXPORT_DATING_COLUMNS`) after the five fixed columns, from the `period`
+   * (`EXPORT_DATING_COLUMNS`) after the identity columns, from the `period`
    * and `released` of each row's `exportIdentity`, and `as_of` is the release.
    * A column the rows already have by name keeps its own values. Needs a
    * cited source, as the fixed columns do.
@@ -141,6 +161,12 @@ export interface CliResultRenderOptions<T = unknown, Row = Record<string, unknow
    * without a reason here, named as `<header>: not available`.
    */
   exportStatus?: (row: Row) => string | null | undefined;
+  /**
+   * Row fields a report gained after its columns were set: CSV writes them
+   * last, after `retrieved_at`, and NDJSON ends each row with them, so no
+   * column an earlier export had moves.
+   */
+  exportAppendedKeys?: readonly string[];
 }
 
 interface CliResultJsonEnvelope<T> extends Omit<CliResult<T>, "freshness" | "exportFreshness" | "failure"> {
@@ -250,7 +276,7 @@ function formatTextValue(
   depth = 0,
   width: number | null = null,
 ): string {
-  const missing = context === "record" ? cliPlainEnabled() ? "—" : cliStyles.muted("-") : "";
+  const missing = context === "record" ? cliPlainEnabled() ? MISSING_VALUE : cliStyles.muted(MISSING_VALUE) : "";
   if (value == null || value === "") return missing;
   // Times print in UTC with the zone named, never in the host's zone; JSON and CSV keep the raw value.
   if (value instanceof Date) return formatUtcTime(value);
@@ -361,30 +387,42 @@ function renderCsv<Row extends Record<string, unknown>>(
   identity?: (row: Row) => string[],
   status?: (row: Row) => string | null | undefined,
   dating?: (row: Row) => string[],
+  /** When the data was retrieved, which an undated export's rows end with (`retrieved_at`). */
+  retrieved?: string,
+  /** Keys written after every other column (`exportAppendedKeys`), in this order. */
+  appendedKeys: readonly string[] = [],
 ): string {
-  const resolvedColumns = columns && columns.length > 0
+  const allColumns = columns && columns.length > 0
     ? columns
     : inferColumns(rows as Record<string, unknown>[]) as CliResultColumn<Row>[];
+  const resolvedColumns = allColumns.filter((column) => !appendedKeys.includes(column.key));
+  const appended = appendedKeys.flatMap((key) => allColumns.filter((column) => column.key === key));
   const headers = resolvedColumns.map((column) => column.header);
+  const cell = (value: unknown) => isNonFiniteNumber(value) ? "" : typeof value === "number" ? exportNumber(value) : value;
   // A dated export's own `released` column keeps its values; the others close the row.
   const datingAdded = dating
     ? EXPORT_DATING_COLUMNS.flatMap((column, index) => headers.includes(column) ? [] : [index]) : [];
+  const retrieval = retrieved !== undefined && !dating && !headers.includes(EXPORT_RETRIEVAL_COLUMN);
   return serializeCsv([
     [
       ...headers,
       ...status ? [statusHeader(headers)] : [],
       ...identity ? EXPORT_IDENTITY_COLUMNS : [],
       ...datingAdded.map((index) => EXPORT_DATING_COLUMNS[index]!),
+      ...retrieval ? [EXPORT_RETRIEVAL_COLUMN] : [],
+      ...appended.map((column) => column.header),
     ],
     ...rows.map((row) => {
       const values = resolvedColumns.map((column) => (column.value ? column.value(row) : row[column.key]));
       const blanked = resolvedColumns.flatMap((column, index) => isNonFiniteNumber(values[index]) ? [column.header] : []);
       const datingCells = dating?.(row) ?? [];
       return [
-        ...values.map((value) => isNonFiniteNumber(value) ? "" : value),
+        ...values.map(cell),
         ...status ? [exportStatusText(status(row), blanked)] : [],
         ...identity?.(row) ?? [],
         ...datingAdded.map((index) => datingCells[index] ?? ""),
+        ...retrieval ? [retrieved] : [],
+        ...appended.map((column) => cell(column.value ? column.value(row) : row[column.key])),
       ];
     }),
   ]);
@@ -446,6 +484,7 @@ function formatTextCell<Row extends Record<string, unknown>>(
 function renderTextTable<Row extends Record<string, unknown>>(
   rows: Row[],
   columns?: CliResultColumn<Row>[],
+  rowNote?: (row: Row) => string | null | undefined,
 ): string {
   const resolvedColumns = textColumns(rows, columns);
   const cells = rows.map((row) => resolvedColumns.map((column) => formatTextCell(column, row, "table")));
@@ -469,6 +508,7 @@ function renderTextTable<Row extends Record<string, unknown>>(
       stackRows: column.stackRows,
     })),
     cells.map((row) => shown.map(({ index }) => row[index]!)),
+    rowNote ? { below: rows.map((row) => { const note = rowNote(row); return note ? [note] : []; }), cutBelow: true } : {},
   );
 }
 
@@ -528,7 +568,7 @@ export function serializeCliResult<T, Row extends Record<string, unknown> = Reco
       ...(cited ? { source: exportSource(cited) } : {}),
       ...(columns?.length ? { columns } : {}),
     };
-    return JSON.stringify(envelope, null, 2);
+    return JSON.stringify(envelope, exportJsonValue, 2);
   }
   const body = serializeCliRows(rest, options, renderOptions, cited);
   if (options.format !== "text" || !freshness) return body;
@@ -555,41 +595,51 @@ function serializeCliRows<T, Row extends Record<string, unknown>>(
   if (options.format === "ndjson") {
     const statusKey = ndjsonStatusKey(rows, renderOptions.columns as readonly CliResultColumn<never>[] | undefined);
     return rows.map((row) => {
-      if (!isPlainObject(row)) return JSON.stringify(row);
+      if (!isPlainObject(row)) return JSON.stringify(row, exportJsonValue);
       const fields = ndjsonRow(row as Row, status, statusKey);
-      if (!cited) return JSON.stringify(fields);
+      if (!cited) return JSON.stringify(fields, exportJsonValue);
       const identity = rowIdentity(row as Row, renderOptions.exportIdentity);
       // A dated export's own fields (a row's `released`) keep their values.
       const dating = renderOptions.exportDated
         ? Object.fromEntries(Object.entries(exportDatingFields(cited, identity)).filter(([key]) => !(key in fields))) : {};
-      return JSON.stringify({ ...fields, ...exportIdentityFields(cited, identity), ...dating });
+      // An undated row says when it was retrieved last, as CSV's `retrieved_at` does.
+      const retrieval = !renderOptions.exportDated && !(EXPORT_RETRIEVAL_COLUMN in fields)
+        ? { [EXPORT_RETRIEVAL_COLUMN]: exportRetrievalCell(cited) } : {};
+      // Fields a report gained later end the row, as they end a CSV row.
+      const appended = Object.fromEntries((renderOptions.exportAppendedKeys ?? []).flatMap((key) => key in fields ? [[key, fields[key]]] : []));
+      const own = Object.fromEntries(Object.entries(fields).filter(([key]) => !(key in appended)));
+      return JSON.stringify({ ...own, ...exportIdentityFields(cited, identity), ...dating, ...retrieval, ...appended }, exportJsonValue);
     }).join("\n");
   }
   if (options.format === "csv") {
     // The rows a window cut say so after them, as text and JSON do: a script has no other way to know.
     const cutNote = window.note ? [`note: ${window.note}`] : [];
-    if (!cited) return withCsvFooter(renderCsv(rows as Row[], renderOptions.columns, undefined, status), cutNote);
+    const appended = renderOptions.exportAppendedKeys ?? [];
+    if (!cited) return withCsvFooter(renderCsv(rows as Row[], renderOptions.columns, undefined, status, undefined, undefined, appended), cutNote);
     const csv = renderCsv(
       rows as Row[],
       renderOptions.columns,
       (row) => exportIdentityCells(cited, rowIdentity(row, renderOptions.exportIdentity)),
       status,
       renderOptions.exportDated ? (row) => exportDatingCells(cited, rowIdentity(row, renderOptions.exportIdentity)) : undefined,
+      exportRetrievalCell(cited),
+      appended,
     );
     return withCsvFooter(csv, [...exportSourceLines(cited), ...cutNote, ...(renderOptions.exportNotes ?? []).map((note) => `note: ${note}`)]);
   }
   if (renderOptions.text) {
-    return renderOptions.text(result.data);
+    return cliText(renderOptions.text(result.data));
   }
-  const summary = renderOptions.summary?.(result.data) ?? "";
-  const withHeading = (text: string) => renderOptions.heading ? `${renderOptions.heading}\n${text}` : text;
+  // The heading's lines, the summary and the notes are prose: each wraps to a narrow --width, as the source line does.
+  const summary = wrapToTerminal(renderOptions.summary?.(result.data) ?? "");
+  const withHeading = (text: string) => renderOptions.heading ? `${wrapToTerminal(renderOptions.heading)}\n${text}` : text;
   if (rows.length === 0) {
-    return withHeading(summary || cliStyles.muted(renderOptions.empty ?? "No results."));
+    return withHeading(summary || cliStyles.muted(wrapToTerminal(renderOptions.empty ?? "No results.")));
   }
   const table = renderTextRows(rows as Row[], result.data, renderOptions);
   const notes = [window.note, renderOptions.footnote].filter((note): note is string => !!note);
   const details = renderOptions.details?.(result.data) ?? "";
-  const body = [table, ...notes.map((note) => cliStyles.muted(note)), ...details ? ["", details] : []].join("\n");
+  const body = [table, ...notes.map((note) => cliStyles.muted(wrapToTerminal(note))), ...details ? ["", details] : []].join("\n");
   return withHeading(summary ? `${summary}\n\n${body}` : body);
 }
 
@@ -607,7 +657,20 @@ function renderTextRows<T, Row extends Record<string, unknown>>(
   }
   return layout === "record"
     ? renderTextRecords(rows as Row[], columns)
-    : renderTextTable(rows as Row[], columns);
+    : renderTextTable(rows as Row[], columns, renderOptions.rowNote);
+}
+
+/** What `printCliResult` drew for the file `--output` names, since `takeCliFileExport` last took it. */
+let fileExport: string[] = [];
+
+/**
+ * The export a command printed for its `--output` file, or null when it
+ * printed none: the text the file is written with (dispatchCli).
+ */
+export function takeCliFileExport(): string | null {
+  const taken = fileExport.filter(Boolean);
+  fileExport = [];
+  return taken.length > 0 ? taken.join("\n") : null;
 }
 
 /** Settles once the result `printCliResult` last wrote has left the process: a pipe can hold it back. */
@@ -621,6 +684,54 @@ export function cliOutputWritten(): Promise<void> {
   return stdoutWritten;
 }
 
+/** How long a command whose report is out waits for reads it stopped waiting for before it exits without them. */
+const LEFT_BEHIND_EXIT_MS = 500;
+
+/**
+ * For a command whose report is out while reads it gave up on are not
+ * (dividends past their deadline): exits once the output has left the
+ * process, not when the last of them answers or times out, which held a
+ * cold `portfolio show` open for fifteen seconds after it printed. Unref'd,
+ * so a process with nothing left exits first, with its own code.
+ */
+export function exitLeavingReadsBehind(): void {
+  setTimeout(() => {
+    cliOutputWritten().then(() => process.exit()).catch(logFailure("cli.result", "Exit after the report failed"));
+  }, LEFT_BEHIND_EXIT_MS).unref();
+}
+
+/** A result whose rows' "Not a ticker: US10Y." cells carry the hint `hinted` gives the sentence. */
+function withHintedCells<T>(result: CliResult<T>, hinted: (text: string) => string): CliResult<T> {
+  if (!Array.isArray(result.data)) return result;
+  let changed = false;
+  const data = result.data.map((row: unknown) => {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return row;
+    let next = row as Record<string, unknown>;
+    for (const [key, value] of Object.entries(row)) {
+      if (typeof value !== "string" || !value.includes("Not a ticker: ")) continue;
+      const hint = hinted(value);
+      if (hint === value) continue;
+      next = { ...next, [key]: hint };
+      changed = true;
+    }
+    return next;
+  });
+  return changed ? { ...result, data: data as T } : result;
+}
+
+/**
+ * A result shown from saved copies while the data service went unanswered,
+ * with the warning that says so (`savedCopyUnreachableWarning`); any other as it is.
+ */
+export function withUnreachedSavedCopyWarning<T>(result: CliResult<T>): CliResult<T> {
+  if (!dataServiceUnreachable()) return result;
+  const cited = result.freshness ?? result.exportFreshness;
+  const saved = cited ? withSavedCopy(cited, result.data).savedAt != null : savedCopyShownAt(result.data) != null;
+  if (!saved) return result;
+  const warning = savedCopyUnreachableWarning();
+  return result.warnings?.includes(warning) ? result : { ...result, warnings: [...result.warnings ?? [], warning] };
+}
+
 export function printCliResult<T, Row extends Record<string, unknown> = Record<string, unknown>>(
   result: CliResult<T>,
   options: CliGlobalOptions,
@@ -629,25 +740,35 @@ export function printCliResult<T, Row extends Record<string, unknown> = Record<s
   isFredSeries?: FredSeriesCheck,
 ): void {
   if (options.quiet && options.format === "text") return;
+  result = withUnreachedSavedCopyWarning(result);
   // JSON keeps the router's own words; everything else is for a person, so a "Not a ticker" gets its hint.
   const hinted = (text: string) => options.format === "json" ? text : withSearchHints(text, args, isFredSeries);
-  const output = hinted(serializeCliResult(result, options, renderOptions));
+  // A CSV's status cell is where its row says why, so it gets the hint the warning line has: a cell ends in a comma,
+  // which the text's sentence search does not take for the sentence's end.
+  const cells = options.format === "csv" ? withHintedCells(result, hinted) : result;
+  // An export `--output` names is drawn for the file (no colour), and held for the command's end to write.
+  const toFile = options.output !== undefined && options.format !== "text";
+  const serialized = hinted(toFile
+    ? renderForFile(() => serializeCliResult(cells, options, renderOptions))
+    : serializeCliResult(cells, options, renderOptions));
+  const { csv, footer } = options.format === "csv" ? splitCsvFooter(serialized) : { csv: serialized, footer: [] };
+  const output = options.format === "csv" ? portableCsv(serialized, result.warnings,
+    [...renderOptions.exportNotes ?? [], ...renderOptions.footnote ? [renderOptions.footnote] : []]) : csv;
+  if (toFile) fileExport.push(output);
   // Bun's console writer can truncate a large pipe write after stdout has been
   // initialized. The stream queues the remaining bytes until the reader drains.
-  if (output && !process.stdout.write(`${output}\n`)) {
+  else if (output && !process.stdout.write(`${output}\n`)) {
     stdoutWritten = new Promise((resolve) => process.stdout.once("drain", () => resolve()));
   }
-  // JSON carries warnings in its envelope. Text, CSV and NDJSON are only the
-  // rows, so a warning goes to stderr, out of a file the rows are piped into.
   if (options.format !== "json" && !options.quiet) {
+    // Each wraps to a narrow --width, as a note does.
     for (const warning of result.warnings ?? []) {
-      console.error(`${cliStyles.warning("warning:")} ${hinted(warning)}`);
+      console.error(wrapToTerminal(`${cliStyles.warning("warning:")} ${hinted(cliText(warning))}`));
     }
   }
-  // CSV says what its rows do not in closing `# note:` lines; NDJSON has no place for one among its rows,
-  // so the same notes go to stderr, where the warnings are.
+  if (!options.quiet) for (const line of footer) console.error(cliText(line));
   if (options.format === "ndjson" && !options.quiet) {
-    for (const note of exportNdjsonNotes(result, options, renderOptions)) console.error(`note: ${note}`);
+    for (const note of exportNdjsonNotes(result, options, renderOptions)) console.error(cliText(`note: ${note}`));
   }
 }
 
@@ -664,7 +785,7 @@ function exportNdjsonNotes<T, Row extends Record<string, unknown>>(
 
 export function serializeCliError(error: CliErrorObject, options: CliGlobalOptions): string {
   if (options.format === "json" || options.format === "ndjson") {
-    return JSON.stringify({ ok: false, error }, null, options.format === "json" ? 2 : 0);
+    return JSON.stringify({ ok: false, error }, exportJsonValue, options.format === "json" ? 2 : 0);
   }
   return error.details == null ? error.message : `${error.message}\n${String(error.details)}`;
 }

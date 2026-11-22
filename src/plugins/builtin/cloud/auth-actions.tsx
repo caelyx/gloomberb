@@ -5,8 +5,9 @@
  * the account is right: same headline grammar, same explanation slot, same two
  * actions, wherever it appears. A pane only supplies the phrase that finishes
  * "Sign in to ...", so the copy stays in one voice instead of drifting per pane.
- * `InlineAuthActions` is the other shape: a row of actions sitting inside a
- * surface that still works signed out, such as the chat composer.
+ * `InlineAuthActions` is the other shape: the same actions, drawn the same
+ * way, in a surface that still shows something without them, such as the
+ * chat composer of a saved login or an unverified account.
  * `ProWall` is the signed-in counterpart for a pane body that needs Pro.
  */
 import { useId } from "react";
@@ -31,41 +32,76 @@ function openAuth(
   }
 }
 
+const RESEND_VERIFICATION = "Resend Verification Email";
+
+/**
+ * The account actions as buttons: Sign up free and Log in, or the resend for
+ * an unconfirmed address. One look for the wall and for the inline copy, so
+ * the same action never reads as two different controls.
+ *
+ * Where both show, Sign up free leads and is the primary: most people who
+ * meet a wall have no account yet, and a Log in form is a dead end for them.
+ * Log in stays beside it. A surface that offers Log in alone (a saved login)
+ * keeps it as its primary.
+ */
+function AuthButtons({ showSignup, needsVerification, onAuth, onResend, stopPropagation = false }: {
+  showSignup: boolean;
+  needsVerification: boolean;
+  onAuth: (mode: AccountMode) => void;
+  onResend: () => void;
+  /** Inside a surface with its own pointer handling (the chat), a press stays on the button. */
+  stopPropagation?: boolean;
+}) {
+  if (needsVerification) return <Button label={t(RESEND_VERIFICATION)} stopPropagation={stopPropagation} onPress={onResend} />;
+  return (
+    <>
+      {showSignup && <Button label={t("Sign up free")} variant="primary" stopPropagation={stopPropagation} onPress={() => onAuth("signup")} />}
+      <Button label={t("Log in")} variant={showSignup ? "secondary" : "primary"} stopPropagation={stopPropagation} onPress={() => onAuth("login")} />
+    </>
+  );
+}
+
 export interface InlineAuthActionsProps {
   showSignup?: boolean;
+  /** The session exists but the address is unconfirmed: the resend replaces the sign-in buttons. */
+  needsVerification?: boolean;
   /**
-   * `buttons` is the wall's pair of compact buttons, for a surface such as
+   * `buttons` is the wall's buttons in the wall's row, for a surface such as
    * the chat composer where the actions must read as controls. `plain` is
    * clickable text, for chrome that is itself a row of text (a status bar).
    */
   variant?: "buttons" | "plain";
 }
 
-export function InlineAuthActions({ showSignup = true, variant = "buttons" }: InlineAuthActionsProps) {
+export function InlineAuthActions({ showSignup = true, needsVerification = false, variant = "buttons" }: InlineAuthActionsProps) {
   const { openCommandBar } = usePluginAppActions();
-  const logIn = () => openAuth(openCommandBar, "login");
-  const signUp = () => openAuth(openCommandBar, "signup");
+  const authenticate = (mode: AccountMode) => openAuth(openCommandBar, mode);
+  const logIn = () => authenticate("login");
+  const signUp = () => authenticate("signup");
+  const resend = () => openCommandBar(RESEND_VERIFICATION);
   // Inside a pane (the chat composer) the pane menu lists them, so they need
   // no mouse; the status bar copy has the Log In command instead.
-  usePaneMenuItems(`inline-auth:${useId()}`, () => [
-    { id: "log-in", label: t("Log in"), onSelect: logIn },
-    ...(showSignup ? [{ id: "sign-up", label: t("Sign up free"), onSelect: signUp }] : []),
-  ], [openCommandBar, showSignup]);
+  usePaneMenuItems(`inline-auth:${useId()}`, () => needsVerification
+    ? [{ id: "resend-verification", label: t(RESEND_VERIFICATION), onSelect: resend }]
+    : [
+      ...(showSignup ? [{ id: "sign-up", label: t("Sign up free"), onSelect: signUp }] : []),
+      { id: "log-in", label: t("Log in"), onSelect: logIn },
+    ], [openCommandBar, needsVerification, showSignup]);
   if (variant === "plain") {
     return (
       <Box flexDirection="row">
-        <Button label={t("Log in")} variant="plain" compact stopPropagation onPress={logIn} />
         {showSignup && <>
-          <Text fg={colors.textDim}> / </Text>
           <Button label={t("Sign up free")} variant="plain" compact stopPropagation onPress={signUp} />
+          <Text fg={colors.textDim}> / </Text>
         </>}
+        <Button label={t("Log in")} variant="plain" compact stopPropagation onPress={logIn} />
       </Box>
     );
   }
+  // The row a wall's actions sit in (EmptyState), wrapping in a narrow pane.
   return (
-    <Box flexDirection="row" gap={1}>
-      <Button label={t("Log in")} variant="primary" compact stopPropagation onPress={logIn} />
-      {showSignup && <Button label={t("Sign up free")} variant="secondary" compact stopPropagation onPress={signUp} />}
+    <Box flexDirection="row" flexWrap="wrap" gap={1}>
+      <AuthButtons showSignup={showSignup} needsVerification={needsVerification} onAuth={authenticate} onResend={resend} stopPropagation />
     </Box>
   );
 }
@@ -95,7 +131,7 @@ export function SignInWall({ placement, action, needsVerification = false, hint,
   const title = needsVerification
     ? tf("Verify your email to {action}.", { action: t(action) })
     : tf("Sign in to {action}.", { action: t(action) });
-  const authenticate = (mode: "login" | "signup") => {
+  const authenticate = (mode: AccountMode) => {
     recordWallCtaClicked(placement, mode);
     openAuth(openCommandBar, mode);
   };
@@ -107,16 +143,13 @@ export function SignInWall({ placement, action, needsVerification = false, hint,
         <EmptyState
           title={title}
           hint={hint}
-          actions={needsVerification ? (
-            <Button
-              label={t("Resend Verification Email")}
-              onPress={() => openCommandBar("Resend Verification Email")}
+          actions={(
+            <AuthButtons
+              showSignup
+              needsVerification={needsVerification}
+              onAuth={authenticate}
+              onResend={() => openCommandBar(RESEND_VERIFICATION)}
             />
-          ) : (
-            <>
-              <Button label={t("Log in")} variant="primary" onPress={() => authenticate("login")} />
-              <Button label={t("Sign up free")} variant="secondary" onPress={() => authenticate("signup")} />
-            </>
           )}
         />
       </Box>

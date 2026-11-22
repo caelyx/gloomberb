@@ -322,14 +322,16 @@ test("the evidence says what the tiles are sized by, and a portfolio's tiles are
 test("the footer dates the session and the snapshot apart from the last check that succeeded, and a failed check keeps both", async () => {
   const api = spyOn(apiClient, "getMarketHeatmap").mockRejectedValueOnce(new Error("down"))
     .mockResolvedValue({ status: "success", data: fridayBoard([stock("AAAA", 400, -0.52), stock("BBBB", 200, 1.1)]) });
-  restore = () => api.mockRestore();
+  // A Pro account's board is real-time: no delayed clock takes room from the caption.
+  const user = spyOn(apiClient, "getCurrentUser").mockReturnValue({ id: "pro", emailVerified: true, plan: "pro" } as never);
+  restore = () => { api.mockRestore(); user.mockRestore(); };
   const pane = await mountHeatmap({ liveStreaming: false });
   // Nothing has been checked yet, so nothing claims it was.
   expect(pane.footer()).not.toContain("checked");
 
   await tui.emitKeypress({ name: "r", sequence: "r" });
   await settleFrame(tui.setup(), 6);
-  const caption = "top 2 · Oct 9 session · snapshot 18:15 ET · checked just now";
+  const caption = "top 2 · 9 Oct session · snapshot 18:15 ET · checked just now";
   expect(pane.footer()).toContain(caption);
   expect(pane.footer()).not.toContain("updated");
 

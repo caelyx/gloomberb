@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { enrollmentSeries } from "./history";
 import { describe, expect, test } from "bun:test";
 import { catalystFixture, catalystPayload } from "./test-fixture";
@@ -17,7 +18,7 @@ test("party revision summaries expose changed links and preserve additions, remo
   expect(catalystChangeText({ field: "parties", before: [linked], after: [] })).toContain("removed, AZN:XNYS (95%)");
   expect(catalystChangeText({ field: "parties", before: [], after: [old] })).toContain("added, Unlinked");
   expect(catalystChangeText({ field: "parties", before: [linked], after: [{ ...linked, entityId: "57" }] })).toContain("Link evidence updated");
-  expect(catalystChangeText({ field: "metadata.enrollment", before: null, after: 0 })).toBe("Enrollment: -- → 0");
+  expect(catalystChangeText({ field: "metadata.enrollment", before: null, after: 0 })).toBe(`Enrollment: ${MISSING_VALUE} → 0`);
   expect(catalystChangeText({ field: "metadata.hasResults", before: false, after: true })).toBe("Has results: No → Yes");
   expect(catalystChangeText({ field: "metadata.phases", before: [], after: ["PHASE1", "PHASE2"] })).toBe("Phases: None → PHASE1, PHASE2");
 });
@@ -33,7 +34,7 @@ describe("catalyst parties, tones and columns", () => {
     expect(catalystParties(filer)).toBe("Dominion Energy South Carolina");
     // An agency heading is not a filer, and the title stays whole.
     const heading = { ...event, parties: [], title: "Airworthiness Directives; Airbus Helicopters" };
-    expect(catalystParties(heading)).toBe("--");
+    expect(catalystParties(heading)).toBe(MISSING_VALUE);
     expect(catalystCell(heading, "title", "any", false)).toBe(heading.title);
   });
   test("tones a status by what it means for the company", () => {
@@ -58,7 +59,7 @@ describe("catalyst provenance and dates", () => {
   test("preserves month precision without inventing a day and distinguishes observed time", () => {
     expect(catalystDate(event)).toBe("2027-04");
     expect(catalystDate(event, "announced")).toBe("2026-01-01");
-    expect(catalystDate(event, "effective")).toBe("--");
+    expect(catalystDate(event, "effective")).toBe(MISSING_VALUE);
     expect(catalystDate(event, "observed")).toBe("2026-10-04 12:00");
     expect(catalystQuery({ tab: "changes", upcoming: true, country: "EU" }, "NOVN:SIX")).toEqual({ symbol: "NOVN:SIX", country: "EU", changed: true, dateField: "observed" });
   });
@@ -81,11 +82,28 @@ describe("catalyst provenance and dates", () => {
   test("a withheld date reads as not disclosed, never as the announcement", () => {
     const withheld = { ...event, type: "pdufa" as const, deadlineDate: null, datePrecision: { announced: "day" as const }, announcedDate: "2026-10-19",
       metadata: { dateWithheld: true, deadlineMeaning: "Company-reported FDA PDUFA target date" } };
-    expect(catalystDate(withheld)).toBe("--");
+    expect(catalystDate(withheld)).toBe(MISSING_VALUE);
     expect(catalystDateBasis(withheld)).toBe("Date not disclosed");
     expect(catalystSection(withheld, "any", false)).toBe("Date not disclosed");
     expect(catalystDate(withheld, "announced")).toBe("2026-10-19");
     expect(catalystDateBasis(withheld, "announced")).toBe("Announced");
+  });
+  // A clinical window of October showed a trial under its January completion: it matched on its October update.
+  test("in a date window a row shows the date that matched it, and says which", () => {
+    const trial = { ...event, announcedDate: "2026-10-20", deadlineDate: "2027-01-29", datePrecision: { announced: "day" as const, deadline: "day" as const },
+      metadata: { sourceUpdateDate: "2026-10-20", deadlineMeaning: "Primary completion date, actual or estimated as reported by sponsor", primaryCompletion: { date: "2027-01-29", type: "ESTIMATED" } } };
+    const window = catalystQuery({ from: "2026-10-01", to: "2026-11-09" });
+    expect([catalystDate(trial, window), catalystDateBasis(trial, window), catalystSection(trial, window, false)]).toEqual(["2026-10-20", "Registry update", "October 2026"]);
+    // Its completion in the window, or no window, keeps the completion.
+    const later = catalystQuery({ from: "2027-01-01", to: "2027-01-31" });
+    expect([catalystDate(trial, later), catalystDateBasis(trial, later)]).toEqual(["2027-01-29", "Primary completion (est.)"]);
+    expect(catalystDate(trial, catalystQuery({}))).toBe("2027-01-29");
+    // A month-precision deadline covers its month.
+    expect(catalystDate(event, catalystQuery({ from: "2027-04-15", to: "2027-04-20" }))).toBe("2027-04");
+    // An FDA advisory notice's comment deadline admits it to no window on the server: the notice it matched on is its date.
+    const notice = { ...event, source: "fda_advisory", announcedDate: "2026-10-05", deadlineDate: "2026-10-20",
+      datePrecision: { announced: "day" as const, deadline: "day" as const }, metadata: { deadlineDateMeaning: "Comment deadline" } };
+    expect([catalystDate(notice, window), catalystDateBasis(notice, window)]).toEqual(["2026-10-05", "Announced"]);
   });
   // The server sends upcoming dates first, then past ones; grouping by month kept a past day ahead of later months.
   test("sections keep the server's order, heading a month today splits twice", () => {

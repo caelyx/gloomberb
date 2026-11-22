@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useMemo, useRef } from "react";
 import type { AwardRow } from "../../../api-client/awards";
 import { ActionRow, KeyValueRow, PaneStatusBody, Section, StatGrid, usePagedRows, usePaneNoticeFooter, usePaneStatusFooter, useTableLoadMore } from "../../../components";
@@ -5,12 +6,16 @@ import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { useThemeColors } from "../../../theme/theme-context";
 import { Box, ScrollBox, Text, useRendererHost, useUiCapabilities, type ScrollBoxRenderable } from "../../../ui";
 import { fetchAward, loadAward } from "./client";
-import { awardPeriod, awardTypeLabel, money } from "./model";
+import { amountWithheld, awardPeriod, awardTypeLabel, money, statementText, WITHHELD_AMOUNT } from "./model";
 import { UpgradeLabel } from "../shared/locked-rows";
 
-export function AwardDetail({ row, accessKey, width, height, focused, openAward, openChildren, openUpgrade }: {
+export function AwardDetail({ row, accessKey, width, height, focused, openAward, openChildren, openUpgrade, attribution: boardAttribution, amountNotice: boardAmountNotice }: {
   row: AwardRow; accessKey: string; width: number; height: number; focused: boolean; openAward: (id: string) => void;
   openChildren: (type: "subaward" | "modification") => void; openUpgrade: () => void;
+  /** The statement the award's source licence asks for wherever its data is shown. */
+  attribution?: string;
+  /** How the award's source's amounts read, when it withholds some (GeBIZ). */
+  amountNotice?: string;
 }) {
   const colors = useThemeColors();
   const host = useRendererHost();
@@ -28,6 +33,11 @@ export function AwardDetail({ row, accessKey, width, height, focused, openAward,
   usePaneRefreshKey(resource.reload, { focused });
   const loaded = resource.pages[0], detail = loaded?.payload;
   const current = detail?.row ?? row;
+  // The board's statements, else the ones the award's own read carries.
+  const attribution = statementText(boardAttribution) || statementText(detail?.attribution);
+  const amountNotice = statementText(boardAmountNotice) || statementText(detail?.amountNotice);
+  // Withheld by the award's own reason (GeBIZ's "under S$6,000"); an amount never printed stays unreported.
+  const withheld = amountWithheld(current);
   const scrollRef = useRef<ScrollBoxRenderable | null>(null);
   const loadMore = useTableLoadMore(scrollRef, resource.hasMore, resource.loadMore);
   usePaneStatusFooter({ registrationId: "awards:detail", loading: resource.loading || resource.loadingMore, error: resource.error?.message ?? resource.moreError?.message, stale: loaded?.stale });
@@ -35,10 +45,11 @@ export function AwardDetail({ row, accessKey, width, height, focused, openAward,
   const labelWidth = width < 85 ? 18 : 23;
   return <ScrollBox ref={scrollRef} scrollY width={width} height={desktop ? undefined : height} flexGrow={1} flexBasis={0} contentOptions={{ paddingX: 1 }} onMouseScroll={loadMore}>
     <StatGrid width={Math.max(1, width - 2)} items={[
-      { id: "value", label: `Value (${current.currency})`, value: money(current.awardAmount), detail: current.fieldAsOf?.awardAmount ? `as of ${current.fieldAsOf.awardAmount.slice(0, 10)}` : undefined },
+      { id: "value", label: `Value (${current.currency})`, value: withheld ? WITHHELD_AMOUNT : money(current.awardAmount), detail: withheld ?? (current.fieldAsOf?.awardAmount ? `as of ${current.fieldAsOf.awardAmount.slice(0, 10)}` : undefined) },
       { id: "obligated", label: `Obligated (${current.currency})`, value: money(current.obligatedAmount), detail: current.fieldAsOf?.obligatedAmount ? `as of ${current.fieldAsOf.obligatedAmount.slice(0, 10)}` : undefined },
       { id: "ceiling", label: `Ceiling (${current.currency})`, value: money(current.ceilingAmount), detail: current.fieldAsOf?.ceilingAmount ? `as of ${current.fieldAsOf.ceilingAmount.slice(0, 10)}` : undefined },
     ]} />
+    {withheld && amountNotice ? <Text fg={colors.textDim} width={width - 2} wrapMode="word" wrapText>{amountNotice}</Text> : null}
     <Section title="Contract" width={width - 2}>
       <KeyValueRow label="Awardee" value={current.recipient.name} labelWidth={labelWidth} />
       <KeyValueRow label={current.entity?.parentName && current.entity.parentName !== current.recipient.name ? "Listed parent" : "Listed company"} value={current.entity ? `${current.entity.ticker} · ${current.entity.parentName ?? current.entity.legalName}` : "Unresolved"} labelWidth={labelWidth} />
@@ -47,8 +58,8 @@ export function AwardDetail({ row, accessKey, width, height, focused, openAward,
       {current.awardStatus ? <KeyValueRow label="Status" value={current.awardStatus} labelWidth={labelWidth} /> : null}
       {current.dataBasis === "bulk-latest-transaction" ? <KeyValueRow label="Record basis" value="Latest published transaction" labelWidth={labelWidth} /> : null}
       <KeyValueRow label="Performance period" value={awardPeriod(current)} labelWidth={labelWidth} />
-      <KeyValueRow label="Performance place" value={[current.placeOfPerformance?.city, current.placeOfPerformance?.region, current.placeOfPerformance?.country].filter(Boolean).join(", ") || "--"} labelWidth={labelWidth} />
-      <KeyValueRow label="NAICS / PSC" value={`${current.naics ?? "--"} / ${current.psc ?? "--"}`} labelWidth={labelWidth} />
+      <KeyValueRow label="Performance place" value={[current.placeOfPerformance?.city, current.placeOfPerformance?.region, current.placeOfPerformance?.country].filter(Boolean).join(", ") || MISSING_VALUE} labelWidth={labelWidth} />
+      <KeyValueRow label="NAICS / PSC" value={`${current.naics ?? MISSING_VALUE} / ${current.psc ?? MISSING_VALUE}`} labelWidth={labelWidth} />
       {current.classifications?.map((classification) => <KeyValueRow key={`${classification.scheme}:${classification.code}`} label={classification.scheme.toUpperCase()} value={classification.code} detail={classification.label} labelWidth={labelWidth} />)}
       <KeyValueRow label="Award id" value={current.sourceAwardId} labelWidth={labelWidth} />
       {current.parentAwardId ? <KeyValueRow label="Parent award" value={current.parentAwardId} labelWidth={labelWidth} /> : null}
@@ -66,10 +77,11 @@ export function AwardDetail({ row, accessKey, width, height, focused, openAward,
     <Section title="Evidence" width={width - 2}>
       <KeyValueRow label="Observed (UTC)" value={current.observedAt.replace("T", " ").slice(0, 19)} labelWidth={labelWidth} />
       {current.dataEffectiveDate ? <KeyValueRow label="Record effective" value={current.dataEffectiveDate.slice(0, 10)} labelWidth={labelWidth} /> : null}
-      <KeyValueRow label="Confidence" value={current.confidence == null ? "--" : `${Math.round(current.confidence * 100)}%`} labelWidth={labelWidth} />
+      <KeyValueRow label="Confidence" value={current.confidence == null ? MISSING_VALUE : `${Math.round(current.confidence * 100)}%`} labelWidth={labelWidth} />
       {current.entity ? <KeyValueRow label="Entity match" value={`${current.entity.method.replaceAll("-", " ")} · ${Math.round(current.entity.confidence * 100)}%`} labelWidth={labelWidth} /> : null}
       {current.evidenceQuote ? <Box paddingY={1}><Text fg={colors.textBright} width={width - 2} wrapMode="word" wrapText>{current.evidenceQuote}</Text></Box> : null}
       <Text fg={colors.textDim} width={width - 2} wrapMode="word" wrapText>{current.sourceUrl}</Text>
+      {attribution ? <Text fg={colors.textDim} width={width - 2} wrapMode="word" wrapText>{attribution}</Text> : null}
       {Object.entries(current.fieldSourceUrls ?? {}).map(([field, url]) => <ActionRow key={field} label={`Open ${({ obligatedAmount: "obligation", ceilingAmount: "ceiling", awardAmount: "award value", parentRecipient: "parent relationship" } as Record<string, string>)[field] ?? field.replace(/([a-z])([A-Z])/g, "$1 $2").replaceAll("_", " ").toLowerCase()} evidence${current.fieldAsOf?.[field] ? ` · ${current.fieldAsOf[field]!.slice(0, 10)}` : ""}`} onPress={() => void host.openExternal(url)} />)}
       {current.entity ? <KeyValueRow label="Entity evidence" value={current.entity.evidenceUrl} labelWidth={labelWidth} /> : null}
       {current.entity ? <ActionRow label="Open entity evidence" onPress={() => void host.openExternal(current.entity!.evidenceUrl)} /> : null}
@@ -82,8 +94,8 @@ export function AwardDetail({ row, accessKey, width, height, focused, openAward,
             <KeyValueRow label="Record" value={revision.id} detail={revision.supersedes ? `Supersedes ${revision.supersedes}` : "Original observation"} labelWidth={labelWidth} />
             <KeyValueRow label="Awardee" value={revision.award.recipient.name} labelWidth={labelWidth} />
             <KeyValueRow label="Agency" value={revision.award.agency.name} labelWidth={labelWidth} />
-            <KeyValueRow label="Award date / value" value={`${revision.award.awardDate} · ${revision.award.currency} ${money(revision.award.awardAmount)}`} labelWidth={labelWidth} />
-            <KeyValueRow label="Performance period" value={`${revision.award.periodStart ?? "--"} / ${revision.award.periodEnd ?? "--"}`} labelWidth={labelWidth} />
+            <KeyValueRow label="Award date / value" value={`${revision.award.awardDate} · ${amountWithheld(revision.award) ? WITHHELD_AMOUNT : `${revision.award.currency} ${money(revision.award.awardAmount)}`}`} labelWidth={labelWidth} />
+            <KeyValueRow label="Performance period" value={`${revision.award.periodStart ?? MISSING_VALUE} / ${revision.award.periodEnd ?? MISSING_VALUE}`} labelWidth={labelWidth} />
             <Text fg={colors.textDim} width={width - 2} wrapMode="word" wrapText>{revision.award.title}</Text>
             {revision.award.evidenceQuote ? <Text fg={colors.text} width={width - 2} wrapMode="word" wrapText>{revision.award.evidenceQuote}</Text> : null}
             <ActionRow label="Open revision source" onPress={() => void host.openExternal(revision.award.sourceUrl)} />
